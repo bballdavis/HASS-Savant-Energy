@@ -21,6 +21,7 @@ DMX_OFF_VALUE: Final = 0
 DMX_CACHE_SECONDS: Final = 5  # Cache DMX status for 5 seconds
 DMX_API_TIMEOUT: Final = 30  # Time in seconds to consider API down
 DMX_ADDRESS_CACHE_SECONDS: Final = 3600  # Cache DMX address for 1 hour
+RDM_DEVICE_NOT_FOUND: Final = "The RDM device could not be found"
 
 # Track API statistics
 _dmx_api_stats = {
@@ -37,6 +38,72 @@ _api_request_count: int = 0
 
 # DMX address cache to minimize API calls
 _dmx_address_cache = {}  # Maps DMX UID -> {"address": int, "timestamp": datetime}
+_dmx_discovery_notifications = {}  # Maps DMX UID -> last error string
+
+
+async def _async_fetch_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    timeout: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+    """Fetch JSON data and return payload, raw text, and error string."""
+    try:
+        timeout_config = aiohttp.ClientTimeout(total=float(timeout))
+        async with session.get(url, timeout=timeout_config) as response:
+            text_response = await response.text()
+            if response.status != 200:
+                error = f"HTTP {response.status}"
+                _LOGGER.warning(
+                    f"Request to {url} failed with {error}, response: {text_response}"
+                )
+                return None, text_response, error
+            try:
+                data = json.loads(text_response)
+            except json.JSONDecodeError as json_err:
+                error = f"Invalid JSON: {json_err}"
+                _LOGGER.warning(
+                    f"JSON decode error from {url}: {error}. Text: {text_response}"
+                )
+                return None, text_response, error
+            return data, text_response, None
+    except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+        error = f"{type(err).__name__}: {err}"
+        _LOGGER.warning(f"Network error calling {url}: {error}")
+        return None, None, error
+    except Exception as err:
+        error = f"Unexpected {type(err).__name__}: {err}"
+        _LOGGER.warning(f"Unexpected error calling {url}: {error}")
+        return None, None, error
+
+
+async def _async_notify_channel_issue(
+    hass: Optional[Any],
+    device_label: str,
+    dmx_uid: str,
+    universe: int,
+    error_message: str,
+) -> None:
+    """Send a persistent notification about a DMX channel lookup failure."""
+    if hass is None:
+        return
+    from .const import DOMAIN  # Local import to avoid circular dependency at import time
+
+    slug = slugify(device_label)
+    notification_id = f"{DOMAIN}_dmx_{slug}"
+    message = (
+        f"Unable to determine the DMX channel for {device_label} (UID {dmx_uid}) in universe {universe} "
+        f"after running RDM discovery. Last error: {error_message}."
+    )
+    await hass.services.async_call(
+        "persistent_notification",
+        "create",
+        {
+            "title": "Savant Energy DMX",
+            "message": message,
+            "notification_id": notification_id,
+        },
+        blocking=False,
+    )
 
 
 def calculate_dmx_uid(uid: str) -> str:
@@ -72,7 +139,14 @@ def slugify(name: str) -> str:
     return name
 
 
-async def async_get_dmx_address(ip_address: str, ola_port: int, universe: int, dmx_uid: str) -> Optional[int]:
+async def async_get_dmx_address(
+    ip_address: str,
+    ola_port: int,
+    universe: int,
+    dmx_uid: str,
+    hass: Optional[Any] = None,
+    device_name: Optional[str] = None,
+) -> Optional[int]:
     """
     Get DMX address for a device using the RDM API.
     Args:
@@ -80,59 +154,120 @@ async def async_get_dmx_address(ip_address: str, ola_port: int, universe: int, d
         ola_port: OLA server port
         universe: DMX universe ID (usually 1)
         dmx_uid: The DMX UID of the device
+        hass: Optional Home Assistant instance for notifications
+        device_name: Friendly device name for notifications
     Returns:
         The DMX address as an integer or None if not found
     """
     global _dmx_address_cache
-    
-    cache_key = f"{dmx_uid}"
+
+    cache_key = dmx_uid
     now = datetime.now()
-    
-    # Check cache for existing DMX address
+
     if cache_key in _dmx_address_cache:
         cache_entry = _dmx_address_cache[cache_key]
         if (now - cache_entry["timestamp"]).total_seconds() < DMX_ADDRESS_CACHE_SECONDS:
-            _LOGGER.debug(f"Using cached DMX address {cache_entry['address']} for device {dmx_uid}")
+            _LOGGER.debug(
+                f"Using cached DMX address {cache_entry['address']} for device {dmx_uid}"
+            )
             return cache_entry["address"]
-    
+
     if not ip_address or not ola_port:
         _LOGGER.warning("Missing IP address or OLA port for DMX address request")
         return None
-    
+
     url = f"http://{ip_address}:{ola_port}/json/rdm/uid_info?id={universe}&uid={dmx_uid}"
-    #_LOGGER.debug(f"Fetching DMX address from: {url}")
-    
+    discovery_triggered = False
+    last_error: Optional[str] = None
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as response:
-                if response.status == 200:
-                    text_response = await response.text()
-                    #_LOGGER.debug(f"RDM raw text response: {text_response}")
-                    
+            for attempt in range(2):
+                data, raw_text, fetch_error = await _async_fetch_json(
+                    session, url, timeout=10
+                )
+
+                if data and "address" in data:
                     try:
-                        data = json.loads(text_response)
-                        #_LOGGER.debug(f"RDM parsed JSON response: {data}")
-                        
-                        if "address" in data:
-                            address = int(data["address"])
-                            _dmx_address_cache[cache_key] = {
-                                "address": address,
-                                "timestamp": now
-                            }
-                            return address
-                        else:
-                            _LOGGER.warning(f"No 'address' field in RDM response: {data}")
-                    except json.JSONDecodeError as json_err:
-                        _LOGGER.warning(f"Failed to parse JSON from response: {json_err}. Text: {text_response}")
+                        address = int(data["address"])
+                    except (TypeError, ValueError):
+                        last_error = f"Invalid address value: {data.get('address')}"
+                        _LOGGER.warning(
+                            f"Invalid address in RDM response for {dmx_uid}: {data}"
+                        )
+                    else:
+                        _dmx_address_cache[cache_key] = {
+                            "address": address,
+                            "timestamp": now,
+                        }
+                        if discovery_triggered:
+                            _dmx_discovery_notifications.pop(dmx_uid, None)
+                        return address
+
+                error_text: Optional[str] = fetch_error
+                if data and "address" not in data:
+                    error_text = str(
+                        data.get("error")
+                        or data.get("message")
+                        or (
+                            "; ".join(str(item) for item in data.get("errors", []))
+                            if isinstance(data.get("errors"), list)
+                            else None
+                        )
+                        or "Address not present in response"
+                    )
+                    if raw_text:
+                        _LOGGER.debug(
+                            f"RDM response for {dmx_uid} without address: {raw_text}"
+                        )
+
+                if error_text == RDM_DEVICE_NOT_FOUND and attempt == 0:
+                    discovery_triggered = True
+                    discovery_url = (
+                        f"http://{ip_address}:{ola_port}/rdm/run_discovery?id={universe}&incremental=true"
+                    )
+                    _LOGGER.info(
+                        "RDM device %s not found; triggering discovery on universe %s",
+                        dmx_uid,
+                        universe,
+                    )
+                    discovery_data, _, discovery_error = await _async_fetch_json(
+                        session, discovery_url, timeout=30
+                    )
+                    if discovery_error:
+                        last_error = discovery_error
+                        _LOGGER.warning(
+                            "RDM discovery failed for %s on universe %s: %s",
+                            dmx_uid,
+                            universe,
+                            discovery_error,
+                        )
+                        break
+                    if discovery_data and isinstance(discovery_data, dict):
+                        discovered_count = len(discovery_data.get("uids", []))
+                        _LOGGER.debug(
+                            "RDM discovery returned %d uid(s) for universe %s",
+                            discovered_count,
+                            universe,
+                        )
+                    continue
+
+                if error_text:
+                    last_error = error_text
                 else:
-                    _LOGGER.warning(f"Failed to get DMX address, status: {response.status}, response: {await response.text()}")
-    except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-        _LOGGER.warning(f"Network error fetching DMX address: {type(err).__name__}: {err}")
-    except json.JSONDecodeError as err:
-        _LOGGER.warning(f"Invalid JSON in DMX address response: {err}")
+                    last_error = "Unknown error retrieving DMX address"
+                break
     except Exception as err:
-        _LOGGER.warning(f"Unexpected error fetching DMX address: {type(err).__name__}: {err}")
-    
+        last_error = f"Unexpected {type(err).__name__}: {err}"
+        _LOGGER.warning(f"Unexpected error fetching DMX address for {dmx_uid}: {last_error}")
+
+    if discovery_triggered and last_error:
+        previous_error = _dmx_discovery_notifications.get(dmx_uid)
+        if previous_error != last_error:
+            _dmx_discovery_notifications[dmx_uid] = last_error
+            label = device_name or dmx_uid
+            await _async_notify_channel_issue(hass, label, dmx_uid, universe, last_error)
+
     return None
 
 
@@ -171,7 +306,8 @@ async def async_get_all_dmx_status(ip_address: str, channels: List[int], ola_por
         _api_request_count += 1
         
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as response:
+            timeout_config = aiohttp.ClientTimeout(total=10.0)
+            async with session.get(url, timeout=timeout_config) as response:
                 if response.status == 200:
                     data = await response.text()
                     
@@ -232,7 +368,8 @@ async def async_get_dmx_status(ip_address: str, channel: int, ola_port: int = DE
     try:
         _api_request_count += 1
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as response:
+            timeout_config = aiohttp.ClientTimeout(total=10.0)
+            async with session.get(url, timeout=timeout_config) as response:
                 _LOGGER.debug(f"Got response with status: {response.status}")
                 if response.status == 200:
                     data = await response.text()
@@ -280,7 +417,8 @@ async def _execute_curl_command(cmd: str) -> tuple[int, str, str]:
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await process.communicate()
-    return process.returncode, stdout.decode(), stderr.decode()
+    returncode = process.returncode if process.returncode is not None else -1
+    return returncode, stdout.decode(), stderr.decode()
 
 
 async def async_set_dmx_values(ip_address: str, channel_values: Dict[int, str], ola_port: int = 9090, testing_mode: bool = False) -> bool:

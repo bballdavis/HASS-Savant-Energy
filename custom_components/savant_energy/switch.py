@@ -9,10 +9,10 @@ import logging
 import time
 import math
 
-from homeassistant.components.switch import SwitchEntity
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.components.switch import SwitchEntity  # type: ignore
+from homeassistant.core import HomeAssistant, callback  # type: ignore
+from homeassistant.helpers.entity import DeviceInfo  # type: ignore
+from homeassistant.helpers.update_coordinator import CoordinatorEntity  # type: ignore
 
 from .const import DOMAIN, CONF_SWITCH_COOLDOWN, DEFAULT_SWITCH_COOLDOWN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE
 from .models import get_device_model
@@ -169,6 +169,7 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
                 device_name = entity_name.replace("_", " ").title()
 
             relay_found = False
+            relay_status_state = None
             for binary_sensor in self._hass.states.async_all("binary_sensor"):
                 if binary_sensor.attributes.get("friendly_name") and f"{device_name} Relay Status" == binary_sensor.attributes.get("friendly_name"):
                     relay_status_state = binary_sensor
@@ -176,7 +177,7 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
                     break
 
             value = "255"
-            if relay_found and relay_status_state.state not in ("unknown", "unavailable"):
+            if relay_found and relay_status_state and relay_status_state.state not in ("unknown", "unavailable"):
                 if relay_status_state.state.lower() == "on":
                     value = "255"
                 elif relay_status_state.state.lower() == "off":

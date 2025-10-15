@@ -5,13 +5,13 @@ Provides power and voltage sensor entities for each relay device.
 import logging
 from typing import Any, Optional
 
-from homeassistant.components.sensor import (
+from homeassistant.components.sensor import (  # type: ignore
     SensorEntity,
     SensorDeviceClass,
     SensorStateClass,
 )
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.helpers.entity import DeviceInfo  # type: ignore
+from homeassistant.helpers.update_coordinator import CoordinatorEntity  # type: ignore
 
 from .const import DOMAIN, MANUFACTURER
 from .models import get_device_model

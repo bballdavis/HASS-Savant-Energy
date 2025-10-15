@@ -7,13 +7,13 @@ All classes and functions are now documented for clarity and open source maintai
 import logging
 from typing import Any, Optional
 
-from homeassistant.components.sensor import (
+from homeassistant.components.sensor import (  # type: ignore
     SensorEntity,
     SensorDeviceClass,
     SensorStateClass,
 )
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.helpers.entity import DeviceInfo  # type: ignore
+from homeassistant.helpers.update_coordinator import CoordinatorEntity  # type: ignore
 
 from .const import DOMAIN, MANUFACTURER
 from .models import get_device_model
@@ -51,21 +51,6 @@ class EnergyDeviceSensor(CoordinatorEntity, SensorEntity):
         )
         self._attr_native_unit_of_measurement = self._get_unit_of_measurement(sensor_type)
         self._dmx_uid = dmx_uid
-
-    @property
-    def name(self) -> str:
-        """
-        Return the dynamic friendly name for the entity, based on the current device name.
-        """
-        # Try to get the latest device name from coordinator data
-        snapshot_data = self.coordinator.data.get("snapshot_data", {})
-        device_name = self._device["name"]
-        if snapshot_data and "presentDemands" in snapshot_data:
-            for device in snapshot_data["presentDemands"]:
-                if device["uid"] == self._device["uid"]:
-                    device_name = device["name"]
-                    break
-        return f"{device_name} {self._sensor_type.capitalize()}"
 
     def _get_unit_of_measurement(self, sensor_type: str) -> str | None:
         """

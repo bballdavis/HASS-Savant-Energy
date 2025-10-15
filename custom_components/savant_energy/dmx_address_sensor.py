@@ -7,9 +7,9 @@ All classes and functions are now documented for clarity and open source maintai
 import logging
 from typing import Any, Optional
 
-from homeassistant.components.sensor import SensorEntity, SensorStateClass
-from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.components.sensor import SensorEntity, SensorStateClass  # type: ignore
+from homeassistant.helpers.entity import DeviceInfo  # type: ignore
+from homeassistant.helpers.update_coordinator import CoordinatorEntity  # type: ignore
 
 from .const import DOMAIN, MANUFACTURER
 from .models import get_device_model
@@ -61,10 +61,6 @@ class DMXAddressSensor(CoordinatorEntity, SensorEntity):
     # Do NOT override entity_id. Home Assistant manages entity_id and expects it to be settable.
     # Only the name property is dynamic, so the UI/friendly_name updates on device rename.
     # unique_id remains stable and is used for entity tracking.
-    @property
-    def name(self):
-        return f"{self._current_device_name} DMX Address"
-
     @property
     def name(self) -> str:
         """
@@ -131,7 +127,15 @@ class DMXAddressSensor(CoordinatorEntity, SensorEntity):
             _LOGGER.warning(f"No IP address available for {self.name}")
             return
         universe = 1  # Default universe
-        address = await async_get_dmx_address(ip_address, ola_port, universe, self._dmx_uid)
+        device_label = self._current_device_name
+        address = await async_get_dmx_address(
+            ip_address,
+            ola_port,
+            universe,
+            self._dmx_uid,
+            hass=self.hass,
+            device_name=device_label,
+        )
         if address is not None:
             self._dmx_address = address
             self.async_write_ha_state()
