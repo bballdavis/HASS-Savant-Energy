@@ -379,7 +379,7 @@ async def async_get_dmx_address(
                 "RDM response for %s without address: %s",
                 dmx_uid,
                 raw_text,
-                url = f"http://{ip_address}:{ola_port}/json/rdm/uid_info?id={universe}&uid={dmx_uid}"
+            )
 
     if error_text == RDM_DEVICE_NOT_FOUND:
         _LOGGER.info(
@@ -405,10 +405,26 @@ async def async_get_dmx_address(
 
     last_error = error_text or "Unknown error retrieving DMX address"
 
+    if hass and schedule_discovery:
+        previous_error = _dmx_discovery_notifications.get(dmx_uid)
+        if previous_error != last_error:
+            _dmx_discovery_notifications[dmx_uid] = last_error
+            await _async_notify_channel_issue(
+                hass,
+                device_name or dmx_uid,
+                dmx_uid,
+                universe,
+                last_error,
+            )
+
     return None
 
 
-async def async_get_all_dmx_status(ip_address: str, channels: List[int], ola_port: int = DEFAULT_OLA_PORT) -> Dict[int, bool]:
+async def async_get_dmx_status_batch(
+    ip_address: str,
+    channels: list,
+    ola_port: int = DEFAULT_OLA_PORT,
+) -> dict:
     """
     Get DMX status for specified channels in one batch.
     Args:
@@ -447,12 +463,10 @@ async def async_get_all_dmx_status(ip_address: str, channels: List[int], ola_por
             async with session.get(url, timeout=timeout_config) as response:
                 if response.status == 200:
                     data = await response.text()
-                    _LOGGER.warning(
-                        "Failed to get DMX address for %s: %s",
-                        dmx_uid,
-                        error_text,
-                    )
-                    return None
+                    try:
+                        json_data = json.loads(data)
+                        if "dmx" in json_data:
+                            dmx_values = json_data["dmx"]
                             
                             for channel in int_channels:
                                 if 0 <= channel-1 < len(dmx_values):
