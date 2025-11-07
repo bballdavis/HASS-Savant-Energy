@@ -9,6 +9,9 @@ DOMAIN = "savant_energy"
 # List of Home Assistant platforms supported by this integration
 PLATFORMS = ["sensor", "binary_sensor", "switch", "button"]
 
+# Dispatcher signals
+SIGNAL_DMX_DISCOVERY_COMPLETE = "savant_energy_dmx_discovery_complete"
+
 # Configuration keys
 CONF_ADDRESS = "address"  # IP address of Savant controller
 CONF_PORT = "port"        # Port for energy snapshot data

@@ -104,54 +104,57 @@ def register_scene_services(hass, scene_manager, storage, coordinator):
         return resp
 
     # --- Register Services ---
-    hass.services.async_register(
-        DOMAIN,
-        "create_scene",
-        handle_create_scene,
-        schema=vol.Schema({
-            vol.Required("name"): str,
-            vol.Required("relay_states"): dict,
-        })
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "update_scene",
-        handle_update_scene,
-        schema=vol.Schema({
-            vol.Required("scene_id"): str,
-            vol.Optional("name"): str,
-            vol.Optional("relay_states"): dict,
-        })
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "delete_scene",
-        handle_delete_scene,
-        schema=vol.Schema({
-            vol.Required("scene_id"): str,
-        })
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "save_scenes",
-        handle_save_scenes,
-        schema=vol.Schema({
-            vol.Required("scenes"): list,
-        })
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "get_scenes",
-        handle_get_scenes,
-    )
-    hass.services.async_register(
-        DOMAIN,
-        "get_scene_breakers",
-        handle_get_scene_breakers,
-        schema=vol.Schema({
-            vol.Required("scene_id"): str,
-        })
-    )
+    try:
+        hass.services.async_register(
+            DOMAIN,
+            "create_scene",
+            handle_create_scene,
+            schema=vol.Schema({
+                vol.Required("name"): str,
+                vol.Required("relay_states"): dict,
+            }),
+        )
+        hass.services.async_register(
+            DOMAIN,
+            "update_scene",
+            handle_update_scene,
+            schema=vol.Schema({
+                vol.Required("scene_id"): str,
+                vol.Optional("name"): str,
+                vol.Optional("relay_states"): dict,
+            }),
+        )
+        hass.services.async_register(
+            DOMAIN,
+            "delete_scene",
+            handle_delete_scene,
+            schema=vol.Schema({
+                vol.Required("scene_id"): str,
+            }),
+        )
+        hass.services.async_register(
+            DOMAIN,
+            "save_scenes",
+            handle_save_scenes,
+            schema=vol.Schema({
+                vol.Required("scenes"): list,
+            }),
+        )
+        hass.services.async_register(
+            DOMAIN,
+            "get_scenes",
+            handle_get_scenes,
+        )
+        hass.services.async_register(
+            DOMAIN,
+            "get_scene_breakers",
+            handle_get_scene_breakers,
+            schema=vol.Schema({
+                vol.Required("scene_id"): str,
+            }),
+        )
+    except Exception as exc:  # pragma: no cover - defensive error handling
+        _LOGGER.error("Failed to register Savant Energy services: %s", exc, exc_info=True)
 
     # Return handlers for testing or extension
     return {

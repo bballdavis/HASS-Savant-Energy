@@ -279,19 +279,26 @@ async def async_setup_entry(
             scene_manager
         )
         # Do NOT create scene entities for Savant scenes anymore
-        # Register all Savant Energy scene API/service handlers
-        register_scene_services(hass, scene_manager, storage, coordinator)
-        # Register REST API views
-        hass.http.register_view(SavantScenesRestView)
-        _LOGGER.info("SavantScenesRestView registered at /api/savant_energy/scenes")
-        hass.http.register_view(SavantSceneDetailRestView)
-        _LOGGER.info(
-            "SavantSceneDetailRestView registered at /api/savant_energy/scenes/{scene_id}"
-        )
-        hass.http.register_view(SavantSceneBreakersRestView)
-        _LOGGER.info(
-            "SavantSceneBreakersRestView registered at /api/savant_energy/scene_breakers/{scene_id}"
-        )
+        # Register all Savant Energy scene API/service handlers and REST views
+        try:
+            register_scene_services(hass, scene_manager, storage, coordinator)
+            # Register REST API views
+            hass.http.register_view(SavantScenesRestView)
+            _LOGGER.info("SavantScenesRestView registered at /api/savant_energy/scenes")
+            hass.http.register_view(SavantSceneDetailRestView)
+            _LOGGER.info(
+                "SavantSceneDetailRestView registered at /api/savant_energy/scenes/{scene_id}"
+            )
+            hass.http.register_view(SavantSceneBreakersRestView)
+            _LOGGER.info(
+                "SavantSceneBreakersRestView registered at /api/savant_energy/scene_breakers/{scene_id}"
+            )
+        except Exception as exc:  # pragma: no cover - defensive error handling
+            _LOGGER.error(
+                "Failed to register Savant scene services or REST views: %s",
+                exc,
+                exc_info=True,
+            )
 
 
 class SavantSceneStorage:

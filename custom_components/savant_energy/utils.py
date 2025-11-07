@@ -11,7 +11,9 @@ from datetime import datetime, timedelta
 import aiohttp
 from typing import List, Dict, Any, Optional, Final, Tuple, Union
 
-from .const import DEFAULT_OLA_PORT
+from homeassistant.helpers.dispatcher import async_dispatcher_send  # type: ignore
+
+from .const import DEFAULT_OLA_PORT, SIGNAL_DMX_DISCOVERY_COMPLETE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,6 +24,7 @@ DMX_CACHE_SECONDS: Final = 5  # Cache DMX status for 5 seconds
 DMX_API_TIMEOUT: Final = 30  # Time in seconds to consider API down
 DMX_ADDRESS_CACHE_SECONDS: Final = 3600  # Cache DMX address for 1 hour
 RDM_DEVICE_NOT_FOUND: Final = "The RDM device could not be found"
+DISCOVERY_RETRY_SECONDS: Final = 15
 
 # Track API statistics
 _dmx_api_stats = {
@@ -39,6 +42,8 @@ _api_request_count: int = 0
 # DMX address cache to minimize API calls
 _dmx_address_cache = {}  # Maps DMX UID -> {"address": int, "timestamp": datetime}
 _dmx_discovery_notifications = {}  # Maps DMX UID -> last error string
+_pending_discovery_tasks: Dict[Tuple[str, int, int], asyncio.Task] = {}
+_pending_discovery_devices: Dict[Tuple[str, int, int], Dict[str, Optional[str]]] = {}
 
 
 async def _async_fetch_json(
@@ -106,6 +111,153 @@ async def _async_notify_channel_issue(
     )
 
 
+def _schedule_rdm_discovery(
+    hass: Optional[Any],
+    ip_address: str,
+    ola_port: int,
+    universe: int,
+    dmx_uid: str,
+    device_name: Optional[str],
+) -> None:
+    """Schedule a background task to run a full RDM discovery after setup completes."""
+    if hass is None:
+        return
+    key = (ip_address, ola_port, universe)
+    devices = _pending_discovery_devices.setdefault(key, {})
+    devices[dmx_uid] = device_name
+
+    task = _pending_discovery_tasks.get(key)
+    if task and not task.done():
+        return
+
+    async def _runner() -> None:
+        try:
+            await hass.async_block_till_done()
+        except Exception:  # pragma: no cover - defensive
+            pass
+        await asyncio.sleep(0)
+        await _async_run_rdm_discovery_pipeline(hass, ip_address, ola_port, universe)
+
+    if hasattr(hass, "async_create_background_task"):
+        _pending_discovery_tasks[key] = hass.async_create_background_task(
+            _runner(),
+            name=f"savant_energy_rdm_discovery_{ip_address}_{universe}",
+        )
+    else:  # pragma: no cover - legacy fallback
+        _pending_discovery_tasks[key] = hass.async_create_task(_runner())
+
+
+async def _async_run_rdm_discovery_pipeline(
+    hass: Any,
+    ip_address: str,
+    ola_port: int,
+    universe: int,
+) -> None:
+    """Run the RDM discovery loop until devices are reported, then refresh DMX addresses."""
+    key = (ip_address, ola_port, universe)
+    discovery_url = f"http://{ip_address}:{ola_port}/rdm/run_discovery?id={universe}"
+    discovered_uids: set[str] = set()
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            while True:
+                data, _, error = await _async_fetch_json(session, discovery_url, timeout=60)
+                if error:
+                    _LOGGER.error(
+                        "RDM discovery error for universe %s at %s:%s: %s",
+                        universe,
+                        ip_address,
+                        ola_port,
+                        error,
+                    )
+                    await asyncio.sleep(DISCOVERY_RETRY_SECONDS)
+                    continue
+
+                raw_uids = []
+                if isinstance(data, dict):
+                    raw_uids = data.get("uids") or []
+
+                if not raw_uids:
+                    _LOGGER.info(
+                        "RDM discovery returned no devices for universe %s; retrying in %s seconds",
+                        universe,
+                        DISCOVERY_RETRY_SECONDS,
+                    )
+                    await asyncio.sleep(DISCOVERY_RETRY_SECONDS)
+                    continue
+
+                discovered_uids = {
+                    str(entry.get("uid", "")).lower()
+                    for entry in raw_uids
+                    if isinstance(entry, dict) and entry.get("uid")
+                }
+
+                if not discovered_uids:
+                    _LOGGER.info(
+                        "RDM discovery reported devices without UIDs for universe %s; retrying in %s seconds",
+                        universe,
+                        DISCOVERY_RETRY_SECONDS,
+                    )
+                    await asyncio.sleep(DISCOVERY_RETRY_SECONDS)
+                    continue
+
+                _LOGGER.info(
+                    "RDM discovery found %d device(s) for universe %s",
+                    len(discovered_uids),
+                    universe,
+                )
+                break
+
+    except asyncio.CancelledError:  # pragma: no cover - task cancelled externally
+        raise
+    except Exception as exc:  # pragma: no cover - defensive
+        _LOGGER.error(
+            "Unexpected error during RDM discovery at %s:%s: %s",
+            ip_address,
+            ola_port,
+            exc,
+            exc_info=True,
+        )
+        return
+    finally:
+        _pending_discovery_tasks.pop(key, None)
+
+    tracked_devices = _pending_discovery_devices.pop(key, {})
+    for device_uid, device_name in tracked_devices.items():
+        address = await async_get_dmx_address(
+            ip_address,
+            ola_port,
+            universe,
+            device_uid,
+            hass=hass,
+            device_name=device_name,
+            schedule_discovery=False,
+        )
+        if address is None:
+            last_error = "DMX address unavailable after discovery"
+            previous_error = _dmx_discovery_notifications.get(device_uid)
+            if previous_error != last_error:
+                _dmx_discovery_notifications[device_uid] = last_error
+                await _async_notify_channel_issue(
+                    hass,
+                    device_name or device_uid,
+                    device_uid,
+                    universe,
+                    last_error,
+                )
+
+    if discovered_uids:
+        async_dispatcher_send(
+            hass,
+            SIGNAL_DMX_DISCOVERY_COMPLETE,
+            {
+                "uids": list(discovered_uids),
+                "ip_address": ip_address,
+                "ola_port": ola_port,
+                "universe": universe,
+            },
+        )
+
 def calculate_dmx_uid(uid: str) -> str:
     """
     Calculate the DMX UID based on the device UID, incrementing as hex if needed.
@@ -146,6 +298,7 @@ async def async_get_dmx_address(
     dmx_uid: str,
     hass: Optional[Any] = None,
     device_name: Optional[str] = None,
+    schedule_discovery: bool = True,
 ) -> Optional[int]:
     """
     Get DMX address for a device using the RDM API.
@@ -177,96 +330,80 @@ async def async_get_dmx_address(
         return None
 
     url = f"http://{ip_address}:{ola_port}/json/rdm/uid_info?id={universe}&uid={dmx_uid}"
-    discovery_triggered = False
     last_error: Optional[str] = None
 
     try:
         async with aiohttp.ClientSession() as session:
-            for attempt in range(2):
-                data, raw_text, fetch_error = await _async_fetch_json(
-                    session, url, timeout=10
-                )
-
-                if data and "address" in data:
-                    try:
-                        address = int(data["address"])
-                    except (TypeError, ValueError):
-                        last_error = f"Invalid address value: {data.get('address')}"
-                        _LOGGER.warning(
-                            f"Invalid address in RDM response for {dmx_uid}: {data}"
-                        )
-                    else:
-                        _dmx_address_cache[cache_key] = {
-                            "address": address,
-                            "timestamp": now,
-                        }
-                        if discovery_triggered:
-                            _dmx_discovery_notifications.pop(dmx_uid, None)
-                        return address
-
-                error_text: Optional[str] = fetch_error
-                if data and "address" not in data:
-                    error_text = str(
-                        data.get("error")
-                        or data.get("message")
-                        or (
-                            "; ".join(str(item) for item in data.get("errors", []))
-                            if isinstance(data.get("errors"), list)
-                            else None
-                        )
-                        or "Address not present in response"
-                    )
-                    if raw_text:
-                        _LOGGER.debug(
-                            f"RDM response for {dmx_uid} without address: {raw_text}"
-                        )
-
-                if error_text == RDM_DEVICE_NOT_FOUND and attempt == 0:
-                    discovery_triggered = True
-                    discovery_url = (
-                        f"http://{ip_address}:{ola_port}/rdm/run_discovery?id={universe}&incremental=true"
-                    )
-                    _LOGGER.info(
-                        "RDM device %s not found; triggering discovery on universe %s",
-                        dmx_uid,
-                        universe,
-                    )
-                    discovery_data, _, discovery_error = await _async_fetch_json(
-                        session, discovery_url, timeout=30
-                    )
-                    if discovery_error:
-                        last_error = discovery_error
-                        _LOGGER.warning(
-                            "RDM discovery failed for %s on universe %s: %s",
-                            dmx_uid,
-                            universe,
-                            discovery_error,
-                        )
-                        break
-                    if discovery_data and isinstance(discovery_data, dict):
-                        discovered_count = len(discovery_data.get("uids", []))
-                        _LOGGER.debug(
-                            "RDM discovery returned %d uid(s) for universe %s",
-                            discovered_count,
-                            universe,
-                        )
-                    continue
-
-                if error_text:
-                    last_error = error_text
-                else:
-                    last_error = "Unknown error retrieving DMX address"
-                break
+            data, raw_text, fetch_error = await _async_fetch_json(
+                session, url, timeout=10
+            )
     except Exception as err:
         last_error = f"Unexpected {type(err).__name__}: {err}"
-        _LOGGER.warning(f"Unexpected error fetching DMX address for {dmx_uid}: {last_error}")
+        _LOGGER.warning(
+            "Unexpected error fetching DMX address for %s: %s",
+            dmx_uid,
+            last_error,
+        )
+        return None
 
-    if discovery_triggered and last_error:
-        previous_error = _dmx_discovery_notifications.get(dmx_uid)
-        if previous_error != last_error:
-            _dmx_discovery_notifications[dmx_uid] = last_error
-            label = device_name or dmx_uid
-            await _async_notify_channel_issue(hass, label, dmx_uid, universe, last_error)
+    if data and "address" in data:
+        try:
+            address = int(data["address"])
+        except (TypeError, ValueError):
+            last_error = f"Invalid address value: {data.get('address')}"
+            _LOGGER.warning(
+                "Invalid address in RDM response for %s: %s",
+                dmx_uid,
+                data,
+            )
+            return None
+
+        _dmx_address_cache[cache_key] = {"address": address, "timestamp": now}
+        _dmx_discovery_notifications.pop(dmx_uid, None)
+        return address
+
+    error_text: Optional[str] = fetch_error
+    if data and "address" not in data:
+        error_text = str(
+            data.get("error")
+            or data.get("message")
+            or (
+                "; ".join(str(item) for item in data.get("errors", []))
+                if isinstance(data.get("errors"), list)
+                else None
+            )
+            or "Address not present in response"
+        )
+        if raw_text:
+            _LOGGER.debug(
+                "RDM response for %s without address: %s",
+                dmx_uid,
+                raw_text,
+                url = f"http://{ip_address}:{ola_port}/json/rdm/uid_info?id={universe}&uid={dmx_uid}"
+
+    if error_text == RDM_DEVICE_NOT_FOUND:
+        _LOGGER.info(
+            "RDM device %s not found when querying uid_info on universe %s",
+            dmx_uid,
+            universe,
+        )
+        if schedule_discovery:
+            _schedule_rdm_discovery(
+                hass,
+                ip_address,
+                ola_port,
+                universe,
+                dmx_uid,
+                device_name,
+            )
+    elif error_text:
+        _LOGGER.warning(
+            "Failed to get DMX address for %s: %s",
+            dmx_uid,
+            error_text,
+        )
+
+    last_error = error_text or "Unknown error retrieving DMX address"
 
     return None
 
@@ -310,11 +447,12 @@ async def async_get_all_dmx_status(ip_address: str, channels: List[int], ola_por
             async with session.get(url, timeout=timeout_config) as response:
                 if response.status == 200:
                     data = await response.text()
-                    
-                    try:
-                        json_data = json.loads(data)
-                        if "dmx" in json_data:
-                            dmx_values = json_data["dmx"]
+                    _LOGGER.warning(
+                        "Failed to get DMX address for %s: %s",
+                        dmx_uid,
+                        error_text,
+                    )
+                    return None
                             
                             for channel in int_channels:
                                 if 0 <= channel-1 < len(dmx_values):

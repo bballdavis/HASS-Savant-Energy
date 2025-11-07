@@ -8,10 +8,11 @@ import logging
 from typing import Any, Optional
 
 from homeassistant.components.sensor import SensorEntity, SensorStateClass  # type: ignore
+from homeassistant.helpers.dispatcher import async_dispatcher_connect  # type: ignore
 from homeassistant.helpers.entity import DeviceInfo  # type: ignore
 from homeassistant.helpers.update_coordinator import CoordinatorEntity  # type: ignore
 
-from .const import DOMAIN, MANUFACTURER
+from .const import DOMAIN, MANUFACTURER, SIGNAL_DMX_DISCOVERY_COMPLETE
 from .models import get_device_model
 from .utils import async_get_dmx_address, slugify
 
@@ -101,6 +102,14 @@ class DMXAddressSensor(CoordinatorEntity, SensorEntity):
         Fetches the DMX address from the API, respecting the DMX Address Cache option.
         """
         await super().async_added_to_hass()
+        # Refresh DMX address when discovery completes after initialization
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                SIGNAL_DMX_DISCOVERY_COMPLETE,
+                self._handle_discovery_complete,
+            )
+        )
         # Check config option for DMX address cache
         cache_enabled = False
         config_entry = getattr(self.coordinator, 'config_entry', None)
@@ -142,6 +151,23 @@ class DMXAddressSensor(CoordinatorEntity, SensorEntity):
             _LOGGER.info(f"Updated DMX address for {self.name}: {address}")
         else:
             _LOGGER.warning(f"Failed to fetch DMX address for {self.name}")
+
+    def _handle_discovery_complete(self, payload: dict[str, Any] | None) -> None:
+        """Handle global DMX discovery completion by re-fetching address."""
+        if not payload or not isinstance(payload, dict):
+            return
+        universe = payload.get("universe", 1)
+        if universe != 1:
+            return
+        uids = payload.get("uids") or []
+        if self._dmx_uid.lower() not in {str(uid).lower() for uid in uids}:
+            return
+        if not self.hass:
+            return
+        self.hass.async_create_background_task(
+            self._fetch_dmx_address(),
+            name=f"savant_energy_refresh_dmx_{self._dmx_uid}",
+        )
 
     @property
     def native_value(self):
