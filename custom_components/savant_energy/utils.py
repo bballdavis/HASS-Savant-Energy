@@ -16,6 +16,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send  # type: igno
 from .const import DEFAULT_OLA_PORT, SIGNAL_DMX_DISCOVERY_COMPLETE
 
 _LOGGER = logging.getLogger(__name__)
+_LOGGER.warning("<<<<< LOADING LATEST VERSION OF UTILS.PY >>>>>")
 
 # DMX API constants
 DMX_ON_VALUE: Final = 255
@@ -440,12 +441,12 @@ async def async_get_dmx_status_batch(
         _LOGGER.warning("Channels parameter is required but was empty - nothing to check")
         return {}
     
-    int_channels = []
+    int_channels: list[int] = []
     for ch in channels:
         try:
             int_channels.append(int(ch))
         except (ValueError, TypeError):
-            _LOGGER.warning(f"Skipping invalid channel: {ch}")
+            _LOGGER.debug(f"Skipping invalid channel value in batch request: {ch}")
 
     if not ip_address or not ola_port:
         _LOGGER.debug("Missing IP address or OLA port for DMX request")
@@ -465,21 +466,22 @@ async def async_get_dmx_status_batch(
                     data = await response.text()
                     try:
                         json_data = json.loads(data)
-                        if "dmx" in json_data:
-                            dmx_values = json_data["dmx"]
-                            
-                            for channel in int_channels:
-                                if 0 <= channel-1 < len(dmx_values):
-                                    channel_value = dmx_values[channel-1]
-                                    dmx_status = channel_value != DMX_OFF_VALUE
-                                    dmx_status_dict[channel] = dmx_status
-                                else:
-                                    _LOGGER.warning(f"Channel {channel} is out of range (max: {len(dmx_values)})")
-                            
-                            _last_successful_api_call = datetime.now()
-                        else:
-                            _LOGGER.error(f"Expected 'dmx' key not found in JSON response: {json_data}")
+                        if "dmx" not in json_data:
+                            _LOGGER.error("Batch DMX response missing 'dmx' key")
                             _api_failure_count += 1
+                        else:
+                            dmx_values = json_data["dmx"]
+                            max_index = len(dmx_values)
+                            for channel in int_channels:
+                                idx = channel - 1
+                                if 0 <= idx < max_index:
+                                    value = dmx_values[idx]
+                                    dmx_status_dict[channel] = value != DMX_OFF_VALUE
+                                else:
+                                    _LOGGER.debug(
+                                        f"Channel {channel} out of range for batch (max {max_index})"
+                                    )
+                            _last_successful_api_call = datetime.now()
                             
                     except json.JSONDecodeError as e:
                         _LOGGER.error(f"Error parsing JSON response: {e}, data: '{data}'")
@@ -495,6 +497,18 @@ async def async_get_dmx_status_batch(
         _api_failure_count += 1
     
     return dmx_status_dict
+
+
+async def async_get_all_dmx_status(
+    ip_address: str,
+    channels: list,
+    ola_port: int = DEFAULT_OLA_PORT,
+) -> dict:
+    """
+    Convenience wrapper that returns DMX on/off status for a list of channels.
+    Uses the batch API to fetch the full DMX universe once and maps the requested channels.
+    """
+    return await async_get_dmx_status_batch(ip_address, channels, ola_port)
 
 
 async def async_get_dmx_status(ip_address: str, channel: int, ola_port: int = DEFAULT_OLA_PORT) -> Optional[bool]:

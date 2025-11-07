@@ -1,7 +1,7 @@
 {
   "domain": "savant_energy",
   "name": "Savant Energy",
-  "version": "0.1.0",
+  "version": "1.5.3",
   "documentation": "https://github.com/bballdavis/hass-savant-pbc",
   "requirements": [],
   "dependencies": ["frontend", "lovelace"],

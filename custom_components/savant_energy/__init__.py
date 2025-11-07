@@ -27,7 +27,7 @@ from .const import (
     DEFAULT_OLA_PORT,
 )
 from .snapshot_data import get_current_energy_snapshot
-from .utils import async_get_all_dmx_status, DMX_CACHE_SECONDS
+from .utils import async_get_all_dmx_status, DMX_CACHE_SECONDS # type: ignore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -121,7 +121,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 not self.dmx_last_update
                 or (now - self.dmx_last_update).total_seconds() > DMX_CACHE_SECONDS
             ):
-                _LOGGER.debug("Updating DMX status data for debugging purposes only")
+                _LOGGER.debug("Updating DMX status data due to expired cache")
                 ola_port = self.config_entry.data.get("ola_port", DEFAULT_OLA_PORT)
                 self.dmx_data = {}
                 self.dmx_last_update = now
@@ -147,7 +147,7 @@ async def _async_register_frontend_resource(hass: HomeAssistant) -> None:
         
         # Try the new method first (HA 2024.7+)
         try:
-            from homeassistant.components.http import StaticPathConfig
+            from homeassistant.components.http import StaticPathConfig # type: ignore
             await hass.http.async_register_static_paths([
                 StaticPathConfig(local_path, os.path.dirname(__file__), True)
             ])
