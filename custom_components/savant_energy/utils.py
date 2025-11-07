@@ -16,7 +16,6 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send  # type: igno
 from .const import DEFAULT_OLA_PORT, SIGNAL_DMX_DISCOVERY_COMPLETE
 
 _LOGGER = logging.getLogger(__name__)
-_LOGGER.warning("<<<<< LOADING LATEST VERSION OF UTILS.PY >>>>>")
 
 # DMX API constants
 DMX_ON_VALUE: Final = 255
