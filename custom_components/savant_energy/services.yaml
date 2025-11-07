@@ -1,0 +1,46 @@
+create_scene:
+  description: "Create a Savant Energy scene. Stores a named set of relay states."
+  fields:
+    name:
+      description: "Human-readable scene name"
+      example: "Evening Lights"
+      required: true
+    relay_states:
+      description: "Mapping of device ids to boolean states (true = on)."
+      example: {"breaker_1": true, "breaker_2": false}
+      required: true
+
+update_scene:
+  description: "Update an existing Savant Energy scene by id."
+  fields:
+    scene_id:
+      description: "ID of the scene to update"
+      required: true
+    name:
+      description: "Optional new name for the scene"
+    relay_states:
+      description: "Optional new mapping of relay states to store"
+
+delete_scene:
+  description: "Delete a Savant Energy scene by id."
+  fields:
+    scene_id:
+      description: "ID of the scene to delete"
+      required: true
+
+save_scenes:
+  description: "Overwrite the saved scenes storage with a provided list."
+  fields:
+    scenes:
+      description: "A list of scenes in the same format used by the integration's storage"
+      required: true
+
+get_scenes:
+  description: "Retrieve a list of available scenes (id and name)."
+
+get_scene_breakers:
+  description: "Return known breakers/devices for a saved scene along with saved states."
+  fields:
+    scene_id:
+      description: "Scene id to query"
+      required: true
