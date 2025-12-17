@@ -41,6 +41,8 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
     """
     def __init__(self, coordinator, device, unique_id, dmx_uid):
         super().__init__(coordinator)
+        # Keep full device dict for compatibility with other code paths
+        self._device = device
         self._device_uid = device["uid"]
         self._attr_unique_id = unique_id
         self._dmx_uid = dmx_uid
