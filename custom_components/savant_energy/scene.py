@@ -591,16 +591,16 @@ class SavantSceneManager:
         _LOGGER.info(f"Executing scene {scene['name']} with {len(dmx_values)} relays")
 
         # Send the DMX command
-        success = await async_set_dmx_values(
+        result = await async_set_dmx_values(
             ip_address, dmx_values, ola_port, dmx_testing_mode
         )
 
-        if success:
+        if result and result.get("success"):
             _LOGGER.info(f"Scene {scene['name']} executed successfully.")
+            return True
         else:
-            _LOGGER.error(f"Scene {scene['name']} failed to execute.")
-
-        return success
+            _LOGGER.error(f"Scene {scene['name']} failed to execute. Result: {result}")
+            return False
 
     def get_all_available_devices(self) -> Dict[str, bool]:
         """Get a list of all available breaker switch devices and their current states."""

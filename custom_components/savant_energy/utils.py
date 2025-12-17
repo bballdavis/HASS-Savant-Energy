@@ -586,7 +586,7 @@ async def _execute_curl_command(cmd: str) -> tuple[int, str, str]:
     return returncode, stdout.decode(), stderr.decode()
 
 
-async def async_set_dmx_values(ip_address: str, channel_values: Dict[int, str], ola_port: int = 9090, testing_mode: bool = False) -> bool:
+async def async_set_dmx_values(ip_address: str, channel_values: Dict[int, str], ola_port: int = 9090, testing_mode: bool = False) -> Dict[str, Any]:
     """
     Set DMX values for channels.
     Args:
@@ -602,42 +602,63 @@ async def async_set_dmx_values(ip_address: str, channel_values: Dict[int, str], 
     
     try:
         max_channel = max(channel_values.keys()) if channel_values else 0
-        
+
         value_array = ["0"] * max_channel
-        
+
         for channel, value in channel_values.items():
             if 1 <= channel <= max_channel:
                 if str(value) == "255" or str(value).lower() == "on" or str(value) == "1":
-                    value_array[channel-1] = "255"
+                    value_array[channel - 1] = "255"
                 else:
-                    value_array[channel-1] = "0"
-        
+                    value_array[channel - 1] = "0"
+
         data_param = ",".join(value_array)
-        
-        cmd = f'curl -X POST -d "u=1&d={data_param}" http://{ip_address}:{ola_port}/set_dmx'
-        
+
+        url = f"http://{ip_address}:{ola_port}/set_dmx"
         log_level = logging.INFO if testing_mode else logging.DEBUG
-        _LOGGER.log(log_level, f"DMX COMMAND {'(TESTING MODE - NOT SENT)' if testing_mode else '(sending)'}: {cmd}")
-        
+        _LOGGER.log(log_level, f"DMX COMMAND {'(TESTING MODE - NOT SENT)' if testing_mode else '(sending)'}: POST {url} u=1 d={data_param}")
+
         if testing_mode:
             _dmx_api_stats["last_successful_call"] = datetime.now()
-            _dmx_api_stats["success_rate"] = ((_dmx_api_stats["request_count"] - _dmx_api_stats["failure_count"]) / 
-                                            _dmx_api_stats["request_count"]) * 100.0
-            return True
-        
-        returncode, stdout, stderr = await _execute_curl_command(cmd)
-        if returncode != 0:
-            _LOGGER.error(f"Error setting DMX values: {stderr}")
-            _dmx_api_stats["failure_count"] += 1
-            _dmx_api_stats["success_rate"] = ((_dmx_api_stats["request_count"] - _dmx_api_stats["failure_count"]) / 
-                                            _dmx_api_stats["request_count"]) * 100.0
-            return False
-        _LOGGER.info(f"DMX command response: {stdout}")
+            _dmx_api_stats["success_rate"] = ((_dmx_api_stats["request_count"] - _dmx_api_stats["failure_count"]) /
+                                              _dmx_api_stats["request_count"]) * 100.0
+            return {"success": True, "status": None, "text": "(testing)", "json": None}
 
-        _dmx_api_stats["last_successful_call"] = datetime.now()
-        _dmx_api_stats["success_rate"] = ((_dmx_api_stats["request_count"] - _dmx_api_stats["failure_count"]) / 
-                                        _dmx_api_stats["request_count"]) * 100.0
-        return True
+        # Perform aiohttp POST to OLA
+        try:
+            timeout_cfg = aiohttp.ClientTimeout(total=5.0)
+            async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
+                async with session.post(url, data={"u": "1", "d": data_param}) as resp:
+                    status = resp.status
+                    text = await resp.text()
+                    json_body = None
+                    if _LOGGER.isEnabledFor(logging.DEBUG):
+                        _LOGGER.debug(f"DMX POST response status: {status}, body: {text}")
+                    try:
+                        json_body = json.loads(text)
+                    except Exception:
+                        json_body = None
+
+                    if status != 200:
+                        _LOGGER.error(f"DMX POST failed with status {status}: {text}")
+                        _dmx_api_stats["failure_count"] += 1
+                        _dmx_api_stats["success_rate"] = ((_dmx_api_stats["request_count"] - _dmx_api_stats["failure_count"]) /
+                                                          _dmx_api_stats["request_count"]) * 100.0
+                        return {"success": False, "status": status, "text": text, "json": json_body}
+
+                    # Successful HTTP 200
+                    _LOGGER.info(f"DMX command response: {text}")
+                    _dmx_api_stats["last_successful_call"] = datetime.now()
+                    _dmx_api_stats["success_rate"] = ((_dmx_api_stats["request_count"] - _dmx_api_stats["failure_count"]) /
+                                                      _dmx_api_stats["request_count"]) * 100.0
+                    return {"success": True, "status": status, "text": text, "json": json_body}
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            _LOGGER.error(f"Network error setting DMX values: {type(err).__name__}: {err}")
+            _dmx_api_stats["failure_count"] += 1
+            _dmx_api_stats["success_rate"] = ((_dmx_api_stats["request_count"] - _dmx_api_stats["failure_count"]) /
+                                              _dmx_api_stats["request_count"]) * 100.0
+            return {"success": False, "status": None, "text": None, "json": None, "error": str(err)}
         
     except Exception as e:
         _LOGGER.error(f"Failed to set DMX values: {str(e)}")

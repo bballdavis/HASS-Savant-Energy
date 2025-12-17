@@ -113,13 +113,13 @@ class SavantSceneButton(ButtonEntity):
         _LOGGER.info(
             f"Executing Savant Scene '{scene['name']}' with {len(dmx_values)} DMX addresses."
         )
-        success = await async_set_dmx_values(
+        result = await async_set_dmx_values(
             ip_address, dmx_values, ola_port, dmx_testing_mode
         )
-        if success:
+        if result and result.get("success"):
             _LOGGER.info(f"Savant Scene '{scene['name']}' executed successfully.")
         else:
-            _LOGGER.warning(f"Failed to execute Savant Scene '{scene['name']}'.")
+            _LOGGER.warning(f"Failed to execute Savant Scene '{scene['name']}'. Result: {result}")
 
 
 async def async_setup_entry(
@@ -329,14 +329,14 @@ class SavantAllLoadsButton(ButtonEntity):
         )
 
         # Use utility function to send command - this will both log and send the command
-        success = await async_set_dmx_values(
+        result = await async_set_dmx_values(
             ip_address, dmx_values, ola_port, dmx_testing_mode
         )
 
-        if success:
+        if result and result.get("success"):
             _LOGGER.info("All loads turned on successfully")
         else:
-            _LOGGER.warning("Failed to turn on all loads")
+            _LOGGER.warning(f"Failed to turn on all loads. Result: {result}")
 
 
 class SavantApiCommandLogButton(ButtonEntity):

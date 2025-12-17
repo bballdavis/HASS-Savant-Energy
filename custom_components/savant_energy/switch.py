@@ -8,6 +8,7 @@ All classes and methods are now documented for clarity and open source maintaina
 import logging
 import time
 import math
+import asyncio
 
 from homeassistant.components.switch import SwitchEntity  # type: ignore
 from homeassistant.core import HomeAssistant, callback  # type: ignore
@@ -208,10 +209,11 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             CONF_DMX_TESTING_MODE,
             self.coordinator.config_entry.data.get(CONF_DMX_TESTING_MODE, False)
         )
-        success = await async_set_dmx_values(ip_address, dmx_states, ola_port, dmx_testing_mode)
+        result = await async_set_dmx_values(ip_address, dmx_states, ola_port, dmx_testing_mode)
+        success = bool(result and result.get("success"))
         if not success:
-            _LOGGER.error(f"Failed to send DMX command for {self.name} at address {target_dmx_address}")
-        return success
+            _LOGGER.error(f"Failed to send DMX command for {self.name} at address {target_dmx_address}: {result}")
+        return result
 
     @property
     def available(self) -> bool:
@@ -270,10 +272,41 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
                 _LOGGER.warning(f"Cannot turn on {self.name}: DMX address unknown")
                 return
             _LOGGER.info(f"Turning ON {self.name} at DMX address {dmx_address}")
-            await self._send_full_dmx_command(dmx_address, "255")
-            self._attr_is_on = True
-            self._last_commanded_state = True
-            self.async_write_ha_state()
+            result = await self._send_full_dmx_command(dmx_address, "255")
+            if result and result.get("success"):
+                # If OLA returns an 'ok' plain text response, schedule delayed HA state update
+                text = (result.get("text") or "").strip().lower()
+                if text == "ok":
+                    # Wait one coordinator update interval before reflecting the change in HA
+                    try:
+                        interval = self.coordinator.update_interval.total_seconds()
+                    except Exception:
+                        interval = self.coordinator.config_entry.options.get("scan_interval", self.coordinator.config_entry.data.get("scan_interval", 15))
+
+                    async def _delayed_set_on():
+                        await asyncio.sleep(interval)
+                        self._attr_is_on = True
+                        self._last_commanded_state = True
+                        self.async_write_ha_state()
+
+                    # Schedule background task so we don't block the caller
+                    self._hass.async_create_task(_delayed_set_on())
+                else:
+                    # Non-OK response but HTTP success — set state after interval anyway
+                    try:
+                        interval = self.coordinator.update_interval.total_seconds()
+                    except Exception:
+                        interval = self.coordinator.config_entry.options.get("scan_interval", self.coordinator.config_entry.data.get("scan_interval", 15))
+
+                    async def _delayed_set_on_fallback():
+                        await asyncio.sleep(interval)
+                        self._attr_is_on = True
+                        self._last_commanded_state = True
+                        self.async_write_ha_state()
+
+                    self._hass.async_create_task(_delayed_set_on_fallback())
+            else:
+                _LOGGER.error(f"Failed to set DMX ON for {self.name}; not updating HA state")
 
     async def async_turn_off(self, **kwargs):
         """
@@ -302,10 +335,37 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
                 _LOGGER.warning(f"Cannot turn off {self.name}: DMX address unknown")
                 return
             _LOGGER.info(f"Turning OFF {self.name} at DMX address {dmx_address}")
-            await self._send_full_dmx_command(dmx_address, "0")
-            self._attr_is_on = False
-            self._last_commanded_state = False
-            self.async_write_ha_state()
+            result = await self._send_full_dmx_command(dmx_address, "0")
+            if result and result.get("success"):
+                text = (result.get("text") or "").strip().lower()
+                if text == "ok":
+                    try:
+                        interval = self.coordinator.update_interval.total_seconds()
+                    except Exception:
+                        interval = self.coordinator.config_entry.options.get("scan_interval", self.coordinator.config_entry.data.get("scan_interval", 15))
+
+                    async def _delayed_set_off():
+                        await asyncio.sleep(interval)
+                        self._attr_is_on = False
+                        self._last_commanded_state = False
+                        self.async_write_ha_state()
+
+                    self._hass.async_create_task(_delayed_set_off())
+                else:
+                    try:
+                        interval = self.coordinator.update_interval.total_seconds()
+                    except Exception:
+                        interval = self.coordinator.config_entry.options.get("scan_interval", self.coordinator.config_entry.data.get("scan_interval", 15))
+
+                    async def _delayed_set_off_fallback():
+                        await asyncio.sleep(interval)
+                        self._attr_is_on = False
+                        self._last_commanded_state = False
+                        self.async_write_ha_state()
+
+                    self._hass.async_create_task(_delayed_set_off_fallback())
+            else:
+                _LOGGER.error(f"Failed to set DMX OFF for {self.name}; not updating HA state")
 
     @callback
     def _handle_coordinator_update(self) -> None:
