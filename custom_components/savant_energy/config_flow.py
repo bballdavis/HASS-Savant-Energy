@@ -102,8 +102,18 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         """
         Handle the initial step of the options flow.
         """
+        errors = {}
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            # Validate breaker debounce delay is an integer within allowed range
+            try:
+                pcm = int(user_input.get(CONF_PENDING_CONFIRM_MULTIPLIER, DEFAULT_PENDING_CONFIRM_MULTIPLIER))
+                if pcm < 1 or pcm > 10:
+                    errors[CONF_PENDING_CONFIRM_MULTIPLIER] = "out_of_range"
+            except Exception:
+                errors[CONF_PENDING_CONFIRM_MULTIPLIER] = "invalid_value"
+
+            if not errors:
+                return self.async_create_entry(title="", data=user_input)
         options_schema = {
             vol.Required(
                 CONF_ADDRESS,
@@ -142,7 +152,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                     ),
                 ),
             ): int,
-            vol.Optional(
+            vol.Required(
                 CONF_PENDING_CONFIRM_MULTIPLIER,
                 default=self.config_entry.options.get(
                     CONF_PENDING_CONFIRM_MULTIPLIER,
@@ -150,7 +160,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         CONF_PENDING_CONFIRM_MULTIPLIER, DEFAULT_PENDING_CONFIRM_MULTIPLIER
                     ),
                 ),
-            ): vol.All(vol.Coerce(int), vol.Range(min=1, max=10)),
+            ): vol.Coerce(int),
             vol.Optional(
                 CONF_DMX_TESTING_MODE,
                 default=self.config_entry.options.get(
