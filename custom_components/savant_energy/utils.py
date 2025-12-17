@@ -25,6 +25,8 @@ DMX_API_TIMEOUT: Final = 30  # Time in seconds to consider API down
 DMX_ADDRESS_CACHE_SECONDS: Final = 3600  # Cache DMX address for 1 hour
 RDM_DEVICE_NOT_FOUND: Final = "The RDM device could not be found"
 DISCOVERY_RETRY_SECONDS: Final = 15
+DISCOVERY_INITIAL_DELAY: Final = 60  # Initial wait after an empty discovery response
+DISCOVERY_MAX_DELAY: Final = 600  # Maximum backoff delay for discovery retries
 
 # Track API statistics
 _dmx_api_stats = {
@@ -160,8 +162,10 @@ async def _async_run_rdm_discovery_pipeline(
 
     try:
         async with aiohttp.ClientSession() as session:
+            # Exponential backoff parameters
+            retry_delay = DISCOVERY_INITIAL_DELAY
             while True:
-                data, _, error = await _async_fetch_json(session, discovery_url, timeout=60)
+                data, raw_text, error = await _async_fetch_json(session, discovery_url, timeout=60)
                 if error:
                     _LOGGER.error(
                         "RDM discovery error for universe %s at %s:%s: %s",
@@ -170,20 +174,25 @@ async def _async_run_rdm_discovery_pipeline(
                         ola_port,
                         error,
                     )
-                    await asyncio.sleep(DISCOVERY_RETRY_SECONDS)
+                    _LOGGER.info("RDM discovery will retry in %s seconds", retry_delay)
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(DISCOVERY_MAX_DELAY, int(retry_delay * 2))
                     continue
 
                 raw_uids = []
                 if isinstance(data, dict):
                     raw_uids = data.get("uids") or []
 
+                # Treat an explicit empty 'uids' array as a retryable empty response
                 if not raw_uids:
                     _LOGGER.info(
-                        "RDM discovery returned no devices for universe %s; retrying in %s seconds",
+                        "RDM discovery returned no devices for universe %s (response: %s); retrying in %s seconds",
                         universe,
-                        DISCOVERY_RETRY_SECONDS,
+                        raw_text if raw_text is not None else "(no response)",
+                        retry_delay,
                     )
-                    await asyncio.sleep(DISCOVERY_RETRY_SECONDS)
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(DISCOVERY_MAX_DELAY, int(retry_delay * 2))
                     continue
 
                 discovered_uids = {
@@ -196,9 +205,10 @@ async def _async_run_rdm_discovery_pipeline(
                     _LOGGER.info(
                         "RDM discovery reported devices without UIDs for universe %s; retrying in %s seconds",
                         universe,
-                        DISCOVERY_RETRY_SECONDS,
+                        retry_delay,
                     )
-                    await asyncio.sleep(DISCOVERY_RETRY_SECONDS)
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(DISCOVERY_MAX_DELAY, int(retry_delay * 2))
                     continue
 
                 _LOGGER.info(
