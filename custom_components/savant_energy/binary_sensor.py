@@ -69,8 +69,13 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
                 if dev_in_snapshot.get("uid") == self._device_uid:
                     device_name_from_coordinator = dev_in_snapshot.get("name")
                     break
-        
-        base_name = device_name_from_coordinator or self._initial_name
+
+        # Fallback to any statically stored device name if available
+        base_name = device_name_from_coordinator or getattr(self, "_initial_name", None)
+        if not base_name and hasattr(self, "_device") and isinstance(self._device, dict):
+            base_name = self._device.get("name")
+        if not base_name:
+            base_name = f"Savant Device {self._device_uid}"
         return f"{base_name} Relay Status"
 
     @property
@@ -123,17 +128,27 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
         """
         Return dynamic DeviceInfo with the current device name and model.
         """
-        current_name_val = self._initial_name  # Default to initial name
-        current_capacity_val = self._initial_capacity  # Default to initial capacity
+        # Start with initial/fallback values
+        current_name_val = getattr(self, "_initial_name", None) or f"Savant Device {self._device_uid}"
+        current_capacity_val = getattr(self, "_initial_capacity", 0)
 
+        # Prefer latest snapshot data if available
         snapshot_data = self.coordinator.data.get("snapshot_data", {}) if self.coordinator.data else {}
         if snapshot_data and "presentDemands" in snapshot_data and isinstance(snapshot_data["presentDemands"], list):
             for device_in_snapshot in snapshot_data["presentDemands"]:
                 if device_in_snapshot.get("uid") == self._device_uid:
-                    current_name_val = device_in_snapshot.get("name", self._initial_name)
-                    current_capacity_val = device_in_snapshot.get("capacity", self._initial_capacity)
+                    current_name_val = device_in_snapshot.get("name", current_name_val)
+                    current_capacity_val = device_in_snapshot.get("capacity", current_capacity_val)
                     break
-        
+
+        # If we still don't have a name, try the original device dict if present
+        if (not current_name_val or current_name_val.startswith("Savant Device")) and hasattr(self, "_device") and isinstance(self._device, dict):
+            try:
+                current_name_val = self._device.get("name", current_name_val)
+                current_capacity_val = self._device.get("capacity", current_capacity_val)
+            except Exception as exc:  # pragma: no cover - defensive
+                _LOGGER.debug("Error reading _device dict for device_info: %s", exc)
+
         return DeviceInfo(
             identifiers={(DOMAIN, str(self._device_uid))},
             name=current_name_val,
