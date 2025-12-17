@@ -311,6 +311,8 @@ class SavantSceneStorage:
         self.scenes: Dict[str, Dict] = {}
         self._lock = asyncio.Lock()
         self._last_saved_state: Dict[str, Dict] = {}
+        # Track whether we've already logged an empty storage state to avoid spamming logs
+        self._warned_no_scenes: bool = False
 
     def _get_normalized_scene_parts(self, raw_name: str) -> tuple[str, str, str]:
         """
@@ -348,7 +350,12 @@ class SavantSceneStorage:
                 sd["relay_states"] = cleaned
             _LOGGER.debug(f"Loaded and validated {len(self.scenes)} scenes.")
         else:
-            _LOGGER.warning("No valid scenes in storage; resetting.")
+            # Avoid repeatedly warning about empty storage; log once at INFO level instead
+            if not self._warned_no_scenes:
+                _LOGGER.info("No scenes in storage; initializing empty scenes store.")
+                self._warned_no_scenes = True
+            else:
+                _LOGGER.debug("No scenes found in storage on load; continuing with empty store.")
             self.scenes = {}
 
 
