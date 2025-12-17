@@ -21,6 +21,8 @@ CONF_SWITCH_COOLDOWN = "switch_cooldown"  # Minimum seconds between relay toggle
 CONF_DMX_TESTING_MODE = "dmx_testing_mode"  # Enable advanced DMX testing mode
 CONF_DMX_ADDRESS_CACHE = "dmx_address_cache"  # Enable DMX address caching
 
+CONF_PENDING_CONFIRM_MULTIPLIER = "pending_confirm_multiplier"  # Multiplier for pending confirm timeout (scan_interval * multiplier)
+
 # Default values
 DEFAULT_SWITCH_COOLDOWN = 30  # Default cooldown of 30 seconds
 DEFAULT_PORT = 2000           # Default Savant energy port
@@ -30,6 +32,7 @@ DEFAULT_OLA_PORT = 9090       # Default OLA/DMX API port
 DEFAULT_DMX_TESTING_MODE = False
 DEFAULT_DMX_ADDRESS_CACHE = False
 DEFAULT_DISABLE_SCENE_BUILDER = False
+DEFAULT_PENDING_CONFIRM_MULTIPLIER = 3
 
 # Manufacturer branding
 MANUFACTURER = "Savant"

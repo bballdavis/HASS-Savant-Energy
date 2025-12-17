@@ -141,6 +141,15 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 ),
             ): int,
             vol.Optional(
+                CONF_PENDING_CONFIRM_MULTIPLIER,
+                default=self.config_entry.options.get(
+                    CONF_PENDING_CONFIRM_MULTIPLIER,
+                    self.config_entry.data.get(
+                        CONF_PENDING_CONFIRM_MULTIPLIER, DEFAULT_PENDING_CONFIRM_MULTIPLIER
+                    ),
+                ),
+            ): vol.All(vol.Coerce(int), vol.Range(min=1, max=10)),
+            vol.Optional(
                 CONF_DMX_TESTING_MODE,
                 default=self.config_entry.options.get(
                     CONF_DMX_TESTING_MODE,

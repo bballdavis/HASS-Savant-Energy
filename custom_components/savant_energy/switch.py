@@ -15,13 +15,23 @@ from homeassistant.core import HomeAssistant, callback  # type: ignore
 from homeassistant.helpers.entity import DeviceInfo  # type: ignore
 from homeassistant.helpers.update_coordinator import CoordinatorEntity  # type: ignore
 
-from .const import DOMAIN, CONF_SWITCH_COOLDOWN, DEFAULT_SWITCH_COOLDOWN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE
+from .const import (
+    DOMAIN,
+    CONF_SWITCH_COOLDOWN,
+    DEFAULT_SWITCH_COOLDOWN,
+    MANUFACTURER,
+    DEFAULT_OLA_PORT,
+    CONF_DMX_TESTING_MODE,
+    CONF_PENDING_CONFIRM_MULTIPLIER,
+    DEFAULT_PENDING_CONFIRM_MULTIPLIER,
+)
 from .models import get_device_model
 from .utils import calculate_dmx_uid, async_set_dmx_values, async_get_dmx_address, slugify
 
 _LOGGER = logging.getLogger(__name__)
 
 _last_command_time = 0.0
+PENDING_CONFIRM_MULTIPLIER: int = 3  # Number of coordinator update intervals to wait before timing out
 
 
 async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities):
@@ -81,6 +91,11 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         )
         self._attr_is_on = self._get_relay_status_state()
         self._last_commanded_state = self._attr_is_on
+        # Pending confirmation state after a user-initiated command
+        self._pending_confirm = False
+        self._pending_confirm_target: bool | None = None
+        self._pending_confirm_task: asyncio.Task | None = None
+        self._pending_confirm_expires: float | None = None
         self.async_on_remove(
             self.coordinator.async_add_listener(self._handle_coordinator_update)
         )
@@ -274,37 +289,11 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             _LOGGER.info(f"Turning ON {self.name} at DMX address {dmx_address}")
             result = await self._send_full_dmx_command(dmx_address, "255")
             if result and result.get("success"):
-                # If OLA returns an 'ok' plain text response, schedule delayed HA state update
-                text = (result.get("text") or "").strip().lower()
-                if text == "ok":
-                    # Wait one coordinator update interval before reflecting the change in HA
-                    try:
-                        interval = self.coordinator.update_interval.total_seconds()
-                    except Exception:
-                        interval = self.coordinator.config_entry.options.get("scan_interval", self.coordinator.config_entry.data.get("scan_interval", 15))
-
-                    async def _delayed_set_on():
-                        await asyncio.sleep(interval)
-                        self._attr_is_on = True
-                        self._last_commanded_state = True
-                        self.async_write_ha_state()
-
-                    # Schedule background task so we don't block the caller
-                    self._hass.async_create_task(_delayed_set_on())
-                else:
-                    # Non-OK response but HTTP success — set state after interval anyway
-                    try:
-                        interval = self.coordinator.update_interval.total_seconds()
-                    except Exception:
-                        interval = self.coordinator.config_entry.options.get("scan_interval", self.coordinator.config_entry.data.get("scan_interval", 15))
-
-                    async def _delayed_set_on_fallback():
-                        await asyncio.sleep(interval)
-                        self._attr_is_on = True
-                        self._last_commanded_state = True
-                        self.async_write_ha_state()
-
-                    self._hass.async_create_task(_delayed_set_on_fallback())
+                # Immediately reflect the commanded state in HA and start confirmation timeout
+                self._attr_is_on = True
+                self._last_commanded_state = True
+                self.async_write_ha_state()
+                self._start_pending_confirm(True)
             else:
                 _LOGGER.error(f"Failed to set DMX ON for {self.name}; not updating HA state")
 
@@ -337,33 +326,11 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             _LOGGER.info(f"Turning OFF {self.name} at DMX address {dmx_address}")
             result = await self._send_full_dmx_command(dmx_address, "0")
             if result and result.get("success"):
-                text = (result.get("text") or "").strip().lower()
-                if text == "ok":
-                    try:
-                        interval = self.coordinator.update_interval.total_seconds()
-                    except Exception:
-                        interval = self.coordinator.config_entry.options.get("scan_interval", self.coordinator.config_entry.data.get("scan_interval", 15))
-
-                    async def _delayed_set_off():
-                        await asyncio.sleep(interval)
-                        self._attr_is_on = False
-                        self._last_commanded_state = False
-                        self.async_write_ha_state()
-
-                    self._hass.async_create_task(_delayed_set_off())
-                else:
-                    try:
-                        interval = self.coordinator.update_interval.total_seconds()
-                    except Exception:
-                        interval = self.coordinator.config_entry.options.get("scan_interval", self.coordinator.config_entry.data.get("scan_interval", 15))
-
-                    async def _delayed_set_off_fallback():
-                        await asyncio.sleep(interval)
-                        self._attr_is_on = False
-                        self._last_commanded_state = False
-                        self.async_write_ha_state()
-
-                    self._hass.async_create_task(_delayed_set_off_fallback())
+                # Immediately reflect the commanded state in HA and start confirmation timeout
+                self._attr_is_on = False
+                self._last_commanded_state = False
+                self.async_write_ha_state()
+                self._start_pending_confirm(False)
             else:
                 _LOGGER.error(f"Failed to set DMX OFF for {self.name}; not updating HA state")
 
@@ -379,7 +346,84 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             ):
                 new_state = binary_sensor.state.lower() == "on"
                 break
+        # If we're currently awaiting confirmation for a commanded state, suppress changes
+        if self._pending_confirm:
+            # If the coordinator shows the requested target state, confirm it and clear pending
+            if new_state is not None and new_state == self._pending_confirm_target:
+                self._cancel_pending_confirm()
+                self._attr_is_on = new_state
+                self._last_commanded_state = new_state
+                self.async_write_ha_state()
+            # Otherwise ignore coordinator updates until pending expires
+            return
+
         if new_state is not None and new_state != self._last_commanded_state:
             self._attr_is_on = new_state
             self._last_commanded_state = new_state
             self.async_write_ha_state()
+
+    def _start_pending_confirm(self, target: bool) -> None:
+        """Start a pending confirmation period where coordinator updates are ignored until confirmed or timeout."""
+        # Cancel any existing pending task
+        if self._pending_confirm_task and not self._pending_confirm_task.done():
+            try:
+                self._pending_confirm_task.cancel()
+            except Exception:
+                pass
+        self._pending_confirm = True
+        self._pending_confirm_target = target
+        # Default timeout equals configured multiplier * coordinator update interval (seconds)
+        try:
+            interval = self.coordinator.update_interval.total_seconds()
+        except Exception:
+            interval = self.coordinator.config_entry.options.get("scan_interval", self.coordinator.config_entry.data.get("scan_interval", 15))
+        multiplier = float(
+            self.coordinator.config_entry.options.get(
+                CONF_PENDING_CONFIRM_MULTIPLIER,
+                self.coordinator.config_entry.data.get(
+                    CONF_PENDING_CONFIRM_MULTIPLIER, DEFAULT_PENDING_CONFIRM_MULTIPLIER
+                ),
+            )
+        )
+        timeout = float(interval) * max(1.0, multiplier)
+        self._pending_confirm_expires = time.monotonic() + timeout
+        self._pending_confirm_task = self._hass.async_create_task(self._pending_confirm_waiter(timeout, target))
+
+    def _cancel_pending_confirm(self) -> None:
+        """Cancel any pending confirmation period and clear state."""
+        self._pending_confirm = False
+        self._pending_confirm_target = None
+        self._pending_confirm_expires = None
+        if self._pending_confirm_task and not self._pending_confirm_task.done():
+            try:
+                self._pending_confirm_task.cancel()
+            except Exception:
+                pass
+        self._pending_confirm_task = None
+
+    async def _pending_confirm_waiter(self, timeout: float, target: bool) -> None:
+        """Wait until coordinator confirms the target state or timeout and then reconcile."""
+        try:
+            end = time.monotonic() + float(timeout)
+            # Poll frequently for coordinator updates until timeout
+            while time.monotonic() < end:
+                await asyncio.sleep(min(0.5, timeout))
+                current = self._get_relay_status_state()
+                if current is None:
+                    continue
+                if current == target:
+                    # Confirmed by relay status
+                    self._cancel_pending_confirm()
+                    self._attr_is_on = target
+                    self._last_commanded_state = target
+                    self.async_write_ha_state()
+                    return
+            # Timeout reached: reconcile to current relay status
+            current = self._get_relay_status_state()
+            if current is not None:
+                self._attr_is_on = current
+                self._last_commanded_state = current
+            self._cancel_pending_confirm()
+            self.async_write_ha_state()
+        except asyncio.CancelledError:
+            return
