@@ -301,6 +301,53 @@ def slugify(name: str) -> str:
     return name
 
 
+def get_dmx_address_from_state(
+    hass: Any,
+    device_uid: str,
+    device_name: Optional[str] = None,
+) -> Optional[int]:
+    """Resolve a DMX address from Home Assistant state using the stable device UID."""
+    if not hass or not device_uid:
+        return None
+
+    for sensor_state in hass.states.async_all("sensor"):
+        if not sensor_state.entity_id.endswith("_dmx_address"):
+            continue
+        if sensor_state.attributes.get("uid") != device_uid:
+            continue
+        if sensor_state.state in ("unknown", "unavailable"):
+            return None
+        try:
+            return int(sensor_state.state)
+        except (ValueError, TypeError):
+            _LOGGER.warning(
+                "Invalid DMX address in sensor %s: %s",
+                sensor_state.entity_id,
+                sensor_state.state,
+            )
+            return None
+
+    legacy_entity_ids = [f"sensor.savant_energy_{device_uid}_dmx_address"]
+    if device_name:
+        legacy_entity_ids.insert(0, f"sensor.{slugify(device_name)}_dmx_address")
+
+    for entity_id in legacy_entity_ids:
+        state = hass.states.get(entity_id)
+        if not state or state.state in ("unknown", "unavailable"):
+            continue
+        try:
+            return int(state.state)
+        except (ValueError, TypeError):
+            _LOGGER.warning(
+                "Invalid DMX address in sensor %s: %s",
+                entity_id,
+                state.state,
+            )
+            return None
+
+    return None
+
+
 async def async_get_dmx_address(
     ip_address: str,
     ola_port: int,
@@ -596,6 +643,60 @@ async def _execute_curl_command(cmd: str) -> tuple[int, str, str]:
     return returncode, stdout.decode(), stderr.decode()
 
 
+def _normalize_dmx_value(value: Any, default: str = "255") -> str:
+    """Normalize a DMX value to a stringified integer between 0 and 255."""
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "on":
+            return "255"
+        if normalized == "off":
+            return "0"
+    try:
+        numeric_value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return str(max(0, min(255, numeric_value)))
+
+
+async def _async_get_current_dmx_values(
+    ip_address: str,
+    ola_port: int,
+    max_channel: int,
+) -> list[str]:
+    """Fetch the current DMX universe and return normalized values up to max_channel."""
+    if not ip_address or not ola_port or max_channel <= 0:
+        return []
+
+    url = f"http://{ip_address}:{ola_port}/get_dmx?u=1"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            timeout_config = aiohttp.ClientTimeout(total=10.0)
+            async with session.get(url, timeout=timeout_config) as response:
+                if response.status != 200:
+                    _LOGGER.debug(
+                        "Unable to fetch current DMX values before set; status=%s response=%s",
+                        response.status,
+                        await response.text(),
+                    )
+                    return []
+
+                payload = json.loads(await response.text())
+    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as err:
+        _LOGGER.debug("Unable to fetch current DMX values before set: %s", err)
+        return []
+    except Exception as err:
+        _LOGGER.debug("Unexpected error fetching current DMX values before set: %s", err)
+        return []
+
+    dmx_values = payload.get("dmx")
+    if not isinstance(dmx_values, list):
+        _LOGGER.debug("Current DMX payload did not include a valid dmx list: %s", payload)
+        return []
+
+    return [_normalize_dmx_value(value) for value in dmx_values[:max_channel]]
+
+
 async def async_set_dmx_values(ip_address: str, channel_values: Dict[int, str], ola_port: int = 9090, testing_mode: bool = False) -> Dict[str, Any]:
     """
     Set DMX values for channels.
@@ -612,15 +713,24 @@ async def async_set_dmx_values(ip_address: str, channel_values: Dict[int, str], 
     
     try:
         max_channel = max(channel_values.keys()) if channel_values else 0
+        if max_channel == 0:
+            _LOGGER.warning("No DMX channel values were provided")
+            return {"success": False, "status": None, "text": None, "json": None, "error": "No channel values provided"}
 
         value_array = ["0"] * max_channel
 
+        if not testing_mode:
+            current_values = await _async_get_current_dmx_values(
+                ip_address,
+                ola_port,
+                max_channel,
+            )
+            for index, current_value in enumerate(current_values):
+                value_array[index] = current_value
+        
         for channel, value in channel_values.items():
             if 1 <= channel <= max_channel:
-                if str(value) == "255" or str(value).lower() == "on" or str(value) == "1":
-                    value_array[channel - 1] = "255"
-                else:
-                    value_array[channel - 1] = "0"
+                value_array[channel - 1] = _normalize_dmx_value(value, default="0")
 
         data_param = ",".join(value_array)
 
@@ -675,7 +785,7 @@ async def async_set_dmx_values(ip_address: str, channel_values: Dict[int, str], 
         _dmx_api_stats["failure_count"] += 1
         _dmx_api_stats["success_rate"] = ((_dmx_api_stats["request_count"] - _dmx_api_stats["failure_count"]) / 
                                         _dmx_api_stats["request_count"]) * 100.0
-        return False
+        return {"success": False, "status": None, "text": None, "json": None, "error": str(e)}
 
 
 def is_dmx_api_available() -> bool:

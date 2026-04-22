@@ -1,3 +1,6 @@
+.local/
+AGENTS.local.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -11,32 +14,47 @@ __pycache__/
 build/
 develop-eggs/
 dist/
-download/
+downloads/
 eggs/
 .eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
 *.egg-info/
-.installed.cfg
-*.egg
+pip-wheel-metadata/
 
-# Virtual environments
-.venv/
-venv/
-ENV/
 env/
+venv/
+.venv/
+ENV/
 
-# Pytest
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
 .pytest_cache/
 
 # mypy
 .mypy_cache/
 
-# VS Code
+# Pyre
+.pyre/
+
+# Editor directories
 .vscode/
+.idea/
+
+# Misc
+*.pyc
+*.pyo
+*.pyd
+*.egg
+*.egg-info
+__pycache__/
 
 # macOS
 .DS_Store

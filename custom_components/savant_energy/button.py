@@ -17,7 +17,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback  # type: i
 from homeassistant.helpers.event import async_track_time_interval  # type: ignore
 
 from .const import DOMAIN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE
-from .utils import async_set_dmx_values, get_dmx_api_stats
+from .utils import async_set_dmx_values, get_dmx_api_stats, get_dmx_address_from_state
 from .scene import SavantSceneStorage, SavantSceneManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -73,27 +73,25 @@ class SavantSceneButton(ButtonEntity):
             return
         relay_states = scene.get("relay_states", {})
         dmx_values = {}
-        # For each breaker in relay_states, look up its DMX address sensor
         for breaker_entity_id, is_on in relay_states.items():
-            # The DMX address sensor is expected to be sensor.<breaker_entity_id>_dmx_address
-            if breaker_entity_id.startswith("switch."):
-                base = breaker_entity_id[len("switch."):]
-            else:
-                base = breaker_entity_id
-            dmx_sensor_id = f"sensor.{base}_dmx_address"
-            state = self._hass.states.get(dmx_sensor_id)
-            if state and state.state not in ("unknown", "unavailable"):
-                try:
-                    dmx_address = int(state.state)
-                    dmx_values[dmx_address] = "255" if is_on else "0"
-                except (ValueError, TypeError):
-                    _LOGGER.debug(f"Invalid DMX address value in sensor {dmx_sensor_id}: {state.state}")
-                    fallback_addr = len(dmx_values) + 1
-                    dmx_values[fallback_addr] = "255" if is_on else "0"
-            else:
-                _LOGGER.debug(f"DMX address sensor not found or unavailable for {dmx_sensor_id}, using scene state value")
-                fallback_addr = len(dmx_values) + 1
-                dmx_values[fallback_addr] = "255" if is_on else "0"
+            breaker_state = self._hass.states.get(breaker_entity_id)
+            device_uid = breaker_state.attributes.get("uid") if breaker_state else None
+            if not device_uid:
+                _LOGGER.warning(
+                    "Skipping scene member %s because its device UID is unavailable",
+                    breaker_entity_id,
+                )
+                continue
+
+            dmx_address = get_dmx_address_from_state(self._hass, device_uid)
+            if dmx_address is None:
+                _LOGGER.warning(
+                    "Skipping scene member %s because its DMX address is unavailable",
+                    breaker_entity_id,
+                )
+                continue
+
+            dmx_values[dmx_address] = "255" if is_on else "0"
 
         if not dmx_values:
             _LOGGER.warning(

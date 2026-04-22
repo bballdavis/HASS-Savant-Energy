@@ -5,6 +5,7 @@ Welcome to the **Savant Energy** integration for Home Assistant! This project br
 ## 🚀 Features
 - **Automatic device discovery** from your Savant system
 - **Power and voltage sensors** for each relay
+- **Per-load cumulative energy sensors** in `kWh` for use with the Home Assistant Energy dashboard
 - **Relay (breaker) switch control** with configurable cooldown
 - **Relay Binary sensors** for relay status
 - **All Loads On Button** to quickly turn all loads on
@@ -33,6 +34,7 @@ Once installed and configured, the integration will automatically create entitie
 
 ### Entity Breakdown
 - **Power Sensor (`sensor.<device>_power`)**: Shows the real-time power usage (Watts) for each relay.
+- **Energy Sensor (`sensor.<device>_energy`)**: Tracks cumulative energy usage (kWh) for each relay and can be added to Home Assistant's Energy dashboard under individual devices.
 - **Voltage Sensor (`sensor.<device>_voltage`)**: Displays the current voltage (Volts) for each relay.
 - **Breaker Switch (`switch.<device>_breaker`)**: Lets you turn the relay on/off. Includes a configurable cooldown (default: 30 seconds) to prevent rapid toggling and protect your hardware.
 - **Relay Status Binary Sensor (`binary_sensor.<device>_relay_status`)**: Indicates if the relay is currently ON or OFF.
@@ -127,6 +129,11 @@ We love contributions! Please:
 - Open issues for bugs or feature requests
 - Submit pull requests with clear descriptions
 - Follow the code style and add docstrings/comments
+
+This project uses AI coding agents during development, but all code changes are reviewed and tested before release.
+
+## 📘 Development
+See [docs/development.md](docs/development.md) for the local Home Assistant MCP workflow, wrapper behavior, and development expectations.
 
 ## 📚 File Structure
 - `__init__.py`: Integration setup and coordinator logic
