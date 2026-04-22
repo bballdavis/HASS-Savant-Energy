@@ -138,8 +138,6 @@ async def async_setup_entry(
     )
     await button_manager.async_setup()
 
-    # Always trigger a refresh to ensure polling starts
-    await coordinator.async_request_refresh()
     if coordinator.data is not None:
         snapshot_data = coordinator.data.get("snapshot_data", {})
         if (

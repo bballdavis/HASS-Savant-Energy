@@ -41,17 +41,25 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
         config_entry.data.get(CONF_SWITCH_COOLDOWN, DEFAULT_SWITCH_COOLDOWN),
     )
     entities = []
-    # Always trigger a refresh to ensure polling starts
-    await coordinator.async_request_refresh()
+    _LOGGER.info(f"async_setup_entry: coordinator.data = {coordinator.data is not None}")
     if coordinator.data is not None:
         snapshot_data = coordinator.data.get("snapshot_data", {})
+        _LOGGER.info(f"async_setup_entry: snapshot_data exists = {bool(snapshot_data)}, has presentDemands = {'presentDemands' in snapshot_data if snapshot_data else False}")
         if (
             snapshot_data
             and isinstance(snapshot_data, dict)
             and "presentDemands" in snapshot_data
         ):
+            _LOGGER.info(
+                "Creating switch entities from %d presentDemands entries",
+                len(snapshot_data["presentDemands"]),
+            )
             for device in snapshot_data["presentDemands"]:
                 entities.append(EnergyDeviceSwitch(hass, coordinator, device, cooldown))
+            _LOGGER.info(f"async_setup_entry: About to add {len(entities)} switch entities")
+        else:
+            _LOGGER.warning("No presentDemands payload available during switch setup. snapshot_data type: %s", type(snapshot_data))
+    _LOGGER.info(f"async_setup_entry: Adding {len(entities)} entities to Home Assistant")
     async_add_entities(entities)
 
 

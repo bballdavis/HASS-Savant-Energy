@@ -119,9 +119,13 @@ class DMXAddressSensor(CoordinatorEntity, SensorEntity):
                 "dmx_address_cache",
                 config_entry.data.get("dmx_address_cache", False)
             )
-        # Only fetch if not cached or cache is disabled
+        # Only fetch if not cached or cache is disabled. Schedule as background task
+        # so entity setup returns immediately and DMX addresses are populated async.
         if not cache_enabled or self._dmx_address is None:
-            await self._fetch_dmx_address()
+            self.hass.async_create_background_task(
+                self._fetch_dmx_address(),
+                name=f"savant_energy_dmx_fetch_{self._dmx_uid}",
+            )
 
     async def _fetch_dmx_address(self):
         """

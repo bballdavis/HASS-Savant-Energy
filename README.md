@@ -132,9 +132,6 @@ We love contributions! Please:
 
 This project uses AI coding agents during development, but all code changes are reviewed and tested before release.
 
-## 📘 Development
-See [docs/development.md](docs/development.md) for the local Home Assistant MCP workflow, wrapper behavior, and development expectations.
-
 ## 📚 File Structure
 - `__init__.py`: Integration setup and coordinator logic
 - `api.py`: Handles REST API requests and responses.

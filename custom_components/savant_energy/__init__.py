@@ -103,10 +103,10 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             # Check if we have valid device data to report for debugging
             if "presentDemands" in snapshot_data:
                 device_count = len(snapshot_data["presentDemands"])
-                _LOGGER.debug(f"Retrieved {device_count} devices in presentDemands")
+                _LOGGER.info(f"Retrieved {device_count} devices in presentDemands")
 
                 # Debug log each device found for troubleshooting
-                for device in snapshot_data["presentDemands"]:
+                for index, device in enumerate(snapshot_data["presentDemands"]):
                     has_uid = "uid" in device
                     has_name = "name" in device
                     has_percent = "percentCommanded" in device
@@ -114,6 +114,17 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                         _LOGGER.warning(
                             f"Incomplete device data: uid={has_uid}, name={has_name}, percentCommanded={has_percent}. Device: {device}"
                         )
+                    _LOGGER.debug(
+                        "Boot device[%d]: uid=%s name=%s channel=%s percentCommanded=%s power=%s voltage=%s capacity=%s",
+                        index,
+                        device.get("uid"),
+                        device.get("name"),
+                        device.get("channel"),
+                        device.get("percentCommanded"),
+                        device.get("power"),
+                        device.get("voltage"),
+                        device.get("capacity"),
+                    )
 
             # Update DMX status for debugging if cache expired
             now = datetime.now()

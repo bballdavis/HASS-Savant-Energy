@@ -29,28 +29,29 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     power_sensors = []  # Track power sensors for utility meter creation
     dmx_address_sensors = []  # Track DMX address sensors for concurrency
 
-    # Always trigger a refresh to ensure polling starts
-    await coordinator.async_request_refresh()
-
     # Defensive: Only try to create entities if coordinator.data is not None
+    _LOGGER.info(f"async_setup_entry: coordinator.data = {coordinator.data is not None}")
     if coordinator.data is not None:
         snapshot_data = coordinator.data.get("snapshot_data", {})
+        _LOGGER.info(f"async_setup_entry: snapshot_data exists = {bool(snapshot_data)}, has presentDemands = {'presentDemands' in snapshot_data if snapshot_data else False}")
         if (
             snapshot_data
             and isinstance(snapshot_data, dict)
             and "presentDemands" in snapshot_data
         ):
-            demands_str = str(snapshot_data["presentDemands"])
+            demands_list = snapshot_data["presentDemands"]
+            _LOGGER.info(f"async_setup_entry: Found {len(demands_list)} presentDemands entries")
+            demands_str = str(demands_list)
             _LOGGER.debug(
                 "Processing presentDemands: %.50s... (total length: %d)",
                 demands_str,
                 len(demands_str),
             )
-            for device in snapshot_data["presentDemands"]:
+            for device in demands_list:
                 uid = device["uid"]
                 dmx_uid = calculate_dmx_uid(uid)
-                _LOGGER.debug(
-                    "Creating sensors for Savant Serial: %s", dmx_uid
+                _LOGGER.info(
+                    "Creating sensors for Savant Serial: %s (uid: %s)", dmx_uid, uid
                 )
 
                 # Create device info once for all sensors
@@ -101,9 +102,10 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
                 entities.append(dmx_sensor)
 
             # Add all entities at once
+            _LOGGER.info(f"async_setup_entry: About to add {len(entities)} sensor entities")
             async_add_entities(entities)
-            _LOGGER.debug("Added %d sensor entities", len(entities))
+            _LOGGER.info("async_setup_entry: Added %d sensor entities successfully", len(entities))
 
             return True
         else:
-            _LOGGER.debug("No presentDemands data found in coordinator")
+            _LOGGER.warning("No presentDemands data found in coordinator. snapshot_data type: %s, keys: %s", type(snapshot_data), list(snapshot_data.keys()) if isinstance(snapshot_data, dict) else "N/A")

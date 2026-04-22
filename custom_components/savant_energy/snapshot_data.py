@@ -22,6 +22,7 @@ def get_current_energy_snapshot(address, port):
     Returns:
         Parsed JSON data as a dict, or None on error.
     """
+    _LOGGER.info(f"get_current_energy_snapshot called with address={address}, port={port}")
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((address, port))
@@ -60,12 +61,44 @@ def get_current_energy_snapshot(address, port):
             return None
         try:
             json_data = json.loads(decoded_string)
+            present_demands = json_data.get("presentDemands")
+            if isinstance(present_demands, list):
+                _LOGGER.info(
+                    "Decoded Savant snapshot with %d presentDemands entries",
+                    len(present_demands),
+                )
+                for index, device in enumerate(present_demands):
+                    if not isinstance(device, dict):
+                        _LOGGER.warning(
+                            "presentDemands[%d] is not an object: %r",
+                            index,
+                            device,
+                        )
+                        continue
+                    _LOGGER.debug(
+                        "Snapshot device[%d]: uid=%s name=%s channel=%s percentCommanded=%s power=%s voltage=%s capacity=%s classification=%s",
+                        index,
+                        device.get("uid"),
+                        device.get("name"),
+                        device.get("channel"),
+                        device.get("percentCommanded"),
+                        device.get("power"),
+                        device.get("voltage"),
+                        device.get("capacity"),
+                        device.get("classification"),
+                    )
+            else:
+                _LOGGER.warning(
+                    "Decoded Savant snapshot is missing a list presentDemands payload: %s",
+                    type(present_demands).__name__,
+                )
+            _LOGGER.info(f"get_current_energy_snapshot returning data with {len(json_data.get('presentDemands', []))} devices")
             return json_data
         except json.JSONDecodeError as e:
             _LOGGER.error(f"JSON Error: {e}, JSON: {decoded_string}")
             return None
     except socket.error as e:
-        _LOGGER.error(f"Socket Error: {e}")
+        _LOGGER.error(f"Socket Error fetching snapshot: {e}")
         return None
     except Exception as e:
         _LOGGER.error(f"Unexpected Error: {e}")

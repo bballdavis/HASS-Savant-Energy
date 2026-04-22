@@ -20,7 +20,6 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     Set up Savant Energy binary sensor entities for relay status.
     """
     coordinator = hass.data[DOMAIN][config_entry.entry_id]
-    await coordinator.async_config_entry_first_refresh()
     snapshot_data = coordinator.data.get("snapshot_data", {}) if coordinator.data else {}
     entities = []
     if snapshot_data and "presentDemands" in snapshot_data:

@@ -38,6 +38,56 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """
     VERSION = 1
 
+    async def async_step_reconfigure(self, user_input=None):
+        """
+        Handle reconfiguration of the integration.
+        Allows users to update connection details (address, port, ola_port) after setup.
+        """
+        config_entry = self.hass.config_entries.async_get_entry(self.context.get("entry_id"))
+        
+        errors = {}
+        if user_input is not None:
+            address = user_input.get(CONF_ADDRESS)
+            port = user_input.get(CONF_PORT)
+            ola_port = user_input.get(CONF_OLA_PORT)
+            if not self._is_valid_address(address):
+                errors[CONF_ADDRESS] = "invalid_address"
+            elif not self._is_valid_port(port):
+                errors[CONF_PORT] = "invalid_port"
+            elif not self._is_valid_port(ola_port):
+                errors[CONF_OLA_PORT] = "invalid_port"
+            else:
+                # Update the config entry data with new connection details
+                self.hass.config_entries.async_update_entry(
+                    config_entry,
+                    data={**config_entry.data, **user_input}
+                )
+                await self.hass.config_entries.async_reload(config_entry.entry_id)
+                return self.async_abort(reason="reconfigure_successful")
+        
+        # Pre-fill form with current values
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_ADDRESS,
+                        default=config_entry.data.get(CONF_ADDRESS),
+                    ): str,
+                    vol.Required(
+                        CONF_PORT,
+                        default=config_entry.data.get(CONF_PORT, 2000),
+                    ): int,
+                    vol.Required(
+                        CONF_OLA_PORT,
+                        default=config_entry.data.get(CONF_OLA_PORT, DEFAULT_OLA_PORT),
+                    ): int,
+                }
+            ),
+            errors=errors,
+            description_placeholders={},
+        )
+
     async def async_step_user(self, user_input=None):
         """
         Handle the initial step of the config flow.
