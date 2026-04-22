@@ -48,6 +48,7 @@ class DMXAddressSensor(CoordinatorEntity, SensorEntity):
             manufacturer=MANUFACTURER,
             model=get_device_model(device.get("capacity", 0)),
         )
+        self._attr_extra_state_attributes = {"uid": device["uid"], "dmx_uid": dmx_uid}
         self._slug_name = slugify(device["name"])
 
     @property

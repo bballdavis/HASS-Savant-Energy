@@ -26,13 +26,9 @@ from .const import (
     DEFAULT_PENDING_CONFIRM_MULTIPLIER,
 )
 from .models import get_device_model
-from .utils import calculate_dmx_uid, async_set_dmx_values, async_get_dmx_address, slugify
+from .utils import calculate_dmx_uid, async_set_dmx_values, get_dmx_address_from_state
 
 _LOGGER = logging.getLogger(__name__)
-
-_last_command_time = 0.0
-PENDING_CONFIRM_MULTIPLIER: int = 3  # Number of coordinator update intervals to wait before timing out
-
 
 async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities):
     """
@@ -89,6 +85,7 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             ),
             serial_number=self._dmx_uid,
         )
+        self._attr_extra_state_attributes = {"uid": device["uid"], "dmx_uid": self._dmx_uid}
         self._attr_is_on = self._get_relay_status_state()
         self._last_commanded_state = self._attr_is_on
         # Pending confirmation state after a user-initiated command
@@ -96,6 +93,8 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         self._pending_confirm_target: bool | None = None
         self._pending_confirm_task: asyncio.Task | None = None
         self._pending_confirm_expires: float | None = None
+        self._last_command_time = 0.0
+        self._last_command_time = 0.0
         self.async_on_remove(
             self.coordinator.async_add_listener(self._handle_coordinator_update)
         )
@@ -121,9 +120,13 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         """
         Get the state of the switch based on the relay status sensor, or None if unknown.
         """
+        return self._get_relay_status_state_for_uid(self._device["uid"])
+
+    def _get_relay_status_state_for_uid(self, device_uid: str) -> bool | None:
+        """Get the relay state for a device UID from the relay status sensor."""
         for binary_sensor in self._hass.states.async_all("binary_sensor"):
             if (
-                binary_sensor.attributes.get("uid") == self._device["uid"]
+                binary_sensor.attributes.get("uid") == device_uid
             ):
                 if binary_sensor.state.lower() == "on":
                     return True
@@ -132,27 +135,20 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
                 break
         return None
 
-    async def _get_dmx_address_from_sensor(self) -> int | None:
+    async def _get_dmx_address_from_sensor(self, device_uid: str, device_name: str) -> int | None:
         """
         Try to get the DMX address from the sensor entity for this device.
         """
-        dmx_address_entity_id = f"sensor.{slugify(self._current_device_name)}_dmx_address"
-        alternative_entity_id = f"sensor.savant_energy_{self._device['uid']}_dmx_address"
-        state = self._hass.states.get(dmx_address_entity_id)
-        if not state or state.state in ('unknown', 'unavailable'):
-            state = self._hass.states.get(alternative_entity_id)
-        if state and state.state not in ('unknown', 'unavailable'):
-            try:
-                return int(state.state)
-            except (ValueError, TypeError):
-                _LOGGER.warning(f"Invalid DMX address in sensor {state.entity_id}: {state.state}")
-        return None    
+        return get_dmx_address_from_state(self._hass, device_uid, device_name)
 
     async def _fetch_dmx_address(self) -> int | None:
         """
         Fetch DMX address from sensor only.
         """
-        address = await self._get_dmx_address_from_sensor()
+        address = await self._get_dmx_address_from_sensor(
+            self._device["uid"],
+            self._current_device_name,
+        )
         if address is not None:
             return address
         _LOGGER.warning(f"No DMX address found in sensor for {self.name}")
@@ -160,47 +156,33 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
 
     async def _get_all_device_dmx_states(self, target_dmx_address=None, target_value=None):
         """
-        Build a dict of {dmx_address: value} for all devices using only DMX Address and Relay Status sensors.
+        Build a dict of {dmx_address: value} for all devices using the coordinator device map and UID-based sensors.
         """
         dmx_states = {}
         max_address = 0
-        dmx_address_entities = [entity for entity in self._hass.states.async_all("sensor") if entity.entity_id.endswith("_dmx_address")]
 
-        for dmx_address_entity in dmx_address_entities:
-            if dmx_address_entity.state in ("unknown", "unavailable") or not dmx_address_entity.state:
+        snapshot_data = self.coordinator.data.get("snapshot_data", {}) if self.coordinator.data else {}
+        devices = snapshot_data.get("presentDemands", []) if isinstance(snapshot_data, dict) else []
+
+        for device in devices:
+            device_uid = device.get("uid")
+            device_name = device.get("name", device_uid)
+            if not device_uid:
                 continue
-            try:
-                dmx_address = int(dmx_address_entity.state)
-            except (ValueError, TypeError):
-                _LOGGER.warning(f"Invalid DMX address in sensor {dmx_address_entity.entity_id}: {dmx_address_entity.state}")
+
+            dmx_address = await self._get_dmx_address_from_sensor(device_uid, device_name)
+            if dmx_address is None:
+                _LOGGER.debug("Skipping %s because its DMX address is unavailable", device_name)
                 continue
 
-            entity_id = dmx_address_entity.entity_id
-            device_name = None
-            sensor_state = self._hass.states.get(entity_id)
-            if sensor_state and sensor_state.attributes.get("friendly_name"):
-                device_name = sensor_state.attributes.get("friendly_name").replace(" DMX Address", "")
-            if not device_name:
-                entity_name = entity_id.split(".", 1)[1].replace("_dmx_address", "")
-                device_name = entity_name.replace("_", " ").title()
+            relay_state = self._get_relay_status_state_for_uid(device_uid)
+            if relay_state is None and "percentCommanded" in device:
+                relay_state = device.get("percentCommanded") == 100
+            if relay_state is None:
+                _LOGGER.debug("Skipping %s because its relay state is unavailable", device_name)
+                continue
 
-            relay_found = False
-            relay_status_state = None
-            for binary_sensor in self._hass.states.async_all("binary_sensor"):
-                if binary_sensor.attributes.get("friendly_name") and f"{device_name} Relay Status" == binary_sensor.attributes.get("friendly_name"):
-                    relay_status_state = binary_sensor
-                    relay_found = True
-                    break
-
-            value = "255"
-            if relay_found and relay_status_state and relay_status_state.state not in ("unknown", "unavailable"):
-                if relay_status_state.state.lower() == "on":
-                    value = "255"
-                elif relay_status_state.state.lower() == "off":
-                    value = "0"
-                _LOGGER.debug(f"Found relay status for {device_name}: {relay_status_state.state} (using value {value})")
-            else:
-                _LOGGER.debug(f"No relay status found for {device_name}, defaulting to ON")
+            value = "255" if relay_state else "0"
 
             dmx_states[dmx_address] = value
             if dmx_address > max_address:
@@ -265,10 +247,9 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         Turn the switch on.
         Implements cooldown logic to prevent rapid toggling.
         """
-        global _last_command_time
         now = time.monotonic()
-        if now - _last_command_time < self._cooldown:
-            time_left = math.ceil(self._cooldown - (now - _last_command_time))
+        if now - self._last_command_time < self._cooldown:
+            time_left = math.ceil(self._cooldown - (now - self._last_command_time))
             _LOGGER.debug("Cooldown active, ignoring turn_on command")
             await self._hass.services.async_call(
                 "persistent_notification",
@@ -281,11 +262,11 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             )
             return
         if not self.is_on:
-            _last_command_time = now
             dmx_address = await self._fetch_dmx_address()
             if dmx_address is None:
                 _LOGGER.warning(f"Cannot turn on {self.name}: DMX address unknown")
                 return
+            self._last_command_time = now
             _LOGGER.info(f"Turning ON {self.name} at DMX address {dmx_address}")
             result = await self._send_full_dmx_command(dmx_address, "255")
             if result and result.get("success"):
@@ -302,10 +283,9 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         Turn the switch off.
         Implements cooldown logic to prevent rapid toggling.
         """
-        global _last_command_time
         now = time.monotonic()
-        if now - _last_command_time < self._cooldown:
-            time_left = math.ceil(self._cooldown - (now - _last_command_time))
+        if now - self._last_command_time < self._cooldown:
+            time_left = math.ceil(self._cooldown - (now - self._last_command_time))
             _LOGGER.debug("Cooldown active, ignoring turn_off command")
             await self._hass.services.async_call(
                 "persistent_notification",
@@ -318,11 +298,11 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             )
             return
         if self.is_on:
-            _last_command_time = now
             dmx_address = await self._fetch_dmx_address()
             if dmx_address is None:
                 _LOGGER.warning(f"Cannot turn off {self.name}: DMX address unknown")
                 return
+            self._last_command_time = now
             _LOGGER.info(f"Turning OFF {self.name} at DMX address {dmx_address}")
             result = await self._send_full_dmx_command(dmx_address, "0")
             if result and result.get("success"):

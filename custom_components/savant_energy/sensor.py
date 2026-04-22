@@ -11,7 +11,7 @@ from homeassistant.helpers.entity import DeviceInfo  # type: ignore
 
 from .const import DOMAIN, MANUFACTURER
 from .models import get_device_model
-from .power_device_sensor import EnergyDeviceSensor
+from .power_device_sensor import EnergyDeviceSensor, IndividualLoadEnergySensor
 from .dmx_address_sensor import DMXAddressSensor
 from .utils import calculate_dmx_uid
 
@@ -68,6 +68,16 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
                 )
                 entities.append(power_sensor)
                 power_sensors.append(power_sensor)
+
+                # Create cumulative energy sensor for the Energy dashboard
+                entities.append(
+                    IndividualLoadEnergySensor(
+                        coordinator,
+                        device,
+                        f"SavantEnergy_{uid}_energy",
+                        dmx_uid,
+                    )
+                )
 
                 # Create voltage sensor
                 entities.append(

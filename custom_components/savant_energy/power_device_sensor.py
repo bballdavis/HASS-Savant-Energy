@@ -1,13 +1,12 @@
 """Energy Device Sensor for Savant Energy.
-Provides power and voltage sensor entities for each relay device.
-
-All classes and functions are now documented for clarity and open source maintainability.
+Provides power, voltage, and cumulative energy sensor entities for each relay device.
 """
 
 import logging
-from typing import Any, Optional
+import time
 
 from homeassistant.components.sensor import (  # type: ignore
+    RestoreSensor,
     SensorEntity,
     SensorDeviceClass,
     SensorStateClass,
@@ -177,3 +176,124 @@ class EnergyDeviceSensor(CoordinatorEntity, SensorEntity):
             manufacturer=MANUFACTURER,
             model=get_device_model(self._device.get("capacity", 0)),
         )
+
+
+class IndividualLoadEnergySensor(CoordinatorEntity, RestoreSensor):
+    """Cumulative energy sensor derived from the per-load power reading."""
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_icon = "mdi:lightning-bolt-circle"
+    _attr_native_unit_of_measurement = "kWh"
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_suggested_display_precision = 3
+
+    def __init__(self, coordinator, device, unique_id, dmx_uid):
+        """Initialize the cumulative energy sensor."""
+        super().__init__(coordinator)
+        self._device = device
+        self._dmx_uid = dmx_uid
+        self._attr_name = f"{device['name']} Energy"
+        self._attr_unique_id = unique_id
+        self._energy_kwh = 0.0
+        self._last_power_watts = None
+        self._last_sample_time = None
+
+    @property
+    def _current_device_name(self):
+        """Fetch the current device name by UID from coordinator data."""
+        snapshot_data = self.coordinator.data.get("snapshot_data", {})
+        if snapshot_data and "presentDemands" in snapshot_data:
+            for device in snapshot_data["presentDemands"]:
+                if device["uid"] == self._device["uid"]:
+                    return device["name"]
+        return self._device["name"]
+
+    @property
+    def name(self):
+        """Return the sensor name using the latest device name."""
+        return f"{self._current_device_name} Energy"
+
+    @property
+    def native_value(self) -> float:
+        """Return the cumulative energy in kWh."""
+        return round(self._energy_kwh, 6)
+
+    @property
+    def available(self) -> bool:
+        """Return True if the source power reading is currently available."""
+        return self._get_current_power_watts() is not None
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return dynamic device info with the current device name."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, str(self._device["uid"]))},
+            name=self._current_device_name,
+            serial_number=self._dmx_uid,
+            manufacturer=MANUFACTURER,
+            model=get_device_model(self._device.get("capacity", 0)),
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the accumulated energy and initialize the integration baseline."""
+        await super().async_added_to_hass()
+
+        last_sensor_data = await self.async_get_last_sensor_data()
+        if last_sensor_data is not None and last_sensor_data.native_value is not None:
+            try:
+                self._energy_kwh = max(float(last_sensor_data.native_value), 0.0)
+            except (TypeError, ValueError):
+                _LOGGER.warning(
+                    "Ignoring invalid restored energy value %s for device %s",
+                    last_sensor_data.native_value,
+                    self._device["uid"],
+                )
+
+        self._last_power_watts = self._get_current_power_watts()
+        if self._last_power_watts is not None:
+            self._last_sample_time = time.monotonic()
+
+    def _handle_coordinator_update(self) -> None:
+        """Integrate the latest power reading into a cumulative energy total."""
+        current_power_watts = self._get_current_power_watts()
+        now = time.monotonic()
+
+        if (
+            current_power_watts is not None
+            and self._last_power_watts is not None
+            and self._last_sample_time is not None
+        ):
+            elapsed_hours = (now - self._last_sample_time) / 3600.0
+            if elapsed_hours > 0:
+                average_power_watts = (
+                    self._last_power_watts + current_power_watts
+                ) / 2.0
+                self._energy_kwh += (average_power_watts * elapsed_hours) / 1000.0
+
+        self._last_power_watts = current_power_watts
+        self._last_sample_time = now if current_power_watts is not None else None
+        self.async_write_ha_state()
+
+    def _get_current_power_watts(self) -> float | None:
+        """Return the current device power reading in watts."""
+        snapshot_data = self.coordinator.data.get("snapshot_data", {})
+        if snapshot_data and "presentDemands" in snapshot_data:
+            for device in snapshot_data["presentDemands"]:
+                if device["uid"] != self._device["uid"]:
+                    continue
+
+                value = device.get("power")
+                if value is None:
+                    return None
+
+                try:
+                    return max(float(value) * 1000.0, 0.0)
+                except (ValueError, TypeError):
+                    _LOGGER.error(
+                        "Invalid power value %s for energy sensor on device %s",
+                        value,
+                        device["uid"],
+                    )
+                    return None
+
+        return None
