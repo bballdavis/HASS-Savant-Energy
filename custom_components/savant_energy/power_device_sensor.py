@@ -184,7 +184,7 @@ class IndividualLoadEnergySensor(CoordinatorEntity, RestoreSensor):
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_icon = "mdi:lightning-bolt-circle"
     _attr_native_unit_of_measurement = "kWh"
-    _attr_state_class = SensorStateClass.TOTAL
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_suggested_display_precision = 3
 
     def __init__(self, coordinator, device, unique_id, dmx_uid):
