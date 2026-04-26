@@ -7,7 +7,7 @@ All classes and functions are now documented for clarity and open source maintai
 import logging
 from typing import Any, Optional
 
-from homeassistant.components.sensor import SensorEntity, SensorStateClass  # type: ignore
+from homeassistant.components.sensor import RestoreSensor, SensorEntity, SensorStateClass  # type: ignore
 from homeassistant.helpers.dispatcher import async_dispatcher_connect  # type: ignore
 from homeassistant.helpers.entity import DeviceInfo  # type: ignore
 from homeassistant.helpers.update_coordinator import CoordinatorEntity  # type: ignore
@@ -19,7 +19,7 @@ from .utils import async_get_dmx_address, slugify
 _LOGGER = logging.getLogger(__name__)
 
 
-class DMXAddressSensor(CoordinatorEntity, SensorEntity):
+class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
     """
     Representation of the DMX Address Sensor.
     Shows the DMX address assigned to a Savant relay device.
@@ -111,21 +111,23 @@ class DMXAddressSensor(CoordinatorEntity, SensorEntity):
                 self._handle_discovery_complete,
             )
         )
-        # Check config option for DMX address cache
-        cache_enabled = False
-        config_entry = getattr(self.coordinator, 'config_entry', None)
-        if config_entry:
-            cache_enabled = config_entry.options.get(
-                "dmx_address_cache",
-                config_entry.data.get("dmx_address_cache", False)
-            )
-        # Only fetch if not cached or cache is disabled. Schedule as background task
-        # so entity setup returns immediately and DMX addresses are populated async.
-        if not cache_enabled or self._dmx_address is None:
-            self.hass.async_create_background_task(
-                self._fetch_dmx_address(),
-                name=f"savant_energy_dmx_fetch_{self._dmx_uid}",
-            )
+        last_sensor_data = await self.async_get_last_sensor_data()
+        if last_sensor_data is not None and last_sensor_data.native_value is not None:
+            try:
+                self._dmx_address = int(last_sensor_data.native_value)
+            except (TypeError, ValueError):
+                _LOGGER.warning(
+                    "Ignoring invalid restored DMX address %s for %s",
+                    last_sensor_data.native_value,
+                    self.name,
+                )
+
+        # Keep the restored value visible during startup, but always refresh in the
+        # background so commands do not depend on stale state indefinitely.
+        self.hass.async_create_background_task(
+            self._fetch_dmx_address(),
+            name=f"savant_energy_dmx_fetch_{self._dmx_uid}",
+        )
 
     async def _fetch_dmx_address(self):
         """

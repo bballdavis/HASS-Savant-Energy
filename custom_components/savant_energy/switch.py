@@ -26,7 +26,7 @@ from .const import (
     DEFAULT_PENDING_CONFIRM_MULTIPLIER,
 )
 from .models import get_device_model
-from .utils import calculate_dmx_uid, async_set_dmx_values, get_dmx_address_from_state
+from .utils import calculate_dmx_uid, async_build_managed_dmx_values, async_set_dmx_values
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -143,71 +143,28 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
                 break
         return None
 
-    async def _get_dmx_address_from_sensor(self, device_uid: str, device_name: str) -> int | None:
-        """
-        Try to get the DMX address from the sensor entity for this device.
-        """
-        return get_dmx_address_from_state(self._hass, device_uid, device_name)
-
-    async def _fetch_dmx_address(self) -> int | None:
-        """
-        Fetch DMX address from sensor only.
-        """
-        address = await self._get_dmx_address_from_sensor(
-            self._device["uid"],
-            self._current_device_name,
-        )
-        if address is not None:
-            return address
-        _LOGGER.warning(f"No DMX address found in sensor for {self.name}")
-        return None
-
-    async def _get_all_device_dmx_states(self, target_dmx_address=None, target_value=None):
-        """
-        Build a dict of {dmx_address: value} for all devices using the coordinator device map and UID-based sensors.
-        """
-        dmx_states = {}
-        max_address = 0
-
-        snapshot_data = self.coordinator.data.get("snapshot_data", {}) if self.coordinator.data else {}
-        devices = snapshot_data.get("presentDemands", []) if isinstance(snapshot_data, dict) else []
-
-        for device in devices:
-            device_uid = device.get("uid")
-            device_name = device.get("name", device_uid)
-            if not device_uid:
-                continue
-
-            dmx_address = await self._get_dmx_address_from_sensor(device_uid, device_name)
-            if dmx_address is None:
-                _LOGGER.debug("Skipping %s because its DMX address is unavailable", device_name)
-                continue
-
-            relay_state = self._get_relay_status_state_for_uid(device_uid)
-            if relay_state is None and "percentCommanded" in device:
-                relay_state = device.get("percentCommanded") == 100
-            if relay_state is None:
-                _LOGGER.debug("Skipping %s because its relay state is unavailable", device_name)
-                continue
-
-            value = "255" if relay_state else "0"
-
-            dmx_states[dmx_address] = value
-            if dmx_address > max_address:
-                max_address = dmx_address
-
-        if target_dmx_address:
-            dmx_states[target_dmx_address] = target_value
-            if target_dmx_address > max_address:
-                max_address = target_dmx_address
-
-        return dmx_states, max_address
-
-    async def _send_full_dmx_command(self, target_dmx_address, target_value):
+    async def _send_full_dmx_command(self, target_value: str):
         """
         Send a DMX command with the full state of all addresses.
         """
-        dmx_states, max_address = await self._get_all_device_dmx_states(target_dmx_address, target_value)
+        dmx_states, resolved_addresses, unresolved_devices = await async_build_managed_dmx_values(
+            self.coordinator,
+            self._hass,
+            {self._device["uid"]: target_value},
+        )
+        target_dmx_address = resolved_addresses.get(self._device["uid"])
+        if target_dmx_address is None:
+            _LOGGER.warning(f"Cannot send DMX command for {self.name}: DMX address unknown")
+            return None, None
+
+        for device_uid, device_name in unresolved_devices.items():
+            if device_uid == self._device["uid"]:
+                continue
+            _LOGGER.debug(
+                "Preserving live universe values for %s because its DMX address is unavailable",
+                device_name,
+            )
+
         ip_address = self.coordinator.config_entry.data.get("address")
         ola_port = self.coordinator.config_entry.data.get("ola_port", DEFAULT_OLA_PORT)
         dmx_testing_mode = self.coordinator.config_entry.options.get(
@@ -218,7 +175,7 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         success = bool(result and result.get("success"))
         if not success:
             _LOGGER.error(f"Failed to send DMX command for {self.name} at address {target_dmx_address}: {result}")
-        return result
+        return target_dmx_address, result
 
     @property
     def available(self) -> bool:
@@ -270,13 +227,11 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             )
             return
         if not self.is_on:
-            dmx_address = await self._fetch_dmx_address()
-            if dmx_address is None:
-                _LOGGER.warning(f"Cannot turn on {self.name}: DMX address unknown")
-                return
             self._last_command_time = now
+            dmx_address, result = await self._send_full_dmx_command("255")
+            if dmx_address is None:
+                return
             _LOGGER.info(f"Turning ON {self.name} at DMX address {dmx_address}")
-            result = await self._send_full_dmx_command(dmx_address, "255")
             if result and result.get("success"):
                 # Immediately reflect the commanded state in HA and start confirmation timeout
                 self._attr_is_on = True
@@ -306,13 +261,11 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             )
             return
         if self.is_on:
-            dmx_address = await self._fetch_dmx_address()
-            if dmx_address is None:
-                _LOGGER.warning(f"Cannot turn off {self.name}: DMX address unknown")
-                return
             self._last_command_time = now
+            dmx_address, result = await self._send_full_dmx_command("0")
+            if dmx_address is None:
+                return
             _LOGGER.info(f"Turning OFF {self.name} at DMX address {dmx_address}")
-            result = await self._send_full_dmx_command(dmx_address, "0")
             if result and result.get("success"):
                 # Immediately reflect the commanded state in HA and start confirmation timeout
                 self._attr_is_on = False

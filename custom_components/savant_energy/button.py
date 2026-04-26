@@ -17,7 +17,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback  # type: i
 from homeassistant.helpers.event import async_track_time_interval  # type: ignore
 
 from .const import DOMAIN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE
-from .utils import async_set_dmx_values, get_dmx_api_stats, get_dmx_address_from_state
+from .utils import async_build_managed_dmx_values, async_set_dmx_values, get_dmx_api_stats
 from .scene import SavantSceneStorage, SavantSceneManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -72,7 +72,7 @@ class SavantSceneButton(ButtonEntity):
             )
             return
         relay_states = scene.get("relay_states", {})
-        dmx_values = {}
+        overrides_by_uid = {}
         for breaker_entity_id, is_on in relay_states.items():
             breaker_state = self._hass.states.get(breaker_entity_id)
             device_uid = breaker_state.attributes.get("uid") if breaker_state else None
@@ -83,15 +83,19 @@ class SavantSceneButton(ButtonEntity):
                 )
                 continue
 
-            dmx_address = get_dmx_address_from_state(self._hass, device_uid)
-            if dmx_address is None:
+            overrides_by_uid[str(device_uid)] = "255" if is_on else "0"
+
+        dmx_values, _resolved_addresses, unresolved_devices = await async_build_managed_dmx_values(
+            self._scene_manager.coordinator,
+            self._hass,
+            overrides_by_uid,
+        )
+        for device_uid, device_name in unresolved_devices.items():
+            if device_uid in overrides_by_uid:
                 _LOGGER.warning(
                     "Skipping scene member %s because its DMX address is unavailable",
-                    breaker_entity_id,
+                    device_name,
                 )
-                continue
-
-            dmx_values[dmx_address] = "255" if is_on else "0"
 
         if not dmx_values:
             _LOGGER.warning(
@@ -264,46 +268,29 @@ class SavantAllLoadsButton(ButtonEntity):
         """
         Handle the button press - send command to turn on all loads.
         """
-        dmx_values = {}
-        max_dmx_address = 0
+        snapshot_data = self.coordinator.data.get("snapshot_data", {}) if self.coordinator.data else {}
+        devices = snapshot_data.get("presentDemands", []) if isinstance(snapshot_data, dict) else []
+        overrides_by_uid = {
+            str(device.get("uid")): "255"
+            for device in devices
+            if device.get("uid")
+        }
+        dmx_values, _resolved_addresses, unresolved_devices = await async_build_managed_dmx_values(
+            self.coordinator,
+            self.hass,
+            overrides_by_uid,
+        )
 
-        # Get all sensor entities that might be DMX address sensors
-        all_entity_ids = self.hass.states.async_entity_ids("sensor")
-        dmx_address_sensors = [
-            entity_id
-            for entity_id in all_entity_ids
-            if entity_id.endswith("_dmx_address")
-        ]
+        if not dmx_values:
+            _LOGGER.warning("No DMX addresses found for all-loads command")
+            return
 
-        _LOGGER.debug(f"Found {len(dmx_address_sensors)} potential DMX address sensors")
-
-        # Extract DMX addresses from all matching sensors
-        for entity_id in dmx_address_sensors:
-            state = self.hass.states.get(entity_id)
-            if state and state.state not in ("unknown", "unavailable"):
-                try:
-                    dmx_address = int(state.state)
-                    # Set this DMX address to "on"
-                    dmx_values[dmx_address] = "255"
-                    if dmx_address > max_dmx_address:
-                        max_dmx_address = dmx_address
-                    _LOGGER.debug(
-                        f"Found DMX address {dmx_address} from sensor {entity_id}"
-                    )
-                except (ValueError, TypeError):
-                    _LOGGER.debug(
-                        f"Invalid DMX address value in sensor {entity_id}: {state.state}"
-                    )
-
-        # Only use default if we didn't find any valid DMX addresses
-        if max_dmx_address == 0:
-            _LOGGER.warning(
-                "No valid DMX addresses found from sensors, defaulting to addresses 1-%d",
-                DEFAULT_CHANNEL_COUNT,
-            )
-            for addr in range(1, DEFAULT_CHANNEL_COUNT + 1):
-                dmx_values[addr] = "255"
-            max_dmx_address = DEFAULT_CHANNEL_COUNT
+        for device_uid, device_name in unresolved_devices.items():
+            if device_uid in overrides_by_uid:
+                _LOGGER.warning(
+                    "Skipping %s in all-loads command because its DMX address is unavailable",
+                    device_name,
+                )
 
         # Get IP address from config entry
         ip_address = self.coordinator.config_entry.data.get("address")
@@ -321,7 +308,7 @@ class SavantAllLoadsButton(ButtonEntity):
         )
 
         _LOGGER.info(
-            f"Turning on all {len(dmx_values)} loads (max DMX address: {max_dmx_address})"
+            f"Turning on all {len(dmx_values)} loads"
         )
 
         # Use utility function to send command - this will both log and send the command
@@ -380,47 +367,30 @@ class SavantApiCommandLogButton(ButtonEntity):
         # Get OLA port from config entry or use default
         ola_port = self.coordinator.config_entry.data.get("ola_port", DEFAULT_OLA_PORT)
 
-        # Example channel values to turn everything on
-        dmx_values = {}
-        max_dmx_address = 0
+        snapshot_data = self.coordinator.data.get("snapshot_data", {}) if self.coordinator.data else {}
+        devices = snapshot_data.get("presentDemands", []) if isinstance(snapshot_data, dict) else []
+        overrides_by_uid = {
+            str(device.get("uid")): "255"
+            for device in devices
+            if device.get("uid")
+        }
+        dmx_values, _resolved_addresses, unresolved_devices = await async_build_managed_dmx_values(
+            self.coordinator,
+            self.hass,
+            overrides_by_uid,
+        )
+        if not dmx_values:
+            _LOGGER.warning("No DMX addresses found, cannot generate curl command example")
+            return
 
-        # Get all sensor entities that might be DMX address sensors
-        all_entity_ids = self.hass.states.async_entity_ids("sensor")
-        dmx_address_sensors = [
-            entity_id
-            for entity_id in all_entity_ids
-            if entity_id.endswith("_dmx_address")
-        ]
+        for device_uid, device_name in unresolved_devices.items():
+            if device_uid in overrides_by_uid:
+                _LOGGER.warning(
+                    "Skipping %s in DMX API command example because its DMX address is unavailable",
+                    device_name,
+                )
 
-        _LOGGER.debug(f"Found {len(dmx_address_sensors)} potential DMX address sensors")
-
-        # Extract DMX addresses from all matching sensors
-        for entity_id in dmx_address_sensors:
-            state = self.hass.states.get(entity_id)
-            if state and state.state not in ("unknown", "unavailable"):
-                try:
-                    dmx_address = int(state.state)
-                    # Set this DMX address to "on"
-                    dmx_values[dmx_address] = "255"
-                    if dmx_address > max_dmx_address:
-                        max_dmx_address = dmx_address
-                    _LOGGER.debug(
-                        f"Found DMX address {dmx_address} from sensor {entity_id}"
-                    )
-                except (ValueError, TypeError):
-                    _LOGGER.debug(
-                        f"Invalid DMX address value in sensor {entity_id}: {state.state}"
-                    )
-
-        # If no valid DMX addresses found, create some defaults
-        if not dmx_values or max_dmx_address == 0:
-            _LOGGER.warning(
-                "No DMX addresses found, defaulting to addresses 1-%d",
-                DEFAULT_CHANNEL_COUNT,
-            )
-            for addr in range(1, DEFAULT_CHANNEL_COUNT + 1):
-                dmx_values[addr] = "255"
-            max_dmx_address = DEFAULT_CHANNEL_COUNT
+        max_dmx_address = max(dmx_values)
 
         # Create array of values where index position corresponds to address-1
         value_array = ["0"] * max_dmx_address

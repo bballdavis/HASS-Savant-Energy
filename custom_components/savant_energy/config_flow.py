@@ -22,9 +22,7 @@ from .const import (
         CONF_PENDING_CONFIRM_MULTIPLIER,
         DEFAULT_PENDING_CONFIRM_MULTIPLIER,
     CONF_DMX_TESTING_MODE,
-    CONF_DMX_ADDRESS_CACHE,
     DEFAULT_DMX_TESTING_MODE,
-    DEFAULT_DMX_ADDRESS_CACHE,
     DEFAULT_DISABLE_SCENE_BUILDER,
 )
 
@@ -114,7 +112,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     vol.Required(CONF_PORT, default=2000): int,
                     vol.Required(CONF_OLA_PORT, default=DEFAULT_OLA_PORT): int,
                     vol.Optional(CONF_DMX_TESTING_MODE, default=DEFAULT_DMX_TESTING_MODE): bool,
-                    vol.Optional(CONF_DMX_ADDRESS_CACHE, default=DEFAULT_DMX_ADDRESS_CACHE): bool,
                     vol.Optional("disable_scene_builder", default=DEFAULT_DISABLE_SCENE_BUILDER): bool,
                 }
             ),
@@ -216,13 +213,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 default=self.config_entry.options.get(
                     CONF_DMX_TESTING_MODE,
                     self.config_entry.data.get(CONF_DMX_TESTING_MODE, DEFAULT_DMX_TESTING_MODE),
-                ),
-            ): bool,
-            vol.Optional(
-                CONF_DMX_ADDRESS_CACHE,
-                default=self.config_entry.options.get(
-                    CONF_DMX_ADDRESS_CACHE,
-                    self.config_entry.data.get(CONF_DMX_ADDRESS_CACHE, DEFAULT_DMX_ADDRESS_CACHE),
                 ),
             ): bool,
             vol.Optional(

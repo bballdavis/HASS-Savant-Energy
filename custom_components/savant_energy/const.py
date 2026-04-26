@@ -19,7 +19,6 @@ CONF_OLA_PORT = "ola_port"  # Port for OLA/DMX API
 CONF_SCAN_INTERVAL = "scan_interval"  # Polling interval (seconds)
 CONF_SWITCH_COOLDOWN = "switch_cooldown"  # Minimum seconds between relay toggles
 CONF_DMX_TESTING_MODE = "dmx_testing_mode"  # Enable advanced DMX testing mode
-CONF_DMX_ADDRESS_CACHE = "dmx_address_cache"  # Enable DMX address caching
 
 CONF_PENDING_CONFIRM_MULTIPLIER = "pending_confirm_multiplier"  # Multiplier for pending confirm timeout (scan_interval * multiplier)
 
@@ -30,7 +29,6 @@ DEFAULT_OLA_PORT = 9090       # Default OLA/DMX API port
 
 # Boolean config defaults
 DEFAULT_DMX_TESTING_MODE = False
-DEFAULT_DMX_ADDRESS_CACHE = False
 DEFAULT_DISABLE_SCENE_BUILDER = False
 DEFAULT_PENDING_CONFIRM_MULTIPLIER = 3
 

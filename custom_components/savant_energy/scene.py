@@ -25,7 +25,7 @@ from .api import register_scene_services  # type: ignore
 from homeassistant.exceptions import HomeAssistantError  # type: ignore
 
 from .const import DOMAIN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE
-from .utils import async_set_dmx_values, get_dmx_address_from_state, slugify
+from .utils import async_build_managed_dmx_values, async_set_dmx_values, slugify
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -549,8 +549,7 @@ class SavantSceneManager:
         scene = self.storage.scenes[scene_id]
         relay_states = scene["relay_states"]
 
-        # Get DMX addresses and values
-        dmx_values = {}
+        overrides_by_uid = {}
 
         for breaker_entity_id, is_on in relay_states.items():
             breaker_state = self.hass.states.get(breaker_entity_id)
@@ -569,16 +568,19 @@ class SavantSceneManager:
                 )
                 continue
 
-            dmx_address = get_dmx_address_from_state(self.hass, device_uid)
-            if dmx_address is None:
+            overrides_by_uid[str(device_uid)] = "255" if is_on else "0"
+
+        dmx_values, _resolved_addresses, unresolved_devices = await async_build_managed_dmx_values(
+            self.coordinator,
+            self.hass,
+            overrides_by_uid,
+        )
+        for device_uid, device_name in unresolved_devices.items():
+            if device_uid in overrides_by_uid:
                 _LOGGER.warning(
                     "Skipping scene member %s because its DMX address is unavailable",
-                    breaker_entity_id,
+                    device_name,
                 )
-                continue
-
-            value = 255 if is_on else 0
-            dmx_values[dmx_address] = str(value)
 
         if not dmx_values:
             _LOGGER.warning(f"No DMX addresses found for scene {scene['name']}")
