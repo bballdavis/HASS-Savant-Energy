@@ -55,8 +55,22 @@ async def _async_fetch_json(
     """Fetch JSON data and return payload, raw text, and error string."""
     try:
         timeout_config = aiohttp.ClientTimeout(total=float(timeout))
-        async with session.get(url, timeout=timeout_config) as response:
+        async with session.get(
+            url,
+            timeout=timeout_config,
+            allow_redirects=False,
+        ) as response:
             text_response = await response.text()
+            if 300 <= response.status < 400:
+                redirect_target = response.headers.get("Location") or "(no location provided)"
+                error = f"Unexpected redirect HTTP {response.status} to {redirect_target}"
+                _LOGGER.warning(
+                    "Request to %s returned redirect response: %s, body: %s",
+                    url,
+                    error,
+                    text_response,
+                )
+                return None, text_response, error
             if response.status != 200:
                 error = f"HTTP {response.status}"
                 _LOGGER.warning(
@@ -66,20 +80,46 @@ async def _async_fetch_json(
             try:
                 data = json.loads(text_response)
             except json.JSONDecodeError as json_err:
-                error = f"Invalid JSON: {json_err}"
+                error = _classify_non_json_response(
+                    response.content_type,
+                    text_response,
+                    json_err,
+                )
                 _LOGGER.warning(
                     f"JSON decode error from {url}: {error}. Text: {text_response}"
                 )
                 return None, text_response, error
             return data, text_response, None
-    except (aiohttp.ClientError, asyncio.TimeoutError) as err:
-        error = f"{type(err).__name__}: {err}"
+    except asyncio.TimeoutError:
+        error = "Transport timeout"
+        _LOGGER.warning(f"Network error calling {url}: {error}")
+        return None, None, error
+    except aiohttp.ClientError as err:
+        error = f"Transport error: {type(err).__name__}: {err}"
         _LOGGER.warning(f"Network error calling {url}: {error}")
         return None, None, error
     except Exception as err:
         error = f"Unexpected {type(err).__name__}: {err}"
         _LOGGER.warning(f"Unexpected error calling {url}: {error}")
         return None, None, error
+
+
+def _classify_non_json_response(
+    content_type: str,
+    text_response: str,
+    json_err: json.JSONDecodeError,
+) -> str:
+    """Classify a non-JSON HTTP 200 response for DMX/RDM endpoints."""
+    response_body = text_response.strip()
+    lowered_body = response_body.lower()
+
+    if "usage:" in lowered_body and "uid=[uid]" in lowered_body:
+        return "Malformed request: endpoint returned usage page instead of JSON"
+
+    if response_body.startswith("<") or content_type == "text/html":
+        return f"Unexpected HTML response instead of JSON ({content_type})"
+
+    return f"Invalid JSON response ({content_type}): {json_err}"
 
 
 async def _async_notify_channel_issue(
@@ -151,6 +191,18 @@ def _extract_json_error(data: Optional[Dict[str, Any]]) -> Optional[str]:
             return joined_errors
 
     return None
+
+
+def _should_run_rdm_discovery(error_text: str) -> bool:
+    """Return True when a lookup failure should trigger discovery and retry."""
+    non_discovery_errors = (
+        "Malformed request:",
+        "Unexpected redirect HTTP",
+        "Unexpected HTML response",
+        "Invalid JSON response",
+        "Missing IP address or OLA port",
+    )
+    return not error_text.startswith(non_discovery_errors)
 
 
 def _get_cached_dmx_address(dmx_uid: str) -> Optional[int]:
@@ -498,7 +550,7 @@ async def async_get_dmx_address(
             last_error,
         )
 
-        if schedule_discovery:
+        if schedule_discovery and _should_run_rdm_discovery(last_error):
             try:
                 discovered_uids = await _async_run_rdm_discovery_pipeline(
                     hass,
@@ -539,6 +591,13 @@ async def async_get_dmx_address(
                     universe,
                     last_error,
                 )
+        elif schedule_discovery:
+            _LOGGER.warning(
+                "Skipping RDM discovery for %s on universe %s because the uid_info response indicates a malformed or unexpected request/response: %s",
+                normalized_dmx_uid,
+                universe,
+                last_error,
+            )
 
     _dmx_last_lookup_error[normalized_dmx_uid] = last_error or "Unknown error retrieving DMX address"
 

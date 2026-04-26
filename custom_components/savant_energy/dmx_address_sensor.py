@@ -4,6 +4,7 @@ Provides a sensor entity that shows the DMX address for each relay device.
 All classes and functions are now documented for clarity and open source maintainability.
 """
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -17,6 +18,7 @@ from .models import get_device_model
 from .utils import async_get_dmx_address, slugify
 
 _LOGGER = logging.getLogger(__name__)
+_DMX_LOOKUP_LOCKS: dict[tuple[str, int, int], asyncio.Lock] = {}
 
 
 class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
@@ -124,10 +126,20 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
 
         # Keep the restored value visible during startup, but always refresh in the
         # background so commands do not depend on stale state indefinitely.
-        self.hass.async_create_task(
-            self._fetch_dmx_address(),
-            name=f"savant_energy_dmx_fetch_{self._dmx_uid}",
-        )
+        self._schedule_dmx_refresh("savant_energy_dmx_fetch")
+
+    def _schedule_dmx_refresh(self, task_prefix: str) -> None:
+        """Schedule a DMX refresh on the Home Assistant event loop thread."""
+        if not self.hass:
+            return
+
+        def _start_task() -> None:
+            self.hass.async_create_task(
+                self._fetch_dmx_address(),
+                name=f"{task_prefix}_{self._dmx_uid}",
+            )
+
+        self.hass.loop.call_soon_threadsafe(_start_task)
 
     async def _fetch_dmx_address(self):
         """
@@ -144,14 +156,17 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
             return
         universe = 1  # Default universe
         device_label = self._current_device_name
-        address = await async_get_dmx_address(
-            ip_address,
-            ola_port,
-            universe,
-            self._dmx_uid,
-            hass=self.hass,
-            device_name=device_label,
-        )
+        lookup_key = (ip_address, ola_port, universe)
+        lookup_lock = _DMX_LOOKUP_LOCKS.setdefault(lookup_key, asyncio.Lock())
+        async with lookup_lock:
+            address = await async_get_dmx_address(
+                ip_address,
+                ola_port,
+                universe,
+                self._dmx_uid,
+                hass=self.hass,
+                device_name=device_label,
+            )
         if address is not None:
             self._dmx_address = address
             self.async_write_ha_state()
@@ -169,12 +184,7 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
         uids = payload.get("uids") or []
         if self._dmx_uid.lower() not in {str(uid).lower() for uid in uids}:
             return
-        if not self.hass:
-            return
-        self.hass.async_create_task(
-            self._fetch_dmx_address(),
-            name=f"savant_energy_refresh_dmx_{self._dmx_uid}",
-        )
+        self._schedule_dmx_refresh("savant_energy_refresh_dmx")
 
     @property
     def native_value(self):
