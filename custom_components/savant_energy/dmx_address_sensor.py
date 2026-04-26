@@ -124,7 +124,7 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
 
         # Keep the restored value visible during startup, but always refresh in the
         # background so commands do not depend on stale state indefinitely.
-        self.hass.async_create_background_task(
+        self.hass.async_create_task(
             self._fetch_dmx_address(),
             name=f"savant_energy_dmx_fetch_{self._dmx_uid}",
         )
@@ -171,7 +171,7 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
             return
         if not self.hass:
             return
-        self.hass.async_create_background_task(
+        self.hass.async_create_task(
             self._fetch_dmx_address(),
             name=f"savant_energy_refresh_dmx_{self._dmx_uid}",
         )
