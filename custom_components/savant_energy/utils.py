@@ -641,9 +641,8 @@ async def async_build_managed_dmx_values(
     if config_entry is None:
         return {}, {}, {}
 
-    snapshot_data = coordinator.data.get("snapshot_data", {}) if coordinator.data else {}
-    devices = snapshot_data.get("presentDemands", []) if isinstance(snapshot_data, dict) else []
-    if not isinstance(devices, list) or not devices:
+    devices = get_coordinator_present_demands(coordinator)
+    if not devices:
         return {}, {}, {}
 
     ip_address = config_entry.data.get("address")
@@ -883,6 +882,79 @@ def _normalize_dmx_value(value: Any, default: str = "255") -> str:
     except (TypeError, ValueError):
         return default
     return str(max(0, min(255, numeric_value)))
+
+
+def get_coordinator_present_demands(coordinator: Any) -> List[Dict[str, Any]]:
+    """Return live or cached presentDemands entries from the coordinator."""
+    if coordinator is None:
+        return []
+
+    snapshot_data = coordinator.data.get("snapshot_data", {}) if getattr(coordinator, "data", None) else {}
+    devices = snapshot_data.get("presentDemands", []) if isinstance(snapshot_data, dict) else []
+    if isinstance(devices, list):
+        valid_devices = [device for device in devices if isinstance(device, dict)]
+        if valid_devices:
+            return valid_devices
+
+    cached_devices = getattr(coordinator, "cached_present_demands", None)
+    if not isinstance(cached_devices, list) and getattr(coordinator, "data", None):
+        cached_devices = coordinator.data.get("cached_present_demands", [])
+
+    if not isinstance(cached_devices, list):
+        return []
+
+    return [device for device in cached_devices if isinstance(device, dict)]
+
+
+def get_known_dmx_channels_from_state(hass: Optional[Any]) -> List[int]:
+    """Return known Savant DMX channels from DMX address sensor state."""
+    if hass is None:
+        return []
+
+    channels: set[int] = set()
+    for sensor_state in hass.states.async_all("sensor"):
+        if not sensor_state.entity_id.endswith("_dmx_address"):
+            continue
+        if not sensor_state.attributes.get("uid") and not sensor_state.attributes.get("dmx_uid"):
+            continue
+        try:
+            address = int(sensor_state.state)
+        except (TypeError, ValueError):
+            continue
+        if address > 0:
+            channels.add(address)
+
+    return sorted(channels)
+
+
+async def async_build_all_loads_dmx_values(
+    coordinator: Any,
+    hass: Optional[Any],
+) -> Tuple[Dict[int, str], str, Dict[str, str]]:
+    """Build an all-loads-on DMX command from live data, cached devices, or HA state."""
+    devices = get_coordinator_present_demands(coordinator)
+    if devices:
+        snapshot_data = coordinator.data.get("snapshot_data", {}) if getattr(coordinator, "data", None) else {}
+        live_devices = snapshot_data.get("presentDemands", []) if isinstance(snapshot_data, dict) else []
+        source = "live snapshot" if isinstance(live_devices, list) and live_devices else "cached snapshot"
+        overrides_by_uid = {
+            str(device.get("uid")): "255"
+            for device in devices
+            if device.get("uid")
+        }
+        dmx_values, _resolved_addresses, unresolved_devices = await async_build_managed_dmx_values(
+            coordinator,
+            hass,
+            overrides_by_uid,
+        )
+        if dmx_values:
+            return dmx_values, source, unresolved_devices
+
+    known_channels = get_known_dmx_channels_from_state(hass)
+    if known_channels:
+        return ({channel: "255" for channel in known_channels}, "dmx address sensors", {})
+
+    return {}, "none", {}
 
 
 async def _async_get_current_dmx_values(

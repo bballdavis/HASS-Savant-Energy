@@ -3,6 +3,7 @@ Integration for Savant Energy.
 Provides Home Assistant integration for Savant relay and energy monitoring devices.
 """
 
+import copy
 import logging
 from datetime import timedelta, datetime
 import os
@@ -26,7 +27,7 @@ from .const import (
     CONF_SCAN_INTERVAL,
     DEFAULT_OLA_PORT,
 )
-from .snapshot_data import get_current_energy_snapshot
+from .snapshot_data import fetch_current_energy_snapshot
 from .utils import async_get_all_dmx_status, DMX_CACHE_SECONDS # type: ignore
 
 _LOGGER = logging.getLogger(__name__)
@@ -73,8 +74,36 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.address = entry.data[CONF_ADDRESS]
         self.port = entry.data[CONF_PORT]
         self.config_entry = entry  # Store config entry directly
+        self.base_scan_interval_seconds = scan_interval
+        self.consecutive_snapshot_failures = 0
+        self.cached_present_demands = []
+        self.last_snapshot_error = None
         self.dmx_data = {}  # Mapping of channel -> status (for debugging)
         self.dmx_last_update = None
+
+    def _set_snapshot_update_interval(self, success: bool) -> None:
+        """Adjust polling interval with capped backoff while snapshot retrieval is unhealthy."""
+        if success:
+            self.consecutive_snapshot_failures = 0
+            next_interval_seconds = self.base_scan_interval_seconds
+        else:
+            self.consecutive_snapshot_failures += 1
+            next_interval_seconds = min(
+                max(
+                    self.base_scan_interval_seconds,
+                    self.base_scan_interval_seconds * (2 ** (self.consecutive_snapshot_failures - 1)),
+                ),
+                30,
+            )
+
+        next_interval = timedelta(seconds=next_interval_seconds)
+        if self.update_interval != next_interval:
+            self.update_interval = next_interval
+            _LOGGER.info(
+                "Updated Savant snapshot poll interval to %s seconds after %s",
+                next_interval_seconds,
+                "successful refresh" if success else "snapshot failure",
+            )
 
     async def _async_update_data(self):
         """
@@ -84,21 +113,51 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         """
         try:
             # Get snapshot data from energy controller
-            snapshot_data = await self.hass.async_add_executor_job(
-                get_current_energy_snapshot, self.address, self.port
+            snapshot_result = await self.hass.async_add_executor_job(
+                fetch_current_energy_snapshot, self.address, self.port
             )
 
-            # Log diagnostic information for troubleshooting entity availability
-            if snapshot_data is None:
-                _LOGGER.error(
-                    "Received no data from Savant controller - check connection settings"
+            if not snapshot_result.success or snapshot_result.data is None:
+                self._set_snapshot_update_interval(success=False)
+                self.last_snapshot_error = {
+                    "type": snapshot_result.error_type,
+                    "message": snapshot_result.error_message,
+                    "raw_excerpt": snapshot_result.raw_excerpt,
+                    "timestamp": now.isoformat(),
+                }
+                _LOGGER.warning(
+                    "Savant snapshot refresh failed (%s): %s%s",
+                    snapshot_result.error_type,
+                    snapshot_result.error_message,
+                    f" | sample: {snapshot_result.raw_excerpt}" if snapshot_result.raw_excerpt else "",
                 )
-                return self.data  # Keep previous data rather than None
 
-            if "presentDemands" not in snapshot_data:
-                _LOGGER.error(
-                    f"Missing 'presentDemands' in snapshot data: {snapshot_data}"
-                )
+                existing_data = dict(self.data) if isinstance(self.data, dict) else {}
+                existing_data.setdefault("snapshot_data", None)
+                existing_data["dmx_data"] = self.dmx_data
+                existing_data["cached_present_demands"] = copy.deepcopy(self.cached_present_demands)
+                existing_data["snapshot_status"] = {
+                    "ok": False,
+                    "error_type": snapshot_result.error_type,
+                    "error_message": snapshot_result.error_message,
+                    "raw_excerpt": snapshot_result.raw_excerpt,
+                    "failure_count": self.consecutive_snapshot_failures,
+                    "next_retry_seconds": int(self.update_interval.total_seconds()),
+                    "used_cached_snapshot": bool(existing_data.get("snapshot_data")),
+                }
+                return existing_data
+
+            snapshot_data = snapshot_result.data
+            self._set_snapshot_update_interval(success=True)
+            self.last_snapshot_error = None
+
+            present_demands = snapshot_data.get("presentDemands", [])
+            if isinstance(present_demands, list):
+                self.cached_present_demands = [
+                    copy.deepcopy(device)
+                    for device in present_demands
+                    if isinstance(device, dict)
+                ]
 
             # Check if we have valid device data to report for debugging
             if "presentDemands" in snapshot_data:
@@ -137,7 +196,20 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 self.dmx_data = {}
                 self.dmx_last_update = now
 
-            return {"snapshot_data": snapshot_data, "dmx_data": self.dmx_data}
+            return {
+                "snapshot_data": snapshot_data,
+                "dmx_data": self.dmx_data,
+                "cached_present_demands": copy.deepcopy(self.cached_present_demands),
+                "snapshot_status": {
+                    "ok": True,
+                    "error_type": None,
+                    "error_message": None,
+                    "raw_excerpt": None,
+                    "failure_count": 0,
+                    "next_retry_seconds": int(self.update_interval.total_seconds()),
+                    "used_cached_snapshot": False,
+                },
+            }
         except Exception as exc:
             _LOGGER.error(f"Error updating data: {exc}")
             raise

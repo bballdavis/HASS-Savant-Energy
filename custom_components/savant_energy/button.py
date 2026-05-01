@@ -17,7 +17,12 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback  # type: i
 from homeassistant.helpers.event import async_track_time_interval  # type: ignore
 
 from .const import DOMAIN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE
-from .utils import async_build_managed_dmx_values, async_set_dmx_values, get_dmx_api_stats
+from .utils import (
+    async_build_all_loads_dmx_values,
+    async_build_managed_dmx_values,
+    async_set_dmx_values,
+    get_dmx_api_stats,
+)
 from .scene import SavantSceneStorage, SavantSceneManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -142,24 +147,13 @@ async def async_setup_entry(
     )
     await button_manager.async_setup()
 
-    if coordinator.data is not None:
-        snapshot_data = coordinator.data.get("snapshot_data", {})
-        if (
-            snapshot_data
-            and isinstance(snapshot_data, dict)
-            and "presentDemands" in snapshot_data
-        ):
-            async_add_entities(
-                [
-                    SavantAllLoadsButton(hass, coordinator),
-                    SavantApiCommandLogButton(hass, coordinator),
-                    SavantApiStatsButton(hass, coordinator),
-                ]
-            )
-        else:
-            _LOGGER.warning(
-                "No presentDemands data found in coordinator snapshot_data, buttons not added"
-            )
+    async_add_entities(
+        [
+            SavantAllLoadsButton(hass, coordinator),
+            SavantApiCommandLogButton(hass, coordinator),
+            SavantApiStatsButton(hass, coordinator),
+        ]
+    )
 
 
 class SavantSceneButtonManager:
@@ -268,29 +262,22 @@ class SavantAllLoadsButton(ButtonEntity):
         """
         Handle the button press - send command to turn on all loads.
         """
-        snapshot_data = self.coordinator.data.get("snapshot_data", {}) if self.coordinator.data else {}
-        devices = snapshot_data.get("presentDemands", []) if isinstance(snapshot_data, dict) else []
-        overrides_by_uid = {
-            str(device.get("uid")): "255"
-            for device in devices
-            if device.get("uid")
-        }
-        dmx_values, _resolved_addresses, unresolved_devices = await async_build_managed_dmx_values(
+        dmx_values, dmx_source, unresolved_devices = await async_build_all_loads_dmx_values(
             self.coordinator,
             self.hass,
-            overrides_by_uid,
         )
 
         if not dmx_values:
-            _LOGGER.warning("No DMX addresses found for all-loads command")
+            _LOGGER.warning(
+                "No DMX addresses found for all-loads command from live snapshot, cached snapshot, or DMX address sensor state"
+            )
             return
 
         for device_uid, device_name in unresolved_devices.items():
-            if device_uid in overrides_by_uid:
-                _LOGGER.warning(
-                    "Skipping %s in all-loads command because its DMX address is unavailable",
-                    device_name,
-                )
+            _LOGGER.warning(
+                "Skipping %s in all-loads command because its DMX address is unavailable",
+                device_name,
+            )
 
         # Get IP address from config entry
         ip_address = self.coordinator.config_entry.data.get("address")
@@ -307,9 +294,7 @@ class SavantAllLoadsButton(ButtonEntity):
             self.coordinator.config_entry.data.get(CONF_DMX_TESTING_MODE, False),
         )
 
-        _LOGGER.info(
-            f"Turning on all {len(dmx_values)} loads"
-        )
+        _LOGGER.info("Turning on %d Savant loads using %s", len(dmx_values), dmx_source)
 
         # Use utility function to send command - this will both log and send the command
         result = await async_set_dmx_values(
@@ -367,28 +352,21 @@ class SavantApiCommandLogButton(ButtonEntity):
         # Get OLA port from config entry or use default
         ola_port = self.coordinator.config_entry.data.get("ola_port", DEFAULT_OLA_PORT)
 
-        snapshot_data = self.coordinator.data.get("snapshot_data", {}) if self.coordinator.data else {}
-        devices = snapshot_data.get("presentDemands", []) if isinstance(snapshot_data, dict) else []
-        overrides_by_uid = {
-            str(device.get("uid")): "255"
-            for device in devices
-            if device.get("uid")
-        }
-        dmx_values, _resolved_addresses, unresolved_devices = await async_build_managed_dmx_values(
+        dmx_values, dmx_source, unresolved_devices = await async_build_all_loads_dmx_values(
             self.coordinator,
             self.hass,
-            overrides_by_uid,
         )
         if not dmx_values:
-            _LOGGER.warning("No DMX addresses found, cannot generate curl command example")
+            _LOGGER.warning(
+                "No DMX addresses found from live snapshot, cached snapshot, or DMX address sensor state; cannot generate curl command example"
+            )
             return
 
         for device_uid, device_name in unresolved_devices.items():
-            if device_uid in overrides_by_uid:
-                _LOGGER.warning(
-                    "Skipping %s in DMX API command example because its DMX address is unavailable",
-                    device_name,
-                )
+            _LOGGER.warning(
+                "Skipping %s in DMX API command example because its DMX address is unavailable",
+                device_name,
+            )
 
         max_dmx_address = max(dmx_values)
 
@@ -405,7 +383,7 @@ class SavantApiCommandLogButton(ButtonEntity):
 
         # Format the curl command properly
         curl_command = f'curl -X POST -d "u=1&d={data_param}" http://{ip_address}:{ola_port}/set_dmx'
-        _LOGGER.info("DMX API command example: %s", curl_command)
+        _LOGGER.info("DMX API command example built from %s: %s", dmx_source, curl_command)
 
 
 class SavantApiStatsButton(ButtonEntity):
