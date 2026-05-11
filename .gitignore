@@ -65,3 +65,10 @@ __pycache__/
 
 # Home Assistant specific
 home-assistant_v2.db
+
+# Savant InfluxDB probe configuration and outputs
+.savant-local.env
+.savant-influx-read.token
+*.token
+savant_influx_discovery/
+tools/savant_influx_discovery/

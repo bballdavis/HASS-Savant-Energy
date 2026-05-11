@@ -116,6 +116,91 @@ This integration exposes a REST API for managing Savant Energy scenes.
 
 Refer to `INTEGRATION_API.md` for more detailed API documentation, including example requests and responses.
 
+## 🔬 InfluxDB Discovery Tool
+
+The Savant host stores InfluxDB 2 data locally. A discovery tool is provided to explore and understand the available measurements, fields, and tags for building an optimized integration.
+
+### Setup
+
+1. **Install dependencies:**
+   ```bash
+   pip install -r tools/requirements-dev.txt
+   ```
+
+2. **Configure local credentials** (gitignored):
+   ```bash
+   cp .savant-local.env.example .savant-local.env
+   # Edit .savant-local.env with your Savant host IP and SSH credentials
+   ```
+
+### Quick Start
+
+Run a full discovery of the InfluxDB on your Savant host:
+
+```bash
+python3 tools/savant_influx_probe.py discover \
+  --ssh-host 192.168.1.14 \
+  --ssh-user RPM \
+  --cache-token
+```
+
+The script will:
+- Prompt for your SSH password
+- Retrieve the InfluxDB read token from the Savant host
+- Query all organizations, buckets, measurements, fields, and tags
+- Sample recent data rows
+- Generate a detailed discovery report in `savant_influx_discovery/YYYYMMDD-HHMMSS/`
+
+### Available Commands
+
+**Full discovery:**
+```bash
+python3 tools/savant_influx_probe.py discover \
+  --influx-url http://192.168.1.14:8086 \
+  --ssh-host 192.168.1.14 \
+  --ssh-user RPM
+```
+
+**List organizations:**
+```bash
+python3 tools/savant_influx_probe.py list-orgs \
+  --influx-url http://192.168.1.14:8086 \
+  --token "<your_token>"
+```
+
+**List buckets:**
+```bash
+python3 tools/savant_influx_probe.py list-buckets \
+  --influx-url http://192.168.1.14:8086 \
+  --token "<your_token>" \
+  --org "<org_name>"
+```
+
+### Output
+
+Discovery generates structured reports in `savant_influx_discovery/YYYYMMDD-HHMMSS/`:
+- **orgs.json**: Organization definitions
+- **buckets.json**: Buckets per organization
+- **measurements.json**: Available measurements
+- **fields.json**: Available field keys (power, energy, voltage, current, etc.)
+- **tags.json**: Available tag keys (name, uid, channel, classification, etc.)
+- **tag_values.json**: Sample values for key tags
+- **recent_sample_*.csv / .jsonl**: Recent data rows
+- **candidate_energy_series.json**: Scored candidates for energy/power data
+- **summary.md**: Human-readable summary with recommendations
+
+### Token Caching
+
+Use `--cache-token` to store the retrieved token locally in `.savant-influx-read.token` (gitignored). This speeds up subsequent runs:
+
+```bash
+# First run: retrieves and caches token
+python3 tools/savant_influx_probe.py discover --cache-token
+
+# Subsequent runs: uses cached token (no SSH prompt)
+python3 tools/savant_influx_probe.py discover
+```
+
 ## 📝 Configuration Options
 - **IP Address**: The address of your Savant controller.
 - **Port**: The port for energy snapshot data (default: 2000).
