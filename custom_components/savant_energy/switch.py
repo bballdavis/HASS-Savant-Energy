@@ -22,11 +22,14 @@ from .const import (
     MANUFACTURER,
     DEFAULT_OLA_PORT,
     CONF_DMX_TESTING_MODE,
+    CONF_MODE,
+    MODE_LEGACY,
     CONF_PENDING_CONFIRM_MULTIPLIER,
     DEFAULT_PENDING_CONFIRM_MULTIPLIER,
 )
 from .models import get_device_model
 from .utils import calculate_dmx_uid, async_build_managed_dmx_values, async_set_dmx_values
+from .relay_control import SavantRelayController
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -84,8 +87,9 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         self._attr_unique_id = f"{DOMAIN}_{device['uid']}_breaker"
         self._dmx_uid = calculate_dmx_uid(device["uid"])
         self._dmx_address = None
+        base_uid = device.get("base_uid", device["uid"])
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, str(device["uid"]))},
+            identifiers={(DOMAIN, base_uid)},
             name=device["name"],
             manufacturer=MANUFACTURER,
             model=get_device_model(
@@ -143,10 +147,52 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
                 break
         return None
 
+    async def _send_relay_command(self, target_value: str) -> bool:
+        """
+        Send a relay control command to the SEM controller.
+
+        Args:
+            target_value: "255" for on, "0" for off
+
+        Returns:
+            True if command was sent successfully
+        """
+        mode = self.coordinator.config_entry.data.get(CONF_MODE, MODE_LEGACY)
+        if mode == MODE_LEGACY:
+            _dmx_address, result = await self._send_full_dmx_command(target_value)
+            return bool(result and result.get("success"))
+
+        relay_controller: SavantRelayController | None = self.coordinator.relay_controller
+        if relay_controller is None:
+            _LOGGER.error("Relay controller is not initialized for current mode")
+            return False
+        
+        # Get the legacy relay UID from device data, or use the InfluxDB UID if not set
+        # The device dict should have 'relay_uid' field populated by influx_client
+        relay_uid = self._device.get("relay_uid") or self._device.get("uid")
+        
+        if not relay_uid:
+            _LOGGER.error(f"No relay UID available for {self.name}")
+            return False
+
+        # Convert target_value (DMX 0-255) to relay state (0 or 100)
+        relay_state = 100 if int(target_value) > 127 else 0
+
+        try:
+            success = await relay_controller.set_relay_state(relay_uid, relay_state)
+
+            if success:
+                _LOGGER.info(f"Sent relay command for {self.name}: state={relay_state}%")
+                return True
+            else:
+                _LOGGER.error(f"Failed to send relay command for {self.name}")
+                return False
+        except Exception as exc:
+            _LOGGER.error(f"Exception sending relay command for {self.name}: {exc}")
+            return False
+
     async def _send_full_dmx_command(self, target_value: str):
-        """
-        Send a DMX command with the full state of all addresses.
-        """
+        """Send a DMX command with the full state of all managed addresses."""
         dmx_states, resolved_addresses, unresolved_devices = await async_build_managed_dmx_values(
             self.coordinator,
             self._hass,
@@ -154,7 +200,7 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         )
         target_dmx_address = resolved_addresses.get(self._device["uid"])
         if target_dmx_address is None:
-            _LOGGER.warning(f"Cannot send DMX command for {self.name}: DMX address unknown")
+            _LOGGER.warning("Cannot send DMX command for %s: DMX address unknown", self.name)
             return None, None
 
         for device_uid, device_name in unresolved_devices.items():
@@ -169,12 +215,9 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         ola_port = self.coordinator.config_entry.data.get("ola_port", DEFAULT_OLA_PORT)
         dmx_testing_mode = self.coordinator.config_entry.options.get(
             CONF_DMX_TESTING_MODE,
-            self.coordinator.config_entry.data.get(CONF_DMX_TESTING_MODE, False)
+            self.coordinator.config_entry.data.get(CONF_DMX_TESTING_MODE, False),
         )
         result = await async_set_dmx_values(ip_address, dmx_states, ola_port, dmx_testing_mode)
-        success = bool(result and result.get("success"))
-        if not success:
-            _LOGGER.error(f"Failed to send DMX command for {self.name} at address {target_dmx_address}: {result}")
         return target_dmx_address, result
 
     @property
@@ -228,18 +271,16 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             return
         if not self.is_on:
             self._last_command_time = now
-            dmx_address, result = await self._send_full_dmx_command("255")
-            if dmx_address is None:
-                return
-            _LOGGER.info(f"Turning ON {self.name} at DMX address {dmx_address}")
-            if result and result.get("success"):
+            success = await self._send_relay_command("255")
+            _LOGGER.info(f"Turning ON {self.name}")
+            if success:
                 # Immediately reflect the commanded state in HA and start confirmation timeout
                 self._attr_is_on = True
                 self._last_commanded_state = True
                 self.async_write_ha_state()
                 self._start_pending_confirm(True)
             else:
-                _LOGGER.error(f"Failed to set DMX ON for {self.name}; not updating HA state")
+                _LOGGER.error(f"Failed to set relay ON for {self.name}; not updating HA state")
 
     async def async_turn_off(self, **kwargs):
         """
@@ -262,18 +303,16 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             return
         if self.is_on:
             self._last_command_time = now
-            dmx_address, result = await self._send_full_dmx_command("0")
-            if dmx_address is None:
-                return
-            _LOGGER.info(f"Turning OFF {self.name} at DMX address {dmx_address}")
-            if result and result.get("success"):
+            success = await self._send_relay_command("0")
+            _LOGGER.info(f"Turning OFF {self.name}")
+            if success:
                 # Immediately reflect the commanded state in HA and start confirmation timeout
                 self._attr_is_on = False
                 self._last_commanded_state = False
                 self.async_write_ha_state()
                 self._start_pending_confirm(False)
             else:
-                _LOGGER.error(f"Failed to set DMX OFF for {self.name}; not updating HA state")
+                _LOGGER.error(f"Failed to set relay OFF for {self.name}; not updating HA state")
 
     @callback
     def _handle_coordinator_update(self) -> None:

@@ -1,6 +1,6 @@
 # Savant Energy Home Assistant Integration
 
-Welcome to the **Savant Energy** integration for Home Assistant! This project brings Savant relay and energy monitoring devices into your smart home, providing real-time power, voltage, relay control, and more—all with a beautiful, open-source touch.
+Welcome to the **Savant Energy** integration for Home Assistant! This project brings Savant relay and energy monitoring devices into your smart home, providing real-time power, voltage, relay control, and more, all with a beautiful, open-source touch.
 
 ## 🚀 Features
 - **Automatic device discovery** from your Savant system
@@ -14,6 +14,7 @@ Welcome to the **Savant Energy** integration for Home Assistant! This project br
 - **REST API** for programmatic control and monitoring of scenes (could expose more if desired)
 - **Scene Buttons** for quick activation of predefined scenes
 - **Integrated Scene Builder** within the Lovelace card
+- **Mode-based setup** for Legacy (<11.2), Current (>=11.2), and Auto detection
 
 ## 🛠️ Installation (via HACS)
 1. **Add the repository to HACS**:
@@ -26,8 +27,23 @@ Welcome to the **Savant Energy** integration for Home Assistant! This project br
 4. **Add the integration**:
    - Go to **Settings > Devices & Services > Add Integration**.
    - Search for **Savant Energy** and follow the prompts.
-   - Add you Panel Controller Bridge's (PCB) IP address.
-   - The port defaults should work, but you can change it if needed.
+   - Choose your setup mode:
+     - **Auto** (recommended): enter the PBC IP and the integration will try the legacy activity feed first. If it does not find it, it will ask for the host IP and either an Influx token or the SSH password for the `RPM` user.
+     - **Legacy (<11.2)**: keeps the original snapshot + DMX workflow and only asks for the PBC IP.
+     - **Current (>=11.2)**: uses InfluxDB for telemetry and direct SEM relay control, and asks for the PBC IP, host IP, and either an Influx token or SSH password.
+
+## Setup Modes
+The integration now supports both the older Savant workflow and the newer `>=11.2` workflow without making existing users change anything unexpectedly.
+
+- **Auto** is the default for new installs.
+- **Legacy** keeps the older behavior as-is.
+- **Current** uses InfluxDB on the host for telemetry, SEM companion status for relay UID mapping, and direct SEM TCP commands for relay control.
+
+If you want the full technical breakdown of the current workflow, see [docs/current-api-workflow.md](docs/current-api-workflow.md).
+
+If you're working with an older system or want the legacy-specific notes, see [docs/legacy/README.md](docs/legacy/README.md).
+
+Existing installs stay on the legacy path by default until you explicitly reconfigure them to current mode.
 
 ## ⚡ How to Use
 Once installed and configured, the integration will automatically create entities for each Savant relay device it discovers. Here’s what you’ll see:
@@ -202,12 +218,13 @@ python3 tools/savant_influx_probe.py discover
 ```
 
 ## 📝 Configuration Options
-- **IP Address**: The address of your Savant controller.
-- **Port**: The port for energy snapshot data (default: 2000).
-- **OLA Port**: The port for DMX/OLA API (default: 9090).
-- **Scan Interval**: How often to poll for new data (default: 15s).
+- **Mode**: Choose between Auto, Legacy, and Current.
+- **PBC IP Address**: The address of your Panel Controller Bridge. Required in all modes.
+- **Host IP Address**: Required for current mode. This is where InfluxDB is running.
+- **Influx Token**: Required for current mode unless you let the setup flow retrieve it over SSH.
+- **Scan Interval**: How often to poll for new data (default: 10s).
 - **Breaker Cooldown**: Minimum seconds between relay toggles (default: 30s).
-- **DMX Testing Mode**: Enable for advanced DMX testing (optional). This mode is a testing mode for viewing the DMX command to be sent without actually sending it (console only).
+- **DMX Testing Mode**: Enable for advanced DMX testing (optional). This mode is useful for viewing the DMX command that would be sent without actually sending it.
 
 ## 🧑‍💻 Contributing
 We love contributions! Please:
@@ -227,7 +244,9 @@ This project uses AI coding agents during development, but all code changes are 
 - `dmx_address_sensor.py`: DMX address sensors
 - `scene.py`: Manages scene creation, modification, and deletion.
 - `utils.py`: Utility functions (DMX, API, etc.)
-- `snapshot_data.py`: Fetches energy snapshot from Savant
+- `snapshot_data.py`: Compatibility import for the legacy snapshot path
+- `legacy/`: Legacy runtime modules
+- `current/`: Current runtime modules
 - `models.py`: Device model helpers
 - `const.py`: Constants
 - `savant-energy-scenes-card.js`: Powers the Lovelace card, including the scene builder.

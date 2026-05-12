@@ -43,8 +43,9 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
         self._dmx_uid = dmx_uid
         self._dmx_address = None  # Will be populated on first update
         self._attr_native_unit_of_measurement = None
+        base_uid = device.get("base_uid", device["uid"])
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, str(device["uid"]))},
+            identifiers={(DOMAIN, base_uid)},
             name=device["name"],
             serial_number=dmx_uid,
             manufacturer=MANUFACTURER,
@@ -91,8 +92,9 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
                 if device["uid"] == self._device["uid"]:
                     device_name = device["name"]
                     break
+        base_uid = self._device.get("base_uid", self._device["uid"])
         return DeviceInfo(
-            identifiers={(DOMAIN, str(self._device["uid"]))},
+            identifiers={(DOMAIN, base_uid)},
             name=device_name,
             serial_number=self._dmx_uid,
             manufacturer=MANUFACTURER,
