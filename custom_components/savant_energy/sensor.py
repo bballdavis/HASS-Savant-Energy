@@ -1,13 +1,18 @@
-"""
-Sensor platform for Savant Energy.
-Creates power, voltage, and DMX address sensors for each relay device.
-All classes and functions are now documented for clarity and open source maintainability.
+"""Sensor platform for Savant Energy.
+
+Creates per-circuit sensors (power, current, voltage, energy, DMX address) and
+system-level sensors (totals, groups, battery, solar) from InfluxDB data.
 """
 
 import logging
-import asyncio
 
+from homeassistant.components.sensor import (  # type: ignore
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.helpers.entity import DeviceInfo  # type: ignore
+from homeassistant.helpers.update_coordinator import CoordinatorEntity  # type: ignore
 
 from .const import DOMAIN, MANUFACTURER
 from .models import get_device_model
@@ -17,95 +22,195 @@ from .utils import calculate_dmx_uid
 
 _LOGGER = logging.getLogger(__name__)
 
+# Hub-level channel keys → (friendly name, unit, device_class, icon)
+_SYSTEM_SENSORS: dict[str, tuple[str, str, SensorDeviceClass | None, str]] = {
+    # Totals
+    "Energy.Total.Consumption.Power": (
+        "Total Consumption", "W", SensorDeviceClass.POWER, "mdi:home-lightning-bolt"
+    ),
+    "Energy.Total.Feed.Power": (
+        "Grid Feed", "W", SensorDeviceClass.POWER, "mdi:transmission-tower"
+    ),
+    "Energy.Total.Net.Power": (
+        "Net Power", "W", SensorDeviceClass.POWER, "mdi:scale-balance"
+    ),
+    # Battery
+    "Energy.Battery.Power": (
+        "Battery Power", "W", SensorDeviceClass.POWER, "mdi:battery-charging"
+    ),
+    "Energy.Battery.StateOfCharge": (
+        "Battery State of Charge", "%", SensorDeviceClass.BATTERY, "mdi:battery"
+    ),
+    "Energy.Battery.SecondsRemaining": (
+        "Battery Time Remaining", "s", None, "mdi:timer-outline"
+    ),
+    "Energy.Battery.OperatingMode": (
+        "Battery Operating Mode", None, None, "mdi:battery-sync"
+    ),
+    # Solar
+    "Energy.Circuit.Solar.Power": (
+        "Solar Power", "W", SensorDeviceClass.POWER, "mdi:solar-power"
+    ),
+    "Energy.Solar.isProducingEnergy": (
+        "Solar Producing", None, None, "mdi:weather-sunny"
+    ),
+    # Grid
+    "Energy.Grid.IsAvailable": (
+        "Grid Available", None, None, "mdi:transmission-tower"
+    ),
+    # Load groups
+    "Energy.Group.HVAC.Power": (
+        "HVAC Power", "W", SensorDeviceClass.POWER, "mdi:hvac"
+    ),
+    "Energy.Group.Lighting.Power": (
+        "Lighting Power", "W", SensorDeviceClass.POWER, "mdi:lightbulb-group"
+    ),
+    "Energy.Group.Appliances.Power": (
+        "Appliances Power", "W", SensorDeviceClass.POWER, "mdi:toaster-oven"
+    ),
+    "Energy.Group.Room.Power": (
+        "Room Power", "W", SensorDeviceClass.POWER, "mdi:sofa"
+    ),
+    "Energy.Group.Outlet.Power": (
+        "Outlet Power", "W", SensorDeviceClass.POWER, "mdi:power-socket-us"
+    ),
+    "Energy.Group.Garage.Power": (
+        "Garage Power", "W", SensorDeviceClass.POWER, "mdi:garage"
+    ),
+    "Energy.Group.Refrigerator.Power": (
+        "Refrigerator Power", "W", SensorDeviceClass.POWER, "mdi:fridge"
+    ),
+    "Energy.Group.Microwave.Power": (
+        "Microwave Power", "W", SensorDeviceClass.POWER, "mdi:microwave"
+    ),
+    "Energy.Group.Network.Power": (
+        "Network Power", "W", SensorDeviceClass.POWER, "mdi:router-network"
+    ),
+}
+
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
-    """
-    Set up Savant Energy sensor entities.
-    Creates power, voltage, and DMX address sensors for each relay device found in presentDemands.
-    """
+    """Set up all Savant Energy sensor entities."""
     coordinator = hass.data[DOMAIN][config_entry.entry_id]
 
     entities = []
-    power_sensors = []  # Track power sensors for utility meter creation
-    dmx_address_sensors = []  # Track DMX address sensors for concurrency
 
-    # Defensive: Only try to create entities if coordinator.data is not None
-    _LOGGER.info(f"async_setup_entry: coordinator.data = {coordinator.data is not None}")
-    if coordinator.data is not None:
-        snapshot_data = coordinator.data.get("snapshot_data", {})
-        _LOGGER.info(f"async_setup_entry: snapshot_data exists = {bool(snapshot_data)}, has presentDemands = {'presentDemands' in snapshot_data if snapshot_data else False}")
-        if (
-            snapshot_data
-            and isinstance(snapshot_data, dict)
-            and "presentDemands" in snapshot_data
-        ):
-            demands_list = snapshot_data["presentDemands"]
-            _LOGGER.info(f"async_setup_entry: Found {len(demands_list)} presentDemands entries")
-            demands_str = str(demands_list)
-            _LOGGER.debug(
-                "Processing presentDemands: %.50s... (total length: %d)",
-                demands_str,
-                len(demands_str),
-            )
-            for device in demands_list:
-                uid = device["uid"]
-                dmx_uid = calculate_dmx_uid(uid)
-                _LOGGER.info(
-                    "Creating sensors for Savant Serial: %s (uid: %s)", dmx_uid, uid
-                )
+    snapshot_data = (coordinator.data or {}).get("snapshot_data", {})
+    _LOGGER.info(
+        "sensor setup: snapshot_data present=%s, has presentDemands=%s",
+        bool(snapshot_data),
+        "presentDemands" in snapshot_data if snapshot_data else False,
+    )
 
-                # Create device info once for all sensors
-                device_info = DeviceInfo(
-                    identifiers={(DOMAIN, str(device["uid"]))},
-                    name=device["name"],
-                    serial_number=dmx_uid,
-                    manufacturer=MANUFACTURER,
-                    model=get_device_model(device.get("capacity", 0)),
-                )
+    # --- Per-circuit entities ---
+    if (
+        snapshot_data
+        and isinstance(snapshot_data, dict)
+        and "presentDemands" in snapshot_data
+    ):
+        demands = snapshot_data["presentDemands"]
+        _LOGGER.info("sensor setup: %d circuits found", len(demands))
 
-                # Create power sensor
-                power_sensor = EnergyDeviceSensor(
-                    coordinator, device, "power", f"SavantEnergy_{uid}_power", dmx_uid
-                )
-                entities.append(power_sensor)
-                power_sensors.append(power_sensor)
+        for device in demands:
+            uid = device["uid"]
+            dmx_uid = calculate_dmx_uid(uid)
 
-                # Create cumulative energy sensor for the Energy dashboard
-                entities.append(
-                    IndividualLoadEnergySensor(
-                        coordinator,
-                        device,
-                        f"SavantEnergy_{uid}_energy",
-                        dmx_uid,
-                    )
-                )
+            entities += [
+                EnergyDeviceSensor(
+                    coordinator, device, "power",
+                    f"SavantEnergy_{uid}_power", dmx_uid,
+                ),
+                EnergyDeviceSensor(
+                    coordinator, device, "current",
+                    f"SavantEnergy_{uid}_current", dmx_uid,
+                ),
+                EnergyDeviceSensor(
+                    coordinator, device, "voltage",
+                    f"SavantEnergy_{uid}_voltage", dmx_uid,
+                ),
+                IndividualLoadEnergySensor(
+                    coordinator, device,
+                    f"SavantEnergy_{uid}_energy", dmx_uid,
+                ),
+                DMXAddressSensor(
+                    coordinator, device,
+                    f"SavantEnergy_{uid}_dmx_address", dmx_uid,
+                ),
+            ]
+    else:
+        _LOGGER.warning(
+            "sensor setup: no presentDemands — circuit sensors will not be created. "
+            "snapshot_data type=%s keys=%s",
+            type(snapshot_data),
+            list(snapshot_data.keys()) if isinstance(snapshot_data, dict) else "N/A",
+        )
 
-                # Create voltage sensor
-                entities.append(
-                    EnergyDeviceSensor(
-                        coordinator,
-                        device,
-                        "voltage",
-                        f"SavantEnergy_{uid}_voltage",
-                        dmx_uid,
-                    )
-                )
-                
-                # Create DMX address sensor
-                dmx_sensor = DMXAddressSensor(
-                    coordinator,
-                    device,
-                    f"SavantEnergy_{uid}_dmx_address",
-                    dmx_uid,
-                )
-                dmx_address_sensors.append(dmx_sensor)
-                entities.append(dmx_sensor)
+    # --- System / hub-level entities ---
+    for channel_key, (label, unit, dev_class, icon) in _SYSTEM_SENSORS.items():
+        entities.append(
+            SystemSensor(coordinator, channel_key, label, unit, dev_class, icon)
+        )
 
-            # Add all entities at once
-            _LOGGER.info(f"async_setup_entry: About to add {len(entities)} sensor entities")
-            async_add_entities(entities)
-            _LOGGER.info("async_setup_entry: Added %d sensor entities successfully", len(entities))
+    async_add_entities(entities)
+    _LOGGER.info("sensor setup: added %d entities total", len(entities))
+    return True
 
-            return True
-        else:
-            _LOGGER.warning("No presentDemands data found in coordinator. snapshot_data type: %s, keys: %s", type(snapshot_data), list(snapshot_data.keys()) if isinstance(snapshot_data, dict) else "N/A")
+
+class SystemSensor(CoordinatorEntity, SensorEntity):
+    """Sensor for a hub-level aggregated channel (totals, groups, battery, solar).
+
+    Reads from coordinator.data['snapshot_data']['system_data'][channel_key].
+    """
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(
+        self,
+        coordinator,
+        channel_key: str,
+        label: str,
+        unit: str | None,
+        device_class: SensorDeviceClass | None,
+        icon: str,
+    ):
+        super().__init__(coordinator)
+        self._channel_key = channel_key
+        self._attr_name = f"Savant {label}"
+        self._attr_unique_id = f"SavantEnergy_system_{channel_key}"
+        self._attr_native_unit_of_measurement = unit
+        self._attr_device_class = device_class
+        self._icon = icon
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, "savant_energy_hub")},
+            name="Savant Energy Hub",
+            manufacturer=MANUFACTURER,
+            model="Savant SEM Hub",
+        )
+
+    @property
+    def icon(self) -> str:
+        return self._icon
+
+    @property
+    def native_value(self) -> float | None:
+        system_data = (
+            (self.coordinator.data or {})
+            .get("snapshot_data", {})
+            .get("system_data", {})
+        )
+        value = system_data.get(self._channel_key)
+        if value is None:
+            return None
+        try:
+            return round(float(value), 3)
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def available(self) -> bool:
+        system_data = (
+            (self.coordinator.data or {})
+            .get("snapshot_data", {})
+            .get("system_data", {})
+        )
+        return self._channel_key in system_data

@@ -49,12 +49,15 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
         self._initial_name = device.get("name", f"Savant Device {self._device_uid}")
         self._initial_capacity = device.get("capacity", 0)
 
+        # Use base_uid for device identifier so that A/B circuit pairs (.0/.1)
+        # appear as a single device in the HASS device registry.
+        base_uid = device.get("base_uid", self._device_uid)
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, str(self._device_uid))},
-            name=self._initial_name,  # Use stored initial name
+            identifiers={(DOMAIN, base_uid)},
+            name=self._initial_name,
             serial_number=self._dmx_uid,
             manufacturer=MANUFACTURER,
-            model=get_device_model(self._initial_capacity),  # Use stored initial capacity
+            model=get_device_model(self._initial_capacity),
         )
         self._attr_extra_state_attributes = {"uid": self._device_uid}
 
@@ -148,8 +151,9 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
             except Exception as exc:  # pragma: no cover - defensive
                 _LOGGER.debug("Error reading _device dict for device_info: %s", exc)
 
+        base_uid = self._device.get("base_uid", self._device_uid) if isinstance(self._device, dict) else self._device_uid
         return DeviceInfo(
-            identifiers={(DOMAIN, str(self._device_uid))},
+            identifiers={(DOMAIN, base_uid)},
             name=current_name_val,
             serial_number=self._dmx_uid,
             manufacturer=MANUFACTURER,

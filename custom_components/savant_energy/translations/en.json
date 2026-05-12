@@ -3,29 +3,92 @@
     "step": {
       "init": {
         "title": "Savant Energy Options",
-            "data": {
-              "address": "IP Address",
-              "port": "Port",
-              "ola_port": "OLA Port",
-              "scan_interval": "Scan Interval",
-              "switch_cooldown": "Breaker Cooldown",
-            "dmx_testing_mode": "DMX Testing Mode",
-            "pending_confirm_multiplier": "Breaker Switch Debounce Delay (scan intervals)",
-            "disable_scene_builder": "Disable Scene Builder"
-          },
-        "description": "Field descriptions: \nIP Address (The address of your Savant controller), \nPort (Port for energy snapshot data, default: 2000), \nOLA Port (Port for DMX/OLA API, default: 9090), \nScan Interval (How often to poll for new data in seconds, default: 15), \nBreaker Cooldown (Minimum seconds between relay toggles, default: 30), \nDMX Testing Mode (Makes all DMX commands sent to console only for testing), \nBreaker Switch Debounce Delay (Number of scan intervals to wait for relay status confirmation after a user command, default: 3 - units are *scan intervals*), \nDisable Scene Builder (Removes loading of scene build card and backend)."
+        "data": {
+          "mode": "Mode",
+          "address": "PBC IP Address",
+          "host": "Host IP Address",
+          "influx_url": "Influx URL",
+          "influx_token": "Influx Token",
+          "influx_org": "Influx Org",
+          "ola_port": "OLA Port",
+          "scan_interval": "Scan Interval",
+          "switch_cooldown": "Breaker Cooldown",
+          "dmx_testing_mode": "DMX Testing Mode",
+          "pending_confirm_multiplier": "Breaker Switch Debounce Delay (scan intervals)",
+          "disable_scene_builder": "Disable Scene Builder"
+        },
+        "description": "Configure advanced options. Ports typically remain on defaults."
       }
     }
   },
   "config": {
     "step": {
       "user": {
-        "title": "Savant Energy Connection",
+        "title": "Savant Energy Mode",
         "data": {
-          "address": "IP Address",
-          "port": "Port"
+          "mode": "Mode"
         },
-        "description": "Field descriptions: \nIP Address (The address of your Savant controller), \nPort (Port for energy snapshot data, default: 2000)."
+        "description": "Choose setup mode. Auto is recommended for first-time installs."
+      },
+      "legacy_setup": {
+        "title": "Legacy Setup (<11.2)",
+        "data": {
+          "address": "PBC IP Address"
+        },
+        "description": "Legacy mode uses the original snapshot/DMX workflow."
+      },
+      "current_setup": {
+        "title": "Current Setup (>=11.2)",
+        "data": {
+          "address": "PBC IP Address",
+          "host": "Host IP Address",
+          "influx_token": "Influx Token (optional if SSH password is provided)",
+          "ssh_password": "SSH Password (RPM user)"
+        },
+        "description": "Current mode uses Influx telemetry and SEM relay commands."
+      },
+      "auto_probe": {
+        "title": "Auto Detect",
+        "data": {
+          "address": "PBC IP Address"
+        },
+        "description": "Enter PBC IP and the integration will probe for legacy activity feed."
+      },
+      "auto_current_fallback": {
+        "title": "Legacy Feed Not Detected",
+        "data": {
+          "host": "Host IP Address",
+          "influx_token": "Influx Token (optional if SSH password is provided)",
+          "ssh_password": "SSH Password (RPM user)"
+        },
+        "description": "Could not find legacy activity feed. Provide host details for current-mode setup."
+      },
+      "reconfigure": {
+        "title": "Reconfigure / Upgrade",
+        "data": {
+          "mode": "Mode",
+          "address": "PBC IP Address",
+          "host": "Host IP Address",
+          "influx_token": "Influx Token (optional if SSH password is provided)",
+          "ssh_password": "SSH Password (RPM user)"
+        },
+        "description": "Use this to keep legacy mode or upgrade to current mode."
+      }
+    },
+    "error": {
+      "invalid_address": "Please enter a valid IP address.",
+      "required": "This field is required."
+    },
+    "abort": {
+      "reconfigure_successful": "Configuration updated successfully."
+    }
+  },
+  "selector": {
+    "mode": {
+      "options": {
+        "legacy": "Legacy (<11.2)",
+        "current": "Current (>=11.2)",
+        "auto": "Auto"
       }
     }
   }
