@@ -340,6 +340,101 @@ async def _async_remove_dmx_address_sensors(hass: HomeAssistant, entry: ConfigEn
         _LOGGER.info("Removed stale DMX address sensor (current mode): %s", entity_id)
 
 
+async def _async_remove_stale_circuit_entities(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator
+) -> None:
+    """Remove orphaned circuit entities and devices from previous integration versions.
+
+    The old power_device_sensor.py used the full circuit uid (e.g. "001AAE17329B.0")
+    as the HA device identifier.  The current version uses base_uid ("001AAE17329B") to
+    group both A/B slots of a relay module under one HA device.  This leaves a stale
+    device entry per circuit slot in the device registry.
+
+    On the entity side, if the uid format ever differs between legacy TCP mode and
+    InfluxDB mode, entity unique_ids also change and orphaned entities accumulate.
+
+    Safe to run every startup — only removes entries whose embedded uid/base_uid is
+    genuinely absent from the live snapshot.
+    """
+    from homeassistant.helpers.entity_registry import async_get as async_get_er  # type: ignore
+    from homeassistant.helpers.device_registry import async_get as async_get_dr  # type: ignore
+
+    snapshot_data = (coordinator.data or {}).get("snapshot_data") or {}
+    demands = snapshot_data.get("presentDemands", [])
+    if not demands:
+        _LOGGER.debug("Skipping stale entity/device cleanup — snapshot has no circuits yet")
+        return
+
+    # Use only legacy_uid as the stable entity identifier going forward.
+    # For relay-controlled circuits this is the MAC-based hex UID (e.g. "001AAE17329B.0")
+    # which matches entity unique_ids from legacy TCP mode, preserving history.
+    # For CT-monitored circuits (no SEM relay) it falls back to the InfluxDB UUID since
+    # those never existed in legacy mode.
+    # UUID-based entries for relay circuits (created during the mode transition) are
+    # intentionally NOT included here so the cleanup removes them.
+    current_uids: set[str] = {d["legacy_uid"] for d in demands if d.get("legacy_uid")}
+    current_base_uids: set[str] = {d["legacy_base_uid"] for d in demands if d.get("legacy_base_uid")}
+
+    er = async_get_er(hass)
+
+    # --- Entity cleanup ---
+    # Patterns: SavantEnergy_{uid}_{suffix}  and  savant_energy_{uid}_breaker
+    sensor_suffixes = (
+        "_power", "_current", "_voltage", "_energy", "_dmx_address", "_relay_status"
+    )
+    stale_entity_ids: list[str] = []
+    for reg in er.entities.values():
+        if reg.config_entry_id != entry.entry_id:
+            continue
+        uid_str = reg.unique_id
+        for suffix in sensor_suffixes:
+            if uid_str.startswith("SavantEnergy_") and uid_str.endswith(suffix):
+                embedded = uid_str[len("SavantEnergy_") : -len(suffix)]
+                if embedded not in current_uids:
+                    stale_entity_ids.append(reg.entity_id)
+                break
+        else:
+            breaker_prefix = f"{DOMAIN}_"
+            if uid_str.startswith(breaker_prefix) and uid_str.endswith("_breaker"):
+                embedded = uid_str[len(breaker_prefix) : -len("_breaker")]
+                if embedded not in current_uids:
+                    stale_entity_ids.append(reg.entity_id)
+
+    for entity_id in stale_entity_ids:
+        er.async_remove(entity_id)
+        _LOGGER.info("Removed stale circuit entity: %s", entity_id)
+    if stale_entity_ids:
+        _LOGGER.info("Stale entity cleanup: removed %d orphaned entities", len(stale_entity_ids))
+
+    # --- Device cleanup ---
+    # Active devices use base_uid as identifier.  Old devices used the full uid with
+    # suffix (e.g. "001AAE17329B.0") which is NOT a valid base_uid and is no longer
+    # referenced by any entity after the entity cleanup above.
+    _always_keep = {"savant_energy_hub", "savant_energy_controller"}
+    dr = async_get_dr(hass)
+    for device in list(dr.devices.values()):
+        for id_tuple in device.identifiers:
+            if not id_tuple or id_tuple[0] != DOMAIN or len(id_tuple) < 2:
+                continue
+            identifier = id_tuple[1]
+            if identifier in _always_keep:
+                break
+            if str(identifier).startswith("savant_") and "_scene" in str(identifier):
+                break
+            # Keep active circuit devices (base_uid match)
+            if identifier in current_base_uids:
+                break
+            # Anything else belonging to this integration is a stale device.
+            # Only remove if truly empty (no entities still attached).
+            attached = [e for e in er.entities.values() if e.device_id == device.id]
+            if not attached:
+                dr.async_remove_device(device.id)
+                _LOGGER.info(
+                    "Removed orphaned device: %s (identifier=%s)", device.name or device.id, identifier
+                )
+            break
+
+
 async def _async_register_frontend_resource(hass: HomeAssistant) -> None:
     """Register the custom Lovelace card with Home Assistant's frontend."""
     try:
@@ -389,6 +484,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if coordinator.mode == MODE_CURRENT:
         await _async_remove_dmx_address_sensors(hass, entry)
+
+    # Clean up orphaned circuit entities and devices from previous installs
+    # (e.g. after a uid format change between legacy and current mode).
+    await _async_remove_stale_circuit_entities(hass, entry, coordinator)
 
     setup_platforms = list(PLATFORMS)
     if not disable_scene_builder:

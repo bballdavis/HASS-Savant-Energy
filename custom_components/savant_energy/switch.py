@@ -58,6 +58,12 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
                 len(snapshot_data["presentDemands"]),
             )
             for device in snapshot_data["presentDemands"]:
+                if not device.get("has_relay", True):
+                    _LOGGER.debug(
+                        "Skipping switch for CT-monitored device (no relay): %s",
+                        device.get("name", device.get("uid")),
+                    )
+                    continue
                 entities.append(EnergyDeviceSwitch(hass, coordinator, device, cooldown))
             _LOGGER.info(f"async_setup_entry: About to add {len(entities)} switch entities")
         else:
@@ -84,10 +90,11 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         self._hass = hass
         self._device = device
         self._cooldown = cooldown
-        self._attr_unique_id = f"{DOMAIN}_{device['uid']}_breaker"
-        self._dmx_uid = calculate_dmx_uid(device["uid"])
+        legacy_uid = device.get("legacy_uid", device["uid"])
+        self._attr_unique_id = f"{DOMAIN}_{legacy_uid}_breaker"
+        self._dmx_uid = calculate_dmx_uid(legacy_uid)
         self._dmx_address = None
-        base_uid = device.get("base_uid", device["uid"])
+        base_uid = device.get("legacy_base_uid", device.get("base_uid", device["uid"]))
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, base_uid)},
             name=device["name"],

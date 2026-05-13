@@ -113,29 +113,33 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
 
         for device in demands:
             uid = device["uid"]
-            dmx_uid = calculate_dmx_uid(uid)
+            # legacy_uid is the MAC-based hex UID (e.g. "001AAE17CF15.0") that
+            # was used as the entity unique_id in legacy TCP mode. Using it here
+            # preserves entity history when transitioning an existing system.
+            legacy_uid = device.get("legacy_uid", uid)
+            dmx_uid = calculate_dmx_uid(legacy_uid)
 
             entities += [
                 EnergyDeviceSensor(
                     coordinator, device, "power",
-                    f"SavantEnergy_{uid}_power", dmx_uid,
+                    f"SavantEnergy_{legacy_uid}_power", dmx_uid,
                 ),
                 EnergyDeviceSensor(
                     coordinator, device, "current",
-                    f"SavantEnergy_{uid}_current", dmx_uid,
+                    f"SavantEnergy_{legacy_uid}_current", dmx_uid,
                 ),
                 EnergyDeviceSensor(
                     coordinator, device, "voltage",
-                    f"SavantEnergy_{uid}_voltage", dmx_uid,
+                    f"SavantEnergy_{legacy_uid}_voltage", dmx_uid,
                 ),
                 IndividualLoadEnergySensor(
                     coordinator, device,
-                    f"SavantEnergy_{uid}_energy", dmx_uid,
+                    f"SavantEnergy_{legacy_uid}_energy", dmx_uid,
                 ),
                 *(
                     [DMXAddressSensor(
                         coordinator, device,
-                        f"SavantEnergy_{uid}_dmx_address", dmx_uid,
+                        f"SavantEnergy_{legacy_uid}_dmx_address", dmx_uid,
                     )]
                     if coordinator.mode != MODE_CURRENT
                     else []

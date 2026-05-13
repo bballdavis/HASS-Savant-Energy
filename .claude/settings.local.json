@@ -3,7 +3,8 @@
     "allow": [
       "Bash(pip install *)",
       "Bash(python test_ssh_token.py)",
-      "Bash(del \"C:\\\\Users\\\\bball\\\\OneDrive\\\\Documents\\\\Git_Projects\\\\hass-savant-pbc\\\\test_ssh_token.py\")"
+      "Bash(del \"C:\\\\Users\\\\bball\\\\OneDrive\\\\Documents\\\\Git_Projects\\\\hass-savant-pbc\\\\test_ssh_token.py\")",
+      "Bash(grep \"\\\\.py$\")"
     ]
   }
 }

@@ -25,8 +25,8 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _device_info(device: dict, dmx_uid: str) -> DeviceInfo:
-    """Build DeviceInfo using base_uid for A/B device grouping."""
-    base_uid = device.get("base_uid", device["uid"])
+    """Build DeviceInfo using legacy_base_uid so device identity is stable across mode transitions."""
+    base_uid = device.get("legacy_base_uid", device.get("base_uid", device["uid"]))
     return DeviceInfo(
         identifiers={(DOMAIN, base_uid)},
         name=device["name"],

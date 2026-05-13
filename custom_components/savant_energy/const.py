@@ -31,11 +31,11 @@ CONF_INFLUX_TOKEN = "influx_token"  # InfluxDB read token
 CONF_INFLUX_ORG = "influx_org"    # InfluxDB org ID
 
 # Default values
-DEFAULT_SWITCH_COOLDOWN = 30  # seconds
+DEFAULT_SWITCH_COOLDOWN = 15  # seconds
 DEFAULT_PORT = 2000           # legacy TCP snapshot port
 DEFAULT_OLA_PORT = 9090       # OLA/DMX API port
 DEFAULT_SEM_COMPANION_PORT = 8644
-DEFAULT_SCAN_INTERVAL = 10    # seconds between InfluxDB polls
+DEFAULT_SCAN_INTERVAL = 5     # seconds between InfluxDB polls
 DEFAULT_INFLUX_URL = "http://192.168.1.14:8086"
 DEFAULT_INFLUX_ORG = "912133f25b21b958"
 
@@ -47,7 +47,7 @@ DEFAULT_MODE = MODE_AUTO
 # Boolean config defaults
 DEFAULT_DMX_TESTING_MODE = False
 DEFAULT_DISABLE_SCENE_BUILDER = False
-DEFAULT_PENDING_CONFIRM_MULTIPLIER = 3
+DEFAULT_PENDING_CONFIRM_MULTIPLIER = 2
 
 AUTH_INFLUX_TOKEN = "token"
 AUTH_INFLUX_SSH = "ssh"

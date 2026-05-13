@@ -8,6 +8,7 @@ import asyncio
 import csv
 import io
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -18,12 +19,14 @@ _LOGGER = logging.getLogger(__name__)
 # InfluxDB stores per-circuit energy in mWh; HASS energy dashboard uses kWh.
 _MWH_TO_KWH = 1_000_000.0
 
-# Flux query: fetch last reading for every field on every circuit SEM channel.
-# Filtering by type="0074" works across measurement name changes (serial rotations).
+# Flux query: fetch last reading for every circuit — relay-controlled and CT-only.
+# We filter on savantUUID being present rather than a specific type code so that
+# CT-monitored loads (EV chargers, solar inverters, etc.) are included alongside
+# relay-switched circuits regardless of their hardware type tag.
 _CIRCUIT_QUERY = """\
 from(bucket: "localHub")
   |> range(start: -2m)
-  |> filter(fn: (r) => r.type == "0074")
+  |> filter(fn: (r) => exists r.savantUUID and r.savantUUID != "")
   |> filter(fn: (r) =>
       r._field == "power" or r._field == "current" or r._field == "voltage" or
       r._field == "energy" or r._field == "percentCommanded" or r._field == "flags")
@@ -177,6 +180,18 @@ async def fetch_influx_snapshot(
             pbc_device_id = row.get("_measurement", "").strip()
 
         if uuid not in by_uuid:
+            # Capture all string tag columns — dump any extras at DEBUG level on first
+            # circuit so operators can see the full InfluxDB schema (helps locate
+            # fields like the legacy hex UID if Savant stores it as an additional tag).
+            known_keys = {
+                "savantUUID", "name", "channel", "classification", "dimmable",
+                "override", "type", "_field", "_value", "_measurement", "_time",
+                "_start", "_stop", "result", "table",
+            }
+            extra_tags = {k: v for k, v in row.items() if k not in known_keys and v}
+            if extra_tags and not by_uuid:  # log once, on the first circuit
+                _LOGGER.debug("InfluxDB extra circuit tags (first row): %s", extra_tags)
+
             by_uuid[uuid] = {
                 "savantUUID": uuid,
                 "name": row.get("name", "").strip(),
@@ -185,6 +200,8 @@ async def fetch_influx_snapshot(
                 "dimmable": _safe_bool(row.get("dimmable", "False")),
                 "override": _safe_bool(row.get("override", "False")),
                 "type": row.get("type", "").strip(),
+                # Preserve any extra tags so callers can inspect them
+                "_extra_tags": extra_tags,
             }
 
         field = row.get("_field", "").strip()
@@ -255,19 +272,65 @@ async def fetch_influx_snapshot(
         key=lambda d: int(d["channel"]) if str(d["channel"]).isdigit() else 9999
     )
 
+    # Log all circuit names at INFO level so operators can see what came through
+    # (useful for diagnosing missing devices like EV chargers that may have
+    # unexpected names or type tags in InfluxDB).
+    _LOGGER.info(
+        "InfluxDB circuits (%d): %s",
+        len(present_demands),
+        ", ".join(
+            f"[{d.get('channel','?')}] {d.get('name','?')} (uid={d.get('uid','?')[:8]}...)"
+            for d in present_demands
+        ),
+    )
+
     # --- Fetch relay UIDs from SEM and merge into presentDemands ---
-    relay_uids = await fetch_relay_uids_from_sem()
+    # has_relay is authoritative only when the SEM API is reachable.
+    # If it's unreachable we fall back to True for all so the integration
+    # keeps working during a transient outage.
+    sem_ok, relay_uids = await fetch_relay_uids_from_sem()
     for circuit in present_demands:
         circuit_name = circuit.get("name", "").lower()
-        # Try to find matching relay UID by device name
+        matched_uid: str | None = None
         for relay_name, relay_uid in relay_uids.items():
             if relay_name in circuit_name or circuit_name in relay_name:
-                circuit["relay_uid"] = relay_uid
+                matched_uid = relay_uid
                 _LOGGER.debug("Mapped circuit '%s' to relay UID %s", circuit["name"], relay_uid)
                 break
-        # If no relay UID found, use the savantUUID as fallback (may not work for control)
-        if "relay_uid" not in circuit:
-            circuit["relay_uid"] = circuit.get("uid")
+
+        if sem_ok:
+            # API reachable: only circuits the SEM knows about have a real relay
+            circuit["relay_uid"] = matched_uid
+            circuit["has_relay"] = matched_uid is not None
+        else:
+            # API unreachable: optimistically assume relay so commands still work
+            circuit["relay_uid"] = matched_uid or circuit.get("uid")
+            circuit["has_relay"] = True
+
+    # --- Assign legacy_uid for entity identity preservation ---
+    # Group relay-controlled circuits by relay_uid, sort by channel, assign a
+    # ".0"/".1" slot index. This reconstructs the MAC-based hex UIDs that were
+    # used as entity unique_ids in legacy TCP mode (e.g. "001AAE17CF15.0"),
+    # so existing entities are updated rather than recreated when transitioning
+    # an installed system from legacy to current (InfluxDB) mode.
+    relay_groups: dict[str, list] = defaultdict(list)
+    for circuit in present_demands:
+        if circuit.get("has_relay") and circuit.get("relay_uid"):
+            relay_groups[circuit["relay_uid"]].append(circuit)
+
+    for relay_uid_key, circuits in relay_groups.items():
+        circuits.sort(
+            key=lambda c: int(c["channel"]) if str(c.get("channel", "")).isdigit() else 9999
+        )
+        for slot, circuit in enumerate(circuits):
+            circuit["legacy_uid"] = f"{relay_uid_key}.{slot}"
+            circuit["legacy_base_uid"] = relay_uid_key
+
+    # CT-monitored circuits have no legacy MAC UID — fall back to their InfluxDB UUID.
+    for circuit in present_demands:
+        if "legacy_uid" not in circuit:
+            circuit["legacy_uid"] = circuit["uid"]
+            circuit["legacy_base_uid"] = circuit.get("base_uid", circuit["uid"])
 
     # --- Build system_data from hub CSV ---
     # Keys are the InfluxDB channel tag values, e.g. "Energy.Total.Consumption.Power"
@@ -294,10 +357,14 @@ async def fetch_influx_snapshot(
     )
 
 
-async def fetch_relay_uids_from_sem(sem_host: str = "192.168.1.108", sem_port: int = 8644) -> dict[str, str]:
+async def fetch_relay_uids_from_sem(
+    sem_host: str = "192.168.1.108", sem_port: int = 8644
+) -> tuple[bool, dict[str, str]]:
     """Fetch relay device UIDs from SEM companion API.
-    
-    Returns dict mapping device names to legacy UIDs (e.g., "Smoke Detector" -> "001AAE1733DB").
+
+    Returns (api_ok, devices) where api_ok indicates whether the SEM was reachable.
+    devices maps lowercase load names to legacy UIDs (e.g., "smoke detector" -> "001AAE1733DB").
+    Only devices that appear here have physical relays; everything else is CT-monitored only.
     """
     try:
         async with aiohttp.ClientSession() as session:
@@ -305,18 +372,16 @@ async def fetch_relay_uids_from_sem(sem_host: str = "192.168.1.108", sem_port: i
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    devices = {}
-                    
-                    # Extract relay devices from the status (note: "Devices" is capitalized)
+                    devices: dict[str, str] = {}
                     for device in data.get("Devices", []):
                         uid = device.get("UID")
                         name = device.get("LoadName", "")
                         if uid and name:
                             devices[name.lower()] = uid
-                    
-                    _LOGGER.debug("Fetched %d relay devices from SEM", len(devices))
-                    return devices
+                    _LOGGER.debug("SEM companion API: %d relay device(s)", len(devices))
+                    return True, devices
+                _LOGGER.warning("SEM companion API returned HTTP %d", resp.status)
     except Exception as exc:
         _LOGGER.warning("Failed to fetch relay UIDs from SEM %s:%d: %s", sem_host, sem_port, exc)
-    
-    return {}
+
+    return False, {}
