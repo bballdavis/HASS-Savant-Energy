@@ -114,7 +114,7 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
     @property
     def _current_device_name(self):
         """Get the latest device name from coordinator data by UID."""
-        snapshot_data = self.coordinator.data.get("snapshot_data", {})
+        snapshot_data = (self.coordinator.data or {}).get("snapshot_data") or {}
         if snapshot_data and "presentDemands" in snapshot_data:
             for device in snapshot_data["presentDemands"]:
                 if device["uid"] == self._device["uid"]:
@@ -225,7 +225,7 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         """
         Return True if the entity is available.
         """
-        snapshot_data = self.coordinator.data.get("snapshot_data", {})
+        snapshot_data = (self.coordinator.data or {}).get("snapshot_data") or {}
         if not snapshot_data or "presentDemands" not in snapshot_data:
             return False
         relay_state = self._get_relay_status_state()

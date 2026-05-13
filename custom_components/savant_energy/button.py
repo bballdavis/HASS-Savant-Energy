@@ -16,7 +16,7 @@ from homeassistant.helpers.entity import DeviceInfo  # type: ignore
 from homeassistant.helpers.entity_platform import AddEntitiesCallback  # type: ignore
 from homeassistant.helpers.event import async_track_time_interval  # type: ignore
 
-from .const import DOMAIN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE
+from .const import DOMAIN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE, MODE_CURRENT
 from .utils import (
     async_build_all_loads_dmx_values,
     async_build_managed_dmx_values,
@@ -67,66 +67,11 @@ class SavantSceneButton(ButtonEntity):
         return self._scene_id in self._scene_manager.storage.scenes
 
     async def async_press(self):
-        """
-        When pressed, dynamically loads the latest scene data and sends the DMX command.
-        """
-        scene = self._scene_manager.storage.scenes.get(self._scene_id)
-        if not scene:
-            _LOGGER.warning(
-                f"Scene {self._scene_id} not found in storage when button pressed."
-            )
+        """Execute the scene through the scene manager (handles mode routing internally)."""
+        if self._scene_id not in self._scene_manager.storage.scenes:
+            _LOGGER.warning("Scene %s not found in storage when button pressed", self._scene_id)
             return
-        relay_states = scene.get("relay_states", {})
-        overrides_by_uid = {}
-        for breaker_entity_id, is_on in relay_states.items():
-            breaker_state = self._hass.states.get(breaker_entity_id)
-            device_uid = breaker_state.attributes.get("uid") if breaker_state else None
-            if not device_uid:
-                _LOGGER.warning(
-                    "Skipping scene member %s because its device UID is unavailable",
-                    breaker_entity_id,
-                )
-                continue
-
-            overrides_by_uid[str(device_uid)] = "255" if is_on else "0"
-
-        dmx_values, _resolved_addresses, unresolved_devices = await async_build_managed_dmx_values(
-            self._scene_manager.coordinator,
-            self._hass,
-            overrides_by_uid,
-        )
-        for device_uid, device_name in unresolved_devices.items():
-            if device_uid in overrides_by_uid:
-                _LOGGER.warning(
-                    "Skipping scene member %s because its DMX address is unavailable",
-                    device_name,
-                )
-
-        if not dmx_values:
-            _LOGGER.warning(
-                "No DMX addresses found for scene button press. No DMX command sent."
-            )
-            return
-        ip_address = self._scene_manager.coordinator.config_entry.data.get("address")
-        ola_port = self._scene_manager.coordinator.config_entry.data.get(
-            "ola_port", DEFAULT_OLA_PORT
-        )
-        dmx_testing_mode = self._scene_manager.coordinator.config_entry.options.get(
-            CONF_DMX_TESTING_MODE,
-            self._scene_manager.coordinator.config_entry.data.get(
-                CONF_DMX_TESTING_MODE, False
-            ),
-        )
-        _LOGGER.info(
-            f"Executing Savant Scene '{scene['name']}' with {len(dmx_values)} DMX addresses."
-        )
-        result = await async_set_dmx_values(
-            ip_address, dmx_values, ola_port, dmx_testing_mode
-        )
-        if result and result.get("success"):
-            _LOGGER.info(f"Savant Scene '{scene['name']}' executed successfully.")
-        else:
-            _LOGGER.warning(f"Failed to execute Savant Scene '{scene['name']}'. Result: {result}")
+        await self._scene_manager.async_execute_scene(self._scene_id)
 
 
 async def async_setup_entry(
@@ -259,12 +204,39 @@ class SavantAllLoadsButton(ButtonEntity):
         )
 
     async def async_press(self) -> None:
-        """
-        Handle the button press - send command to turn on all loads.
-        """
+        """Handle the button press — turn on all loads (mode-aware)."""
+        if getattr(self.coordinator, "mode", None) == MODE_CURRENT:
+            await self._press_current()
+        else:
+            await self._press_legacy()
+
+    async def _press_current(self) -> None:
+        """Turn on all loads via the SEM relay controller (current mode >=11.2)."""
+        relay_controller = getattr(self.coordinator, "relay_controller", None)
+        if not relay_controller:
+            _LOGGER.warning("Relay controller not available for all-loads command")
+            return
+
+        present_demands = (
+            ((self.coordinator.data or {}).get("snapshot_data") or {}).get("presentDemands", [])
+        )
+        bulk_states = {
+            d["relay_uid"]: 100
+            for d in present_demands
+            if d.get("relay_uid")
+        }
+
+        if not bulk_states:
+            _LOGGER.warning("No relay UIDs found in snapshot; cannot turn on all loads")
+            return
+
+        _LOGGER.info("Turning on %d loads via relay controller", len(bulk_states))
+        await relay_controller.set_relay_states_bulk(bulk_states)
+
+    async def _press_legacy(self) -> None:
+        """Turn on all loads via DMX/OLA (legacy mode <11.2)."""
         dmx_values, dmx_source, unresolved_devices = await async_build_all_loads_dmx_values(
-            self.coordinator,
-            self.hass,
+            self.coordinator, self.hass,
         )
 
         if not dmx_values:
@@ -279,32 +251,24 @@ class SavantAllLoadsButton(ButtonEntity):
                 device_name,
             )
 
-        # Get IP address from config entry
         ip_address = self.coordinator.config_entry.data.get("address")
         if not ip_address:
             _LOGGER.warning("No IP address available, cannot send all loads on command")
             return
 
-        # Get OLA port from config entry or use default
         ola_port = self.coordinator.config_entry.data.get("ola_port", DEFAULT_OLA_PORT)
-
-        # Get DMX testing mode from config
         dmx_testing_mode = self.coordinator.config_entry.options.get(
             CONF_DMX_TESTING_MODE,
             self.coordinator.config_entry.data.get(CONF_DMX_TESTING_MODE, False),
         )
 
         _LOGGER.info("Turning on %d Savant loads using %s", len(dmx_values), dmx_source)
-
-        # Use utility function to send command - this will both log and send the command
-        result = await async_set_dmx_values(
-            ip_address, dmx_values, ola_port, dmx_testing_mode
-        )
+        result = await async_set_dmx_values(ip_address, dmx_values, ola_port, dmx_testing_mode)
 
         if result and result.get("success"):
             _LOGGER.info("All loads turned on successfully")
         else:
-            _LOGGER.warning(f"Failed to turn on all loads. Result: {result}")
+            _LOGGER.warning("Failed to turn on all loads. Result: %s", result)
 
 
 class SavantApiCommandLogButton(ButtonEntity):

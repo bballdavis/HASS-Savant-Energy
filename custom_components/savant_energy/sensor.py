@@ -14,7 +14,7 @@ from homeassistant.components.sensor import (  # type: ignore
 from homeassistant.helpers.entity import DeviceInfo  # type: ignore
 from homeassistant.helpers.update_coordinator import CoordinatorEntity  # type: ignore
 
-from .const import DOMAIN, MANUFACTURER
+from .const import DOMAIN, MANUFACTURER, MODE_CURRENT, CONF_MODE
 from .models import get_device_model
 from .power_device_sensor import EnergyDeviceSensor, IndividualLoadEnergySensor
 from .dmx_address_sensor import DMXAddressSensor
@@ -132,9 +132,13 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
                     coordinator, device,
                     f"SavantEnergy_{uid}_energy", dmx_uid,
                 ),
-                DMXAddressSensor(
-                    coordinator, device,
-                    f"SavantEnergy_{uid}_dmx_address", dmx_uid,
+                *(
+                    [DMXAddressSensor(
+                        coordinator, device,
+                        f"SavantEnergy_{uid}_dmx_address", dmx_uid,
+                    )]
+                    if coordinator.mode != MODE_CURRENT
+                    else []
                 ),
             ]
     else:
@@ -191,14 +195,13 @@ class SystemSensor(CoordinatorEntity, SensorEntity):
     def icon(self) -> str:
         return self._icon
 
+    def _system_data(self) -> dict:
+        snapshot = (self.coordinator.data or {}).get("snapshot_data") or {}
+        return snapshot.get("system_data") or {}
+
     @property
     def native_value(self) -> float | None:
-        system_data = (
-            (self.coordinator.data or {})
-            .get("snapshot_data", {})
-            .get("system_data", {})
-        )
-        value = system_data.get(self._channel_key)
+        value = self._system_data().get(self._channel_key)
         if value is None:
             return None
         try:
@@ -208,9 +211,4 @@ class SystemSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def available(self) -> bool:
-        system_data = (
-            (self.coordinator.data or {})
-            .get("snapshot_data", {})
-            .get("system_data", {})
-        )
-        return self._channel_key in system_data
+        return self._channel_key in self._system_data()

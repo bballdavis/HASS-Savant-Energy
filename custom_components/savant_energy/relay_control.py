@@ -81,17 +81,8 @@ class SavantRelayController:
         # Otherwise try to look it up in the map
         return self._relay_uid_map.get(circuit_uid, self.default_relay_uid)
 
-    async def set_relay_state(self, relay_uid: str, state: int) -> bool:
-        """
-        Send SET_LOAD_STATE command to control relay.
-
-        Args:
-            relay_uid: Legacy relay UID (e.g., "001AAE1733DB")
-            state: 0 for OFF, 100 for ON
-
-        Returns:
-            True if command was sent successfully
-        """
+    async def _send_set_load_state(self, states: dict[str, int]) -> bool:
+        """Send one SET_LOAD_STATE frame with an arbitrary states dict and return success."""
         if not self._connected:
             if not await self.connect():
                 return False
@@ -100,57 +91,66 @@ class SavantRelayController:
             _LOGGER.error("Writer/reader not available")
             return False
 
-        # Build the payload
-        request_id = str(uuid.uuid4())
-        payload = {"states": {relay_uid: state}, "requestId": request_id}
-        
-        # Encode as base64
-        json_str = json.dumps(payload)
-        b64_payload = base64.b64encode(json_str.encode()).decode()
-        
-        # Send the command
+        payload = {"states": states, "requestId": str(uuid.uuid4())}
+        b64_payload = base64.b64encode(json.dumps(payload).encode()).decode()
         command = f"SET_LOAD_STATE={b64_payload}\n"
-        
+
         try:
             self._writer.write(command.encode())
             await asyncio.wait_for(self._writer.drain(), timeout=5.0)
-            _LOGGER.debug("Sent SET_LOAD_STATE for %s to state %d", relay_uid, state)
+            _LOGGER.debug("Sent SET_LOAD_STATE for %d relay(s)", len(states))
         except Exception as exc:
             _LOGGER.error("Failed to send SET_LOAD_STATE: %s", exc)
             self._connected = False
             return False
 
-        # Try to read response (timeout after 2 seconds; SEM doesn't always respond)
         try:
             response_data = await asyncio.wait_for(
                 self._reader.readuntil(b"\n"),
                 timeout=2.0,
             )
             response_str = response_data.decode("utf-8", errors="ignore").strip()
-            
             if response_str.startswith("SET_LOAD_STATE_RESPONSE="):
                 b64_response = response_str[len("SET_LOAD_STATE_RESPONSE="):]
                 try:
                     response_json = json.loads(base64.b64decode(b64_response))
                     if response_json.get("status") == "OK":
-                        _LOGGER.info("Relay %s set to state %d: OK", relay_uid, state)
+                        _LOGGER.info("SET_LOAD_STATE OK for %d relay(s)", len(states))
                         return True
-                    else:
-                        _LOGGER.warning("Relay command failed: %s", response_json)
-                        return False
-                except Exception as e:
-                    _LOGGER.warning("Failed to decode response: %s", e)
+                    _LOGGER.warning("SET_LOAD_STATE failed: %s", response_json)
+                    return False
+                except Exception as exc:
+                    _LOGGER.warning("Failed to decode SET_LOAD_STATE response: %s", exc)
         except asyncio.TimeoutError:
-            # SEM doesn't always send a response, but the command may still work
-            # This is normal behavior based on capture analysis
-            _LOGGER.debug("No response from SEM (timeout), but command was sent")
+            # SEM doesn't always respond; the command is still applied.
+            _LOGGER.debug("No SET_LOAD_STATE response (timeout) — command was sent")
             return True
         except Exception as exc:
-            _LOGGER.error("Error reading response: %s", exc)
+            _LOGGER.error("Error reading SET_LOAD_STATE response: %s", exc)
             self._connected = False
             return False
 
         return True
+
+    async def set_relay_state(self, relay_uid: str, state: int) -> bool:
+        """Send SET_LOAD_STATE for a single relay.
+
+        Args:
+            relay_uid: Legacy relay UID (e.g., "001AAE1733DB")
+            state: 0 for OFF, 100 for ON
+        """
+        return await self._send_set_load_state({relay_uid: state})
+
+    async def set_relay_states_bulk(self, states: dict[str, int]) -> bool:
+        """Send SET_LOAD_STATE for multiple relays in a single command.
+
+        Args:
+            states: Mapping of relay_uid → state (0=OFF, 100=ON)
+        """
+        if not states:
+            return True
+        _LOGGER.info("Sending bulk SET_LOAD_STATE for %d relay(s)", len(states))
+        return await self._send_set_load_state(states)
 
     async def turn_on(self, relay_uid: Optional[str] = None) -> bool:
         """Turn on a relay (state=100)."""

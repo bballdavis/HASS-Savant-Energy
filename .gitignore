@@ -24,6 +24,7 @@ env/
 venv/
 .venv/
 ENV/
+.savant-local.env
 
 # Installer logs
 pip-log.txt
@@ -64,3 +65,4 @@ __pycache__/
 
 # Home Assistant specific
 home-assistant_v2.db
+.savant-local.env

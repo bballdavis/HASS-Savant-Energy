@@ -85,7 +85,7 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
         """
         Return True if the relay is ON, based on percentCommanded == 100.
         """
-        snapshot_data = self.coordinator.data.get("snapshot_data", {})
+        snapshot_data = (self.coordinator.data or {}).get("snapshot_data") or {}
         if snapshot_data and "presentDemands" in snapshot_data:
             for device in snapshot_data["presentDemands"]:
                 if device["uid"] == self._device_uid:

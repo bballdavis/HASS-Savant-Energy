@@ -56,7 +56,7 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
 
     @property
     def _current_device_name(self):
-        snapshot_data = self.coordinator.data.get("snapshot_data", {})
+        snapshot_data = (self.coordinator.data or {}).get("snapshot_data") or {}
         if snapshot_data and "presentDemands" in snapshot_data:
             for device in snapshot_data["presentDemands"]:
                 if device["uid"] == self._device["uid"]:
@@ -71,7 +71,7 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
         """
         Return the dynamic friendly name for the entity, based on the current device name.
         """
-        snapshot_data = self.coordinator.data.get("snapshot_data", {})
+        snapshot_data = (self.coordinator.data or {}).get("snapshot_data") or {}
         device_name = self._device["name"]
         if snapshot_data and "presentDemands" in snapshot_data:
             for device in snapshot_data["presentDemands"]:
@@ -85,7 +85,7 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
         """
         Return dynamic DeviceInfo with the current device name.
         """
-        snapshot_data = self.coordinator.data.get("snapshot_data", {})
+        snapshot_data = (self.coordinator.data or {}).get("snapshot_data") or {}
         device_name = self._device["name"]
         if snapshot_data and "presentDemands" in snapshot_data:
             for device in snapshot_data["presentDemands"]:

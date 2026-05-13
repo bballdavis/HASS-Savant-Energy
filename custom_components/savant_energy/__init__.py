@@ -57,6 +57,7 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 LOVELACE_CARD_FILENAME = "savant-energy-scenes-card.js"
+LEGACY_FEED_NOTIFICATION_ID = f"{DOMAIN}_legacy_feed_unavailable"
 
 
 class SavantEnergyCoordinator(DataUpdateCoordinator):
@@ -95,6 +96,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.consecutive_failures = 0
         self.cached_present_demands: list = []
         self.last_fetch_error: dict | None = None
+        self._legacy_feed_notification_key: tuple[str | None, str | None] | None = None
 
         self.relay_controller: SavantRelayController | None = None
         if self.mode == MODE_CURRENT:
@@ -237,6 +239,14 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 result.error_message,
             )
 
+            notification_key = (result.error_type, result.error_message)
+            if notification_key != self._legacy_feed_notification_key:
+                self._legacy_feed_notification_key = notification_key
+                await self._async_notify_legacy_feed_unavailable(
+                    result.error_type,
+                    result.error_message,
+                )
+
             existing = dict(self.data) if isinstance(self.data, dict) else {}
             existing.setdefault("snapshot_data", None)
             existing["cached_present_demands"] = copy.deepcopy(self.cached_present_demands)
@@ -253,6 +263,9 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         snapshot_data = result.data
         self._adjust_interval(success=True)
         self.last_fetch_error = None
+        if self._legacy_feed_notification_key is not None:
+            await self._async_dismiss_legacy_feed_notification()
+            self._legacy_feed_notification_key = None
 
         present_demands = snapshot_data.get("presentDemands", [])
         if isinstance(present_demands, list):
@@ -272,6 +285,59 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 "used_cached_snapshot": False,
             },
         }
+
+    async def _async_notify_legacy_feed_unavailable(
+        self,
+        error_type: str | None,
+        error_message: str | None,
+    ) -> None:
+        """Notify the user that the legacy PBC feed is unavailable."""
+        pbc_ip = self.address or "the configured PBC"
+        message = (
+            f"Savant Energy could not reach the legacy feed at {pbc_ip}. "
+            f"Check that the PBC IP is correct. If this Savant Host system has been upgraded recently (>11.2), "
+            f"open the integration and run Reconfigure to switch to the newer setup path."
+        )
+        if error_type or error_message:
+            message = (
+                f"{message} Last error: {error_type or 'unknown'}: {error_message or 'no details available'}."
+            )
+
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "create",
+            {
+                "title": "Savant Energy Legacy Feed Unavailable",
+                "message": message,
+                "notification_id": LEGACY_FEED_NOTIFICATION_ID,
+            },
+            blocking=True,
+        )
+
+    async def _async_dismiss_legacy_feed_notification(self) -> None:
+        """Dismiss the legacy feed notification once the feed is healthy again."""
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": LEGACY_FEED_NOTIFICATION_ID},
+            blocking=True,
+        )
+
+
+async def _async_remove_dmx_address_sensors(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Remove any DMX address sensor entities left over from a previous legacy-mode install."""
+    from homeassistant.helpers.entity_registry import async_get as async_get_er  # type: ignore
+
+    er = async_get_er(hass)
+    stale = [
+        reg.entity_id
+        for reg in er.entities.values()
+        if reg.config_entry_id == entry.entry_id
+        and reg.unique_id.endswith("_dmx_address")
+    ]
+    for entity_id in stale:
+        er.async_remove(entity_id)
+        _LOGGER.info("Removed stale DMX address sensor (current mode): %s", entity_id)
 
 
 async def _async_register_frontend_resource(hass: HomeAssistant) -> None:
@@ -320,6 +386,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.warning(
             "Initial InfluxDB fetch returned no data — entities may show as unavailable"
         )
+
+    if coordinator.mode == MODE_CURRENT:
+        await _async_remove_dmx_address_sensors(hass, entry)
 
     setup_platforms = list(PLATFORMS)
     if not disable_scene_builder:

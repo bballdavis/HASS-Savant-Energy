@@ -348,6 +348,145 @@ def get_dmx_address_from_state(
     return None
 
 
+def _collect_device_candidates(coordinator: Any) -> Tuple[list[Dict[str, Any]], str]:
+    """Return the best available device list and its source label."""
+    coordinator_data = getattr(coordinator, "data", None) or {}
+
+    snapshot_data = coordinator_data.get("snapshot_data")
+    if isinstance(snapshot_data, dict):
+        present_demands = snapshot_data.get("presentDemands")
+        if isinstance(present_demands, list) and present_demands:
+            return [device for device in present_demands if isinstance(device, dict)], "live snapshot"
+
+    cached_present_demands = coordinator_data.get("cached_present_demands")
+    if isinstance(cached_present_demands, list) and cached_present_demands:
+        return [device for device in cached_present_demands if isinstance(device, dict)], "cached snapshot"
+
+    return [], "unknown"
+
+
+def _collect_devices_from_dmx_sensors(hass: Any) -> list[Dict[str, Any]]:
+    """Build device-like records from existing DMX address sensor states."""
+    if hass is None:
+        return []
+
+    devices: list[Dict[str, Any]] = []
+    for sensor_state in hass.states.async_all("sensor"):
+        if not sensor_state.entity_id.endswith("_dmx_address"):
+            continue
+
+        device_uid = sensor_state.attributes.get("uid")
+        if not device_uid:
+            continue
+
+        if sensor_state.state in ("unknown", "unavailable"):
+            continue
+
+        device_name = sensor_state.attributes.get("friendly_name") or sensor_state.name or str(device_uid)
+        devices.append(
+            {
+                "uid": str(device_uid),
+                "name": device_name,
+                "dmx_address": sensor_state.state,
+            }
+        )
+
+    return devices
+
+
+def _resolve_dmx_value_for_device(
+    device: Dict[str, Any],
+    overrides_by_uid: Optional[Dict[str, str]],
+) -> str:
+    """Return the DMX value to send for a device record."""
+    device_uid = str(device.get("uid", ""))
+    if overrides_by_uid and device_uid in overrides_by_uid:
+        return _normalize_dmx_value(overrides_by_uid[device_uid], default="0")
+
+    if "percentCommanded" in device:
+        try:
+            percent_commanded = float(device.get("percentCommanded") or 0)
+        except (TypeError, ValueError):
+            percent_commanded = 0.0
+        return "255" if percent_commanded > 0 else "0"
+
+    if "override" in device:
+        return "255" if bool(device.get("override")) else "0"
+
+    return "0"
+
+
+def _resolve_dmx_address_for_device(hass: Any, device: Dict[str, Any]) -> Optional[int]:
+    """Resolve the DMX address for a device using sensor state or inline data."""
+    device_uid = str(device.get("uid", ""))
+    device_name = device.get("name")
+
+    inline_address = device.get("dmx_address")
+    if inline_address is not None:
+        try:
+            return int(inline_address)
+        except (TypeError, ValueError):
+            _LOGGER.debug("Ignoring invalid inline DMX address for %s: %s", device_uid, inline_address)
+
+    return get_dmx_address_from_state(hass, device_uid, device_name)
+
+
+async def async_build_managed_dmx_values(
+    coordinator: Any,
+    hass: Any,
+    overrides_by_uid: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[int, str], Dict[str, int], Dict[str, str]]:
+    """Build a DMX channel map for the current managed devices."""
+    devices, _source = _collect_device_candidates(coordinator)
+    if not devices:
+        devices = _collect_devices_from_dmx_sensors(hass)
+
+    dmx_values: Dict[int, str] = {}
+    resolved_addresses: Dict[str, int] = {}
+    unresolved_devices: Dict[str, str] = {}
+
+    for device in devices:
+        device_uid = str(device.get("uid", ""))
+        if not device_uid:
+            continue
+
+        address = _resolve_dmx_address_for_device(hass, device)
+        if address is None:
+            unresolved_devices[device_uid] = str(device.get("name") or device_uid)
+            continue
+
+        resolved_addresses[device_uid] = address
+        dmx_values[address] = _resolve_dmx_value_for_device(device, overrides_by_uid)
+
+    return dmx_values, resolved_addresses, unresolved_devices
+
+
+async def async_build_all_loads_dmx_values(
+    coordinator: Any,
+    hass: Any,
+) -> Tuple[Dict[int, str], str, Dict[str, str]]:
+    """Build a DMX channel map that turns all known loads on."""
+    devices, source = _collect_device_candidates(coordinator)
+    if not devices:
+        devices = _collect_devices_from_dmx_sensors(hass)
+        if devices:
+            source = "dmx address sensors"
+
+    overrides_by_uid = {
+        str(device.get("uid")): "255"
+        for device in devices
+        if device.get("uid")
+    }
+
+    dmx_values, _resolved_addresses, unresolved_devices = await async_build_managed_dmx_values(
+        coordinator,
+        hass,
+        overrides_by_uid,
+    )
+
+    return dmx_values, source, unresolved_devices
+
+
 async def async_get_dmx_address(
     ip_address: str,
     ola_port: int,

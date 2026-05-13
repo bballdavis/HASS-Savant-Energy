@@ -32,6 +32,8 @@ Welcome to the **Savant Energy** integration for Home Assistant! This project br
      - **Legacy (<11.2)**: keeps the original snapshot + DMX workflow and only asks for the PBC IP.
      - **Current (>=11.2)**: uses InfluxDB for telemetry and direct SEM relay control, and asks for the PBC IP, host IP, and either an Influx token or SSH password.
 
+If the integration can no longer read the legacy PBC feed, it will create a Home Assistant notification that points you to the PBC IP and the **Reconfigure** flow.
+
 ## Setup Modes
 The integration now supports both the older Savant workflow and the newer `>=11.2` workflow without making existing users change anything unexpectedly.
 

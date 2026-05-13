@@ -66,7 +66,7 @@ class EnergyDeviceSensor(CoordinatorEntity, SensorEntity):
     # --- Coordinator lookup helpers ---
 
     def _find_device(self) -> dict | None:
-        snapshot = (self.coordinator.data or {}).get("snapshot_data", {})
+        snapshot = (self.coordinator.data or {}).get("snapshot_data") or {}
         uid = self._device["uid"]
         for d in (snapshot.get("presentDemands") or []):
             if d.get("uid") == uid:
@@ -174,7 +174,7 @@ class IndividualLoadEnergySensor(CoordinatorEntity, SensorEntity):
         return f"{self._live_name} Energy"
 
     def _find_device(self) -> dict | None:
-        snapshot = (self.coordinator.data or {}).get("snapshot_data", {})
+        snapshot = (self.coordinator.data or {}).get("snapshot_data") or {}
         uid = self._device["uid"]
         for d in (snapshot.get("presentDemands") or []):
             if d.get("uid") == uid:
