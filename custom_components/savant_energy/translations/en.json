@@ -3,29 +3,189 @@
     "step": {
       "init": {
         "title": "Savant Energy Options",
-            "data": {
-              "address": "IP Address",
-              "port": "Port",
-              "ola_port": "OLA Port",
-              "scan_interval": "Scan Interval",
-              "switch_cooldown": "Breaker Cooldown",
-            "dmx_testing_mode": "DMX Testing Mode",
-            "pending_confirm_multiplier": "Breaker Switch Debounce Delay (scan intervals)",
-            "disable_scene_builder": "Disable Scene Builder"
-          },
-        "description": "Field descriptions: \nIP Address (The address of your Savant controller), \nPort (Port for energy snapshot data, default: 2000), \nOLA Port (Port for DMX/OLA API, default: 9090), \nScan Interval (How often to poll for new data in seconds, default: 15), \nBreaker Cooldown (Minimum seconds between relay toggles, default: 30), \nDMX Testing Mode (Makes all DMX commands sent to console only for testing), \nBreaker Switch Debounce Delay (Number of scan intervals to wait for relay status confirmation after a user command, default: 3 - units are *scan intervals*), \nDisable Scene Builder (Removes loading of scene build card and backend)."
+        "data": {
+          "mode": "Mode",
+          "address": "PBC IP",
+          "host": "Host IP",
+          "influx_url": "Influx URL",
+          "influx_token": "Influx Token",
+          "influx_org": "Influx Org",
+          "influx_auth_method": "Influx Credential Method",
+          "ola_port": "OLA Port",
+          "scan_interval": "Scan Interval",
+          "switch_cooldown": "Breaker Cooldown",
+          "dmx_testing_mode": "DMX Testing Mode",
+          "pending_confirm_multiplier": "Breaker Switch Debounce Delay (scan intervals)",
+          "disable_scene_builder": "Disable Scene Builder"
+        },
+        "description": "Configure advanced options. Ports typically remain on defaults."
       }
     }
   },
   "config": {
     "step": {
       "user": {
-        "title": "Savant Energy Connection",
+        "title": "Savant Energy — Choose Mode",
         "data": {
-          "address": "IP Address",
-          "port": "Port"
+          "mode": "Mode"
         },
-        "description": "Field descriptions: \nIP Address (The address of your Savant controller), \nPort (Port for energy snapshot data, default: 2000)."
+        "description": "Select your Savant firmware version. Use Auto to let the integration detect it automatically."
+      },
+      "legacy_setup": {
+        "title": "Legacy Setup (firmware <11.2)",
+        "data": {
+          "address": "PBC IP Address"
+        },
+        "data_description": {
+          "address": "IP address of your Savant Power Control Bridge (PBC)."
+        },
+        "description": "Legacy mode uses the original snapshot and DMX workflow. Only the PBC IP is required."
+      },
+      "current_setup": {
+        "title": "Current Setup (firmware ≥11.2) — Device IPs",
+        "data": {
+          "address": "PBC IP Address",
+          "host": "Host IP Address"
+        },
+        "data_description": {
+          "address": "IP address of your Savant Power Control Bridge (PBC).",
+          "host": "IP address of your Savant RPM Host — the machine running InfluxDB (usually your main Savant controller)."
+        },
+        "description": "Enter the IP addresses for the PBC and the RPM host."
+      },
+      "current_auth": {
+        "title": "Current Setup — InfluxDB Authentication",
+        "data": {
+          "influx_auth_method": "How to obtain the Influx token"
+        },
+        "data_description": {
+          "influx_auth_method": "Choose 'Paste Token' if you already have the read token, or 'Fetch via SSH' to have the integration retrieve it automatically using the RPM user credentials."
+        },
+        "description": "The integration needs an InfluxDB read token to pull energy data. Choose how you'd like to provide it."
+      },
+      "current_token": {
+        "title": "Current Setup — Influx Read Token",
+        "data": {
+          "influx_token": "Influx Read Token"
+        },
+        "data_description": {
+          "influx_token": "Paste the InfluxDB read token from your Savant host. You can find it at: /home/RPM/.remote/rpm_modules/rpm-energy/current/influxdb/read.token"
+        },
+        "description": "Paste the InfluxDB read token from your Savant host."
+      },
+      "current_ssh": {
+        "title": "Current Setup — SSH Auto-Fetch",
+        "data": {
+          "ssh_password": "RPM User Password"
+        },
+        "data_description": {
+          "ssh_password": "Password for the 'RPM' user account on the Savant host. The integration will SSH in and retrieve the Influx read token automatically."
+        },
+        "description": "Enter the RPM user password. The integration will connect via SSH and fetch the Influx token from the host."
+      },
+      "auto_probe": {
+        "title": "Auto Detect — PBC IP",
+        "data": {
+          "address": "PBC IP Address"
+        },
+        "data_description": {
+          "address": "IP address of your Savant Power Control Bridge (PBC)."
+        },
+        "description": "Enter your PBC IP address. The integration will probe for a legacy activity feed and configure itself accordingly."
+      },
+      "auto_current_host": {
+        "title": "Auto Detect — Legacy Feed Not Found",
+        "data": {
+          "host": "Host IP Address"
+        },
+        "data_description": {
+          "host": "IP address of your Savant RPM Host — the machine running InfluxDB."
+        },
+        "description": "The legacy activity feed was not detected on your PBC. Enter the RPM host IP to continue with the current API (firmware ≥11.2)."
+      },
+      "reconfigure": {
+        "title": "Reconfigure — Choose Mode",
+        "data": {
+          "mode": "Mode"
+        },
+        "description": "Select the operating mode. Choose Legacy for firmware <11.2 or Current for firmware ≥11.2."
+      },
+      "reconfigure_legacy": {
+        "title": "Reconfigure — Legacy Mode",
+        "data": {
+          "address": "PBC IP Address"
+        },
+        "data_description": {
+          "address": "IP address of your Savant Power Control Bridge (PBC)."
+        },
+        "description": "Confirm or update the PBC IP address for legacy mode."
+      },
+      "reconfigure_current_host": {
+        "title": "Reconfigure — Device IPs",
+        "data": {
+          "address": "PBC IP Address",
+          "host": "Host IP Address"
+        },
+        "data_description": {
+          "address": "IP address of your Savant Power Control Bridge (PBC).",
+          "host": "IP address of your Savant RPM Host — the machine running InfluxDB."
+        },
+        "description": "Confirm or update the IP addresses for the PBC and RPM host."
+      },
+      "reconfigure_auth": {
+        "title": "Reconfigure — InfluxDB Authentication",
+        "data": {
+          "influx_auth_method": "How to obtain the Influx token"
+        },
+        "data_description": {
+          "influx_auth_method": "Choose 'Paste Token' if you already have the read token, or 'Fetch via SSH' to have the integration retrieve it automatically using the RPM user credentials."
+        },
+        "description": "Choose how the integration should authenticate with InfluxDB."
+      },
+      "reconfigure_token": {
+        "title": "Reconfigure — Influx Read Token",
+        "data": {
+          "influx_token": "Influx Read Token"
+        },
+        "data_description": {
+          "influx_token": "Paste the InfluxDB read token from your Savant host. Found at: /home/RPM/.remote/rpm_modules/rpm-energy/current/influxdb/read.token"
+        },
+        "description": "Paste the InfluxDB read token from your Savant host."
+      },
+      "reconfigure_ssh": {
+        "title": "Reconfigure — SSH Auto-Fetch",
+        "data": {
+          "ssh_password": "RPM User Password"
+        },
+        "data_description": {
+          "ssh_password": "Password for the 'RPM' user account on the Savant host. The integration will SSH in and retrieve the Influx read token automatically."
+        },
+        "description": "Enter the RPM user password. The integration will connect via SSH and fetch the Influx token from the host."
+      }
+    },
+    "error": {
+      "invalid_address": "Please enter a valid IP address.",
+      "required": "This field is required.",
+      "ssh_unavailable": "The paramiko library is not installed. SSH token fetch is unavailable — paste the token manually instead.",
+      "ssh_token_empty": "SSH connection succeeded but the token file was empty or not found. Verify the host is running rpm-energy ≥11.2.",
+      "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password."
+    },
+    "abort": {
+      "reconfigure_successful": "Configuration updated successfully."
+    }
+  },
+  "selector": {
+    "mode": {
+      "options": {
+        "legacy": "Legacy (<11.2)",
+        "current": "Current (≥11.2)",
+        "auto": "Auto Detect"
+      }
+    },
+    "influx_auth_method": {
+      "options": {
+        "token": "Paste Token",
+        "ssh": "Fetch via SSH"
       }
     }
   }

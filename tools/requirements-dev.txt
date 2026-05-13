@@ -1,0 +1,10 @@
+# Optional development dependencies for savant_influx_probe.py
+
+# Core HTTP client library
+requests>=2.28.0
+
+# SSH support for remote token retrieval
+paramiko>=2.12.0
+
+# Environment variable loading (optional, but convenient)
+python-dotenv>=0.20.0

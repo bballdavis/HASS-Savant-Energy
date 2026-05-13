@@ -24,7 +24,10 @@ from homeassistant.components.http import HomeAssistantView  # type: ignore
 from .api import register_scene_services  # type: ignore
 from homeassistant.exceptions import HomeAssistantError  # type: ignore
 
-from .const import DOMAIN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE
+from .const import (
+    DOMAIN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE,
+    CONF_MODE, MODE_CURRENT, MODE_LEGACY,
+)
 from .utils import async_build_managed_dmx_values, async_set_dmx_values, slugify
 
 _LOGGER = logging.getLogger(__name__)
@@ -542,15 +545,62 @@ class SavantSceneManager:
         await self.storage.async_delete_scene(scene_id)
 
     async def async_execute_scene(self, scene_id: str) -> bool:
-        """Execute a scene by sending DMX commands for all included relays."""
+        """Execute a scene (mode-aware: relay controller for current, DMX for legacy)."""
         if scene_id not in self.storage.scenes:
             raise HomeAssistantError(f"Scene {scene_id} not found")
 
         scene = self.storage.scenes[scene_id]
         relay_states = scene["relay_states"]
 
-        overrides_by_uid = {}
+        if getattr(self.coordinator, "mode", None) == MODE_CURRENT:
+            return await self._execute_scene_current(scene, relay_states)
+        return await self._execute_scene_legacy(scene, relay_states)
 
+    async def _execute_scene_current(self, scene: dict, relay_states: dict) -> bool:
+        """Execute a scene via the SEM relay controller (current mode >=11.2)."""
+        relay_controller = getattr(self.coordinator, "relay_controller", None)
+        if not relay_controller:
+            _LOGGER.error("Relay controller not available for current mode scene execution")
+            return False
+
+        present_demands = (
+            ((self.coordinator.data or {}).get("snapshot_data") or {}).get("presentDemands", [])
+        )
+        uid_to_relay_uid = {
+            d["uid"]: d["relay_uid"]
+            for d in present_demands
+            if d.get("uid") and d.get("relay_uid")
+        }
+
+        bulk_states: dict[str, int] = {}
+        for breaker_entity_id, is_on in relay_states.items():
+            breaker_state = self.hass.states.get(breaker_entity_id)
+            if not breaker_state:
+                _LOGGER.warning("Skipping scene member %s: entity unavailable", breaker_entity_id)
+                continue
+            device_uid = breaker_state.attributes.get("uid")
+            if not device_uid:
+                _LOGGER.warning("Skipping scene member %s: no uid attribute", breaker_entity_id)
+                continue
+            relay_uid = uid_to_relay_uid.get(str(device_uid))
+            if not relay_uid:
+                _LOGGER.warning(
+                    "Skipping scene member %s: relay_uid not found for uid %s",
+                    breaker_entity_id, device_uid,
+                )
+                continue
+            bulk_states[relay_uid] = 100 if is_on else 0
+
+        if not bulk_states:
+            _LOGGER.warning("No relay states resolved for scene %s", scene["name"])
+            return False
+
+        _LOGGER.info("Executing scene %s via relay controller (%d relays)", scene["name"], len(bulk_states))
+        return await relay_controller.set_relay_states_bulk(bulk_states)
+
+    async def _execute_scene_legacy(self, scene: dict, relay_states: dict) -> bool:
+        """Execute a scene via DMX/OLA (legacy mode <11.2)."""
+        overrides_by_uid = {}
         for breaker_entity_id, is_on in relay_states.items():
             breaker_state = self.hass.states.get(breaker_entity_id)
             if not breaker_state:
@@ -559,7 +609,6 @@ class SavantSceneManager:
                     breaker_entity_id,
                 )
                 continue
-
             device_uid = breaker_state.attributes.get("uid")
             if not device_uid:
                 _LOGGER.warning(
@@ -567,13 +616,10 @@ class SavantSceneManager:
                     breaker_entity_id,
                 )
                 continue
-
             overrides_by_uid[str(device_uid)] = "255" if is_on else "0"
 
         dmx_values, _resolved_addresses, unresolved_devices = await async_build_managed_dmx_values(
-            self.coordinator,
-            self.hass,
-            overrides_by_uid,
+            self.coordinator, self.hass, overrides_by_uid,
         )
         for device_uid, device_name in unresolved_devices.items():
             if device_uid in overrides_by_uid:
@@ -583,32 +629,24 @@ class SavantSceneManager:
                 )
 
         if not dmx_values:
-            _LOGGER.warning(f"No DMX addresses found for scene {scene['name']}")
+            _LOGGER.warning("No DMX addresses found for scene %s", scene["name"])
             return False
 
-        # Get IP address and OLA port from config entry
         ip_address = self.coordinator.config_entry.data.get("address")
         ola_port = self.coordinator.config_entry.data.get("ola_port", DEFAULT_OLA_PORT)
-
-        # Get DMX testing mode from config
         dmx_testing_mode = self.coordinator.config_entry.options.get(
             CONF_DMX_TESTING_MODE,
             self.coordinator.config_entry.data.get(CONF_DMX_TESTING_MODE, False),
         )
 
-        _LOGGER.info(f"Executing scene {scene['name']} with {len(dmx_values)} relays")
-
-        # Send the DMX command
-        result = await async_set_dmx_values(
-            ip_address, dmx_values, ola_port, dmx_testing_mode
-        )
+        _LOGGER.info("Executing scene %s via DMX (%d relays)", scene["name"], len(dmx_values))
+        result = await async_set_dmx_values(ip_address, dmx_values, ola_port, dmx_testing_mode)
 
         if result and result.get("success"):
-            _LOGGER.info(f"Scene {scene['name']} executed successfully.")
+            _LOGGER.info("Scene %s executed successfully", scene["name"])
             return True
-        else:
-            _LOGGER.error(f"Scene {scene['name']} failed to execute. Result: {result}")
-            return False
+        _LOGGER.error("Scene %s failed to execute. Result: %s", scene["name"], result)
+        return False
 
     def get_all_available_devices(self) -> Dict[str, bool]:
         """Get a list of all available breaker switch devices and their current states."""

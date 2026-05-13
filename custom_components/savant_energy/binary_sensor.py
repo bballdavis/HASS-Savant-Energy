@@ -24,11 +24,11 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     entities = []
     if snapshot_data and "presentDemands" in snapshot_data:
         for device in snapshot_data["presentDemands"]:
-            if "uid" in device and "percentCommanded" in device:
-                uid = device["uid"]
-                dmx_uid = calculate_dmx_uid(uid)
+            if "uid" in device and "percentCommanded" in device and device.get("has_relay", True):
+                legacy_uid = device.get("legacy_uid", device["uid"])
+                dmx_uid = calculate_dmx_uid(legacy_uid)
                 entities.append(
-                    EnergyDeviceBinarySensor(coordinator, device, f"SavantEnergy_{uid}_relay_status", dmx_uid)
+                    EnergyDeviceBinarySensor(coordinator, device, f"SavantEnergy_{legacy_uid}_relay_status", dmx_uid)
                 )
     async_add_entities(entities)
 
@@ -49,12 +49,15 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
         self._initial_name = device.get("name", f"Savant Device {self._device_uid}")
         self._initial_capacity = device.get("capacity", 0)
 
+        # Use legacy_base_uid so device identity is stable across mode transitions.
+        # A/B circuit pairs share the same base (MAC without suffix) in both modes.
+        base_uid = device.get("legacy_base_uid", device.get("base_uid", self._device_uid))
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, str(self._device_uid))},
-            name=self._initial_name,  # Use stored initial name
+            identifiers={(DOMAIN, base_uid)},
+            name=self._initial_name,
             serial_number=self._dmx_uid,
             manufacturer=MANUFACTURER,
-            model=get_device_model(self._initial_capacity),  # Use stored initial capacity
+            model=get_device_model(self._initial_capacity),
         )
         self._attr_extra_state_attributes = {"uid": self._device_uid}
 
@@ -82,7 +85,7 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
         """
         Return True if the relay is ON, based on percentCommanded == 100.
         """
-        snapshot_data = self.coordinator.data.get("snapshot_data", {})
+        snapshot_data = (self.coordinator.data or {}).get("snapshot_data") or {}
         if snapshot_data and "presentDemands" in snapshot_data:
             for device in snapshot_data["presentDemands"]:
                 if device["uid"] == self._device_uid:
@@ -148,8 +151,13 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
             except Exception as exc:  # pragma: no cover - defensive
                 _LOGGER.debug("Error reading _device dict for device_info: %s", exc)
 
+        base_uid = (
+            self._device.get("legacy_base_uid", self._device.get("base_uid", self._device_uid))
+            if isinstance(self._device, dict)
+            else self._device_uid
+        )
         return DeviceInfo(
-            identifiers={(DOMAIN, str(self._device_uid))},
+            identifiers={(DOMAIN, base_uid)},
             name=current_name_val,
             serial_number=self._dmx_uid,
             manufacturer=MANUFACTURER,

@@ -43,8 +43,9 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
         self._dmx_uid = dmx_uid
         self._dmx_address = None  # Will be populated on first update
         self._attr_native_unit_of_measurement = None
+        base_uid = device.get("legacy_base_uid", device.get("base_uid", device["uid"]))
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, str(device["uid"]))},
+            identifiers={(DOMAIN, base_uid)},
             name=device["name"],
             serial_number=dmx_uid,
             manufacturer=MANUFACTURER,
@@ -55,7 +56,7 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
 
     @property
     def _current_device_name(self):
-        snapshot_data = self.coordinator.data.get("snapshot_data", {})
+        snapshot_data = (self.coordinator.data or {}).get("snapshot_data") or {}
         if snapshot_data and "presentDemands" in snapshot_data:
             for device in snapshot_data["presentDemands"]:
                 if device["uid"] == self._device["uid"]:
@@ -70,7 +71,7 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
         """
         Return the dynamic friendly name for the entity, based on the current device name.
         """
-        snapshot_data = self.coordinator.data.get("snapshot_data", {})
+        snapshot_data = (self.coordinator.data or {}).get("snapshot_data") or {}
         device_name = self._device["name"]
         if snapshot_data and "presentDemands" in snapshot_data:
             for device in snapshot_data["presentDemands"]:
@@ -84,15 +85,16 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
         """
         Return dynamic DeviceInfo with the current device name.
         """
-        snapshot_data = self.coordinator.data.get("snapshot_data", {})
+        snapshot_data = (self.coordinator.data or {}).get("snapshot_data") or {}
         device_name = self._device["name"]
         if snapshot_data and "presentDemands" in snapshot_data:
             for device in snapshot_data["presentDemands"]:
                 if device["uid"] == self._device["uid"]:
                     device_name = device["name"]
                     break
+        base_uid = self._device.get("legacy_base_uid", self._device.get("base_uid", self._device["uid"]))
         return DeviceInfo(
-            identifiers={(DOMAIN, str(self._device["uid"]))},
+            identifiers={(DOMAIN, base_uid)},
             name=device_name,
             serial_number=self._dmx_uid,
             manufacturer=MANUFACTURER,
