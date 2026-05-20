@@ -28,8 +28,9 @@ from .const import (
     CONF_INFLUX_URL,
     CONF_INFLUX_TOKEN,
     CONF_INFLUX_ORG,
-    CONF_SSH_PASSWORD,
+    CONF_SSH_PRIVATE_KEY,
     DEFAULT_MODE,
+    DEFAULT_SSH_USERNAME,
     MODE_LEGACY,
     MODE_CURRENT,
     MODE_AUTO,
@@ -38,7 +39,6 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_INFLUX_URL,
     DEFAULT_INFLUX_ORG,
-    DEFAULT_SSH_PASSWORD,
 )
 from .current.influx_client import fetch_influx_snapshot
 from .current.relay_control import SavantRelayController
@@ -100,8 +100,8 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.last_fetch_error: dict | None = None
         self._legacy_feed_notification_key: tuple[str | None, str | None] | None = None
 
-        self.ssh_password = entry.options.get(
-            CONF_SSH_PASSWORD, entry.data.get(CONF_SSH_PASSWORD, DEFAULT_SSH_PASSWORD)
+        self.ssh_private_key = entry.options.get(
+            CONF_SSH_PRIVATE_KEY, entry.data.get(CONF_SSH_PRIVATE_KEY, "")
         )
         self._token_refresh_in_progress = False
 
@@ -112,56 +112,31 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             self.relay_controller = SavantRelayController(sem_host=sem_host, sem_port=DEFAULT_PORT)
 
     async def _async_refresh_influx_token(self) -> bool:
-        """SSH to the Savant host and update the stored InfluxDB read token.
+        """SSH to the Savant host using the stored Ed25519 key and update the token.
 
         Returns True if a new token was fetched and the config entry was updated.
-        Only runs when an SSH password is configured and no refresh is already in progress.
+        Only runs when a private key is configured and no refresh is already in progress.
         """
         if self._token_refresh_in_progress:
             return False
-        if not self.ssh_password:
-            _LOGGER.debug("401 detected but no SSH password configured — skipping auto-refresh")
+        if not self.ssh_private_key:
+            _LOGGER.debug("401 detected but no SSH private key configured — skipping auto-refresh")
             return False
 
         self._token_refresh_in_progress = True
         try:
+            from .ssh_helper import async_ssh_fetch_token_with_key
+
             host = self.host or self._hub_host_from_influx_url()
-            password = self.ssh_password
-
-            def _ssh_fetch() -> str | None:
-                try:
-                    import paramiko  # type: ignore
-                except Exception as exc:
-                    _LOGGER.warning("paramiko unavailable — cannot auto-refresh token: %s", exc)
-                    return None
-                client = None
-                try:
-                    client = paramiko.SSHClient()
-                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                    client.connect(hostname=host, username="RPM", password=password, timeout=10)
-                    _, stdout, _ = client.exec_command(
-                        "cat /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia"
-                        "/statusfiles/InfluxDB2/.influxReadtoken"
-                    )
-                    return stdout.read().decode("utf-8", errors="ignore").strip() or None
-                except Exception as exc:
-                    _LOGGER.warning("SSH token refresh from %s failed: %s", host, exc)
-                    return None
-                finally:
-                    if client:
-                        try:
-                            client.close()
-                        except Exception:
-                            pass
-
-            new_token = await self.hass.async_add_executor_job(_ssh_fetch)
+            new_token = await async_ssh_fetch_token_with_key(
+                self.hass, host, DEFAULT_SSH_USERNAME, self.ssh_private_key
+            )
             if not new_token or new_token == self.influx_token:
                 return False
 
-            _LOGGER.info("Auto-refreshed InfluxDB token via SSH from %s", host)
+            _LOGGER.info("Auto-refreshed InfluxDB token via SSH key from %s", host)
             self.influx_token = new_token
 
-            # Persist the new token into the config entry options so it survives restarts.
             updated_options = dict(self.config_entry.options)
             updated_options[CONF_INFLUX_TOKEN] = new_token
             self.hass.config_entries.async_update_entry(

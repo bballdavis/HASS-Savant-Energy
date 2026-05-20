@@ -27,7 +27,9 @@ from .const import (
     CONF_DMX_TESTING_MODE,
     CONF_INFLUX_AUTH_METHOD,
     CONF_SSH_PASSWORD,
+    CONF_SSH_PRIVATE_KEY,
     DEFAULT_MODE,
+    DEFAULT_SSH_USERNAME,
     MODE_LEGACY,
     MODE_CURRENT,
     MODE_AUTO,
@@ -41,7 +43,6 @@ from .const import (
     DEFAULT_DISABLE_SCENE_BUILDER,
     DEFAULT_PENDING_CONFIRM_MULTIPLIER,
     DEFAULT_INFLUX_AUTH_METHOD,
-    DEFAULT_SSH_PASSWORD,
     AUTH_INFLUX_TOKEN,
     AUTH_INFLUX_SSH,
     SCAN_INTERVAL_OPTIONS,
@@ -75,47 +76,6 @@ def _mode_selector(include_auto: bool = True):
         )
     )
 
-
-async def _fetch_influx_token_via_ssh(
-    hass, host: str, password: str
-) -> tuple[str | None, str | None]:
-    """Retrieve the InfluxDB read token from a Savant host over SSH.
-
-    All blocking I/O (including the paramiko import) runs on the executor thread.
-    Returns (token, None) on success or (None, error_key) on failure so callers
-    can surface a specific error message in the config UI.
-    """
-    def _worker() -> tuple[str | None, str | None]:
-        try:
-            import paramiko  # type: ignore  # noqa: PLC0415
-        except Exception as exc:
-            _LOGGER.warning("paramiko unavailable — SSH token fetch not possible: %s", exc)
-            return None, "ssh_unavailable"
-
-        client = None
-        try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(hostname=host, username="RPM", password=password, timeout=10)
-            _stdin, stdout, _stderr = client.exec_command(
-                "cat /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken"
-            )
-            token = stdout.read().decode("utf-8", errors="ignore").strip()
-            if not token:
-                _LOGGER.warning("SSH connected to %s but token file was empty or missing", host)
-                return None, "ssh_token_empty"
-            return token, None
-        except Exception as exc:
-            _LOGGER.warning("SSH token fetch from %s failed: %s", host, exc)
-            return None, "ssh_failed"
-        finally:
-            if client:
-                try:
-                    client.close()
-                except Exception:
-                    pass
-
-    return await hass.async_add_executor_job(_worker)
 
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -161,7 +121,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_INFLUX_AUTH_METHOD: self._pending[CONF_INFLUX_AUTH_METHOD],
             CONF_INFLUX_URL: _derive_influx_url(host_ip),
             CONF_INFLUX_TOKEN: self._pending[CONF_INFLUX_TOKEN],
-            CONF_SSH_PASSWORD: self._pending.get(CONF_SSH_PASSWORD, DEFAULT_SSH_PASSWORD),
+            CONF_SSH_PRIVATE_KEY: self._pending.get(CONF_SSH_PRIVATE_KEY, ""),
         }
 
     # ── Initial setup ────────────────────────────────────────────────────────
@@ -285,21 +245,23 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_current_ssh(self, user_input=None):
-        """Current mode step 3b: SSH password to auto-fetch the Influx token."""
+        """Current mode step 3b: SSH password (used once) to install key and fetch token."""
         errors = {}
         if user_input is not None:
             ssh_password = (user_input.get(CONF_SSH_PASSWORD) or "").strip()
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                token, ssh_error = await _fetch_influx_token_via_ssh(
-                    self.hass, self._pending[CONF_HOST], ssh_password
+                from .ssh_helper import async_ssh_bootstrap
+
+                private_key, token, error_key = await async_ssh_bootstrap(
+                    self.hass, self._pending[CONF_HOST], DEFAULT_SSH_USERNAME, ssh_password
                 )
-                if ssh_error:
-                    errors[CONF_SSH_PASSWORD] = ssh_error
+                if error_key:
+                    errors[CONF_SSH_PASSWORD] = error_key
                 else:
                     self._pending[CONF_INFLUX_TOKEN] = token
-                    self._pending[CONF_SSH_PASSWORD] = ssh_password
+                    self._pending[CONF_SSH_PRIVATE_KEY] = private_key
                     return self.async_create_entry(
                         title="Savant Energy",
                         data=self._build_current_data(),
@@ -508,7 +470,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_reconfigure_ssh(self, user_input=None):
-        """Reconfigure current step 3b: SSH password to auto-fetch the Influx token."""
+        """Reconfigure current step 3b: SSH password (used once) to install key and fetch token."""
         config_entry = self._get_reconfigure_entry()
         errors = {}
         if user_input is not None:
@@ -516,14 +478,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                token, ssh_error = await _fetch_influx_token_via_ssh(
-                    self.hass, self._pending[CONF_HOST], ssh_password
+                from .ssh_helper import async_ssh_bootstrap
+
+                private_key, token, error_key = await async_ssh_bootstrap(
+                    self.hass, self._pending[CONF_HOST], DEFAULT_SSH_USERNAME, ssh_password
                 )
-                if ssh_error:
-                    errors[CONF_SSH_PASSWORD] = ssh_error
+                if error_key:
+                    errors[CONF_SSH_PASSWORD] = error_key
                 else:
                     self._pending[CONF_INFLUX_TOKEN] = token
-                    self._pending[CONF_SSH_PASSWORD] = ssh_password
+                    self._pending[CONF_SSH_PRIVATE_KEY] = private_key
                     self.hass.config_entries.async_update_entry(
                         config_entry,
                         data=self._build_current_data(config_entry.data),
@@ -568,12 +532,23 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 errors[CONF_PENDING_CONFIRM_MULTIPLIER] = "invalid_value"
 
             if not errors:
+                reprovision = user_input.pop("reprovision_ssh_key", False)
+                if reprovision:
+                    # Hand off to re-bootstrap step; carry current options forward
+                    self._pending_options = user_input
+                    return await self.async_step_reprovision_ssh()
                 return self.async_create_entry(title="", data=user_input)
 
         def _opt(key, default):
             return self.config_entry.options.get(
                 key, self.config_entry.data.get(key, default)
             )
+
+        has_key = bool(
+            self.config_entry.options.get(
+                CONF_SSH_PRIVATE_KEY, self.config_entry.data.get(CONF_SSH_PRIVATE_KEY, "")
+            )
+        )
 
         return self.async_show_form(
             step_id="init",
@@ -612,11 +587,42 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         "disable_scene_builder",
                         default=_opt("disable_scene_builder", DEFAULT_DISABLE_SCENE_BUILDER),
                     ): bool,
-                    vol.Optional(
-                        CONF_SSH_PASSWORD,
-                        default=_opt(CONF_SSH_PASSWORD, DEFAULT_SSH_PASSWORD),
-                    ): str,
+                    # Shown only for current-mode entries; allows re-bootstrapping the SSH key
+                    vol.Optional("reprovision_ssh_key", default=False): bool,
                 }
             ),
+            description_placeholders={
+                "ssh_key_status": "installed" if has_key else "not configured",
+            },
+            errors=errors,
+        )
+
+    async def async_step_reprovision_ssh(self, user_input=None):
+        """Re-bootstrap the SSH key using a fresh password."""
+        errors = {}
+        if user_input is not None:
+            ssh_password = (user_input.get(CONF_SSH_PASSWORD) or "").strip()
+            if not ssh_password:
+                errors[CONF_SSH_PASSWORD] = "required"
+            else:
+                from .ssh_helper import async_ssh_bootstrap
+
+                host = self.config_entry.options.get(
+                    CONF_HOST, self.config_entry.data.get(CONF_HOST, "")
+                )
+                private_key, token, error_key = await async_ssh_bootstrap(
+                    self.hass, host, DEFAULT_SSH_USERNAME, ssh_password
+                )
+                if error_key:
+                    errors[CONF_SSH_PASSWORD] = error_key
+                else:
+                    options = getattr(self, "_pending_options", {})
+                    options[CONF_SSH_PRIVATE_KEY] = private_key
+                    options[CONF_INFLUX_TOKEN] = token
+                    return self.async_create_entry(title="", data=options)
+
+        return self.async_show_form(
+            step_id="reprovision_ssh",
+            data_schema=vol.Schema({vol.Required(CONF_SSH_PASSWORD): str}),
             errors=errors,
         )

@@ -55,6 +55,8 @@ DEFAULT_INFLUX_AUTH_METHOD = AUTH_INFLUX_TOKEN
 
 CONF_SSH_PASSWORD = "ssh_password"
 DEFAULT_SSH_PASSWORD = ""
+CONF_SSH_PRIVATE_KEY = "ssh_private_key"
+DEFAULT_SSH_USERNAME = "RPM"
 
 # Scan interval choices shown in the UI (seconds)
 SCAN_INTERVAL_OPTIONS = [5, 10, 15, 30]
