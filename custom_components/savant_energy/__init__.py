@@ -28,6 +28,7 @@ from .const import (
     CONF_INFLUX_URL,
     CONF_INFLUX_TOKEN,
     CONF_INFLUX_ORG,
+    CONF_SSH_PASSWORD,
     DEFAULT_MODE,
     MODE_LEGACY,
     MODE_CURRENT,
@@ -37,6 +38,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_INFLUX_URL,
     DEFAULT_INFLUX_ORG,
+    DEFAULT_SSH_PASSWORD,
 )
 from .current.influx_client import fetch_influx_snapshot
 from .current.relay_control import SavantRelayController
@@ -98,11 +100,76 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.last_fetch_error: dict | None = None
         self._legacy_feed_notification_key: tuple[str | None, str | None] | None = None
 
+        self.ssh_password = entry.options.get(
+            CONF_SSH_PASSWORD, entry.data.get(CONF_SSH_PASSWORD, DEFAULT_SSH_PASSWORD)
+        )
+        self._token_refresh_in_progress = False
+
         self.relay_controller: SavantRelayController | None = None
         if self.mode == MODE_CURRENT:
             # Relay control only applies to current mode.
             sem_host = os.getenv("SAVANT_SEM_HOST", self.address or "192.168.1.108")
             self.relay_controller = SavantRelayController(sem_host=sem_host, sem_port=DEFAULT_PORT)
+
+    async def _async_refresh_influx_token(self) -> bool:
+        """SSH to the Savant host and update the stored InfluxDB read token.
+
+        Returns True if a new token was fetched and the config entry was updated.
+        Only runs when an SSH password is configured and no refresh is already in progress.
+        """
+        if self._token_refresh_in_progress:
+            return False
+        if not self.ssh_password:
+            _LOGGER.debug("401 detected but no SSH password configured — skipping auto-refresh")
+            return False
+
+        self._token_refresh_in_progress = True
+        try:
+            host = self.host or self._hub_host_from_influx_url()
+            password = self.ssh_password
+
+            def _ssh_fetch() -> str | None:
+                try:
+                    import paramiko  # type: ignore
+                except Exception as exc:
+                    _LOGGER.warning("paramiko unavailable — cannot auto-refresh token: %s", exc)
+                    return None
+                client = None
+                try:
+                    client = paramiko.SSHClient()
+                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    client.connect(hostname=host, username="RPM", password=password, timeout=10)
+                    _, stdout, _ = client.exec_command(
+                        "cat /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia"
+                        "/statusfiles/InfluxDB2/.influxReadtoken"
+                    )
+                    return stdout.read().decode("utf-8", errors="ignore").strip() or None
+                except Exception as exc:
+                    _LOGGER.warning("SSH token refresh from %s failed: %s", host, exc)
+                    return None
+                finally:
+                    if client:
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
+
+            new_token = await self.hass.async_add_executor_job(_ssh_fetch)
+            if not new_token or new_token == self.influx_token:
+                return False
+
+            _LOGGER.info("Auto-refreshed InfluxDB token via SSH from %s", host)
+            self.influx_token = new_token
+
+            # Persist the new token into the config entry options so it survives restarts.
+            updated_options = dict(self.config_entry.options)
+            updated_options[CONF_INFLUX_TOKEN] = new_token
+            self.hass.config_entries.async_update_entry(
+                self.config_entry, options=updated_options
+            )
+            return True
+        finally:
+            self._token_refresh_in_progress = False
 
     def _hub_host_from_influx_url(self) -> str:
         """Extract hub host from InfluxDB URL (same device, different port)."""
@@ -149,30 +216,42 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         )
 
         if not result.success or result.data is None:
-            self._adjust_interval(success=False)
-            self.last_fetch_error = {
-                "type": result.error_type,
-                "message": result.error_message,
-                "timestamp": now.isoformat(),
-            }
-            _LOGGER.warning(
-                "Savant InfluxDB fetch failed (%s): %s",
-                result.error_type,
-                result.error_message,
-            )
+            # If the failure looks like a 401, try to auto-refresh the token via SSH
+            # and immediately retry once with the new token.
+            is_401 = result.error_message and "401" in result.error_message
+            if is_401:
+                _LOGGER.warning("InfluxDB returned 401 — attempting SSH token refresh")
+                refreshed = await self._async_refresh_influx_token()
+                if refreshed:
+                    result = await fetch_influx_snapshot(
+                        self.influx_url, self.influx_token, self.influx_org
+                    )
 
-            existing = dict(self.data) if isinstance(self.data, dict) else {}
-            existing.setdefault("snapshot_data", None)
-            existing["cached_present_demands"] = copy.deepcopy(self.cached_present_demands)
-            existing["snapshot_status"] = {
-                "ok": False,
-                "error_type": result.error_type,
-                "error_message": result.error_message,
-                "failure_count": self.consecutive_failures,
-                "next_retry_seconds": int(self.update_interval.total_seconds()),
-                "used_cached_snapshot": bool(existing.get("snapshot_data")),
-            }
-            return existing
+            if not result.success or result.data is None:
+                self._adjust_interval(success=False)
+                self.last_fetch_error = {
+                    "type": result.error_type,
+                    "message": result.error_message,
+                    "timestamp": now.isoformat(),
+                }
+                _LOGGER.warning(
+                    "Savant InfluxDB fetch failed (%s): %s",
+                    result.error_type,
+                    result.error_message,
+                )
+
+                existing = dict(self.data) if isinstance(self.data, dict) else {}
+                existing.setdefault("snapshot_data", None)
+                existing["cached_present_demands"] = copy.deepcopy(self.cached_present_demands)
+                existing["snapshot_status"] = {
+                    "ok": False,
+                    "error_type": result.error_type,
+                    "error_message": result.error_message,
+                    "failure_count": self.consecutive_failures,
+                    "next_retry_seconds": int(self.update_interval.total_seconds()),
+                    "used_cached_snapshot": bool(existing.get("snapshot_data")),
+                }
+                return existing
 
         snapshot_data = result.data
         self._adjust_interval(success=True)

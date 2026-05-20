@@ -26,6 +26,7 @@ from .const import (
     CONF_PENDING_CONFIRM_MULTIPLIER,
     CONF_DMX_TESTING_MODE,
     CONF_INFLUX_AUTH_METHOD,
+    CONF_SSH_PASSWORD,
     DEFAULT_MODE,
     MODE_LEGACY,
     MODE_CURRENT,
@@ -40,6 +41,7 @@ from .const import (
     DEFAULT_DISABLE_SCENE_BUILDER,
     DEFAULT_PENDING_CONFIRM_MULTIPLIER,
     DEFAULT_INFLUX_AUTH_METHOD,
+    DEFAULT_SSH_PASSWORD,
     AUTH_INFLUX_TOKEN,
     AUTH_INFLUX_SSH,
     SCAN_INTERVAL_OPTIONS,
@@ -47,8 +49,6 @@ from .const import (
 from .legacy.snapshot_data import fetch_current_energy_snapshot
 
 _LOGGER = logging.getLogger(__name__)
-
-CONF_SSH_PASSWORD = "ssh_password"
 
 
 def _auth_method_selector():
@@ -161,6 +161,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_INFLUX_AUTH_METHOD: self._pending[CONF_INFLUX_AUTH_METHOD],
             CONF_INFLUX_URL: _derive_influx_url(host_ip),
             CONF_INFLUX_TOKEN: self._pending[CONF_INFLUX_TOKEN],
+            CONF_SSH_PASSWORD: self._pending.get(CONF_SSH_PASSWORD, DEFAULT_SSH_PASSWORD),
         }
 
     # ── Initial setup ────────────────────────────────────────────────────────
@@ -298,6 +299,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     errors[CONF_SSH_PASSWORD] = ssh_error
                 else:
                     self._pending[CONF_INFLUX_TOKEN] = token
+                    self._pending[CONF_SSH_PASSWORD] = ssh_password
                     return self.async_create_entry(
                         title="Savant Energy",
                         data=self._build_current_data(),
@@ -521,6 +523,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     errors[CONF_SSH_PASSWORD] = ssh_error
                 else:
                     self._pending[CONF_INFLUX_TOKEN] = token
+                    self._pending[CONF_SSH_PASSWORD] = ssh_password
                     self.hass.config_entries.async_update_entry(
                         config_entry,
                         data=self._build_current_data(config_entry.data),
@@ -609,6 +612,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         "disable_scene_builder",
                         default=_opt("disable_scene_builder", DEFAULT_DISABLE_SCENE_BUILDER),
                     ): bool,
+                    vol.Optional(
+                        CONF_SSH_PASSWORD,
+                        default=_opt(CONF_SSH_PASSWORD, DEFAULT_SSH_PASSWORD),
+                    ): str,
                 }
             ),
             errors=errors,
