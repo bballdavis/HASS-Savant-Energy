@@ -534,8 +534,11 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             if not errors:
                 reprovision = user_input.pop("reprovision_ssh_key", False)
                 if reprovision:
-                    # Hand off to re-bootstrap step; carry current options forward
+                    # Hand off to re-bootstrap step; save current options for continuation
                     self._pending_options = user_input
+                    self._pending_host = self.config_entry.options.get(
+                        CONF_HOST, self.config_entry.data.get(CONF_HOST, "")
+                    )
                     return await self.async_step_reprovision_ssh()
                 return self.async_create_entry(title="", data=user_input)
 
@@ -607,19 +610,20 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             else:
                 from .ssh_helper import async_ssh_bootstrap
 
-                host = self.config_entry.options.get(
-                    CONF_HOST, self.config_entry.data.get(CONF_HOST, "")
-                )
-                private_key, token, error_key = await async_ssh_bootstrap(
-                    self.hass, host, DEFAULT_SSH_USERNAME, ssh_password
-                )
-                if error_key:
-                    errors[CONF_SSH_PASSWORD] = error_key
+                host = getattr(self, "_pending_host", "")
+                if not host:
+                    errors[CONF_SSH_PASSWORD] = "host_not_available"
                 else:
-                    options = getattr(self, "_pending_options", {})
-                    options[CONF_SSH_PRIVATE_KEY] = private_key
-                    options[CONF_INFLUX_TOKEN] = token
-                    return self.async_create_entry(title="", data=options)
+                    private_key, token, error_key = await async_ssh_bootstrap(
+                        self.hass, host, DEFAULT_SSH_USERNAME, ssh_password
+                    )
+                    if error_key:
+                        errors[CONF_SSH_PASSWORD] = error_key
+                    else:
+                        options = getattr(self, "_pending_options", {})
+                        options[CONF_SSH_PRIVATE_KEY] = private_key
+                        options[CONF_INFLUX_TOKEN] = token
+                        return self.async_create_entry(title="", data=options)
 
         return self.async_show_form(
             step_id="reprovision_ssh",

@@ -56,19 +56,27 @@ def _ssh_bootstrap_worker(
         client.connect(hostname=host, username=username, password=password, timeout=10)
 
         # Ensure .ssh dir exists and has correct perms
-        client.exec_command("mkdir -p /data/RPM/.ssh && chmod 700 /data/RPM/.ssh")
+        _, stdout, _ = client.exec_command("mkdir -p /data/RPM/.ssh && chmod 700 /data/RPM/.ssh")
+        stdout.channel.recv_exit_status()
 
-        # Append public key only if not already present
-        check_cmd = f"grep -qF '{public_key_line}' {_AUTH_KEYS_PATH} 2>/dev/null"
-        _, stdout, _ = client.exec_command(check_cmd)
-        stdout.channel.recv_exit_status()  # wait
-
-        append_cmd = (
-            f"grep -qF '{public_key_line}' {_AUTH_KEYS_PATH} 2>/dev/null || "
-            f"echo '{public_key_line}' >> {_AUTH_KEYS_PATH} && chmod 600 {_AUTH_KEYS_PATH}"
-        )
-        _, _, stderr = client.exec_command(append_cmd)
-        stderr.channel.recv_exit_status()
+        # Append public key idempotently using a Python one-liner to avoid shell quoting issues
+        python_cmd = f"""python3 << 'PYEOF'
+key_line = {repr(public_key_line)}
+auth_path = {repr(_AUTH_KEYS_PATH)}
+try:
+    with open(auth_path, 'r') as f:
+        content = f.read()
+    if key_line not in content:
+        with open(auth_path, 'a') as f:
+            f.write(key_line + '\\n')
+        import os
+        os.chmod(auth_path, 0o600)
+except Exception:
+    pass
+PYEOF
+"""
+        _, stdout, _ = client.exec_command(python_cmd)
+        stdout.channel.recv_exit_status()
 
         # Read the influx token
         _, stdout, _ = client.exec_command(f"cat {_TOKEN_PATH}")
