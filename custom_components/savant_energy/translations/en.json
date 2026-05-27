@@ -19,7 +19,25 @@
           "disable_scene_builder": "Disable Scene Builder"
         },
         "description": "Configure advanced options. Ports typically remain on defaults."
+      },
+      "reprovision_ssh": {
+        "title": "Re-provision SSH Key",
+        "data": {
+          "ssh_password": "RPM User Password"
+        },
+        "data_description": {
+          "ssh_password": "Password for the 'RPM' user account on the Savant host. A new SSH key will be generated and the latest Influx token will be fetched."
+        },
+        "description": "Enter the RPM user password to generate a new SSH key and refresh the Influx token."
       }
+    },
+    "error": {
+      "required": "This field is required.",
+      "keygen_failed": "Failed to generate an SSH key pair. Check that the cryptography library is installed.",
+      "ssh_unavailable": "The paramiko library is not installed. SSH token fetch is unavailable — paste the token manually instead.",
+      "ssh_token_empty": "SSH connection succeeded but the token file was empty or not found. Verify the host is running rpm-energy ≥11.2.",
+      "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password.",
+      "host_not_available": "No host IP is configured. Go back and set a Host IP before re-provisioning."
     }
   },
   "config": {
@@ -166,6 +184,7 @@
     "error": {
       "invalid_address": "Please enter a valid IP address.",
       "required": "This field is required.",
+      "keygen_failed": "Failed to generate an SSH key pair. Check that the cryptography library is installed.",
       "ssh_unavailable": "The paramiko library is not installed. SSH token fetch is unavailable — paste the token manually instead.",
       "ssh_token_empty": "SSH connection succeeded but the token file was empty or not found. Verify the host is running rpm-energy ≥11.2.",
       "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password."

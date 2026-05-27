@@ -156,7 +156,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             return "192.168.1.14"
 
     def _adjust_interval(self, success: bool) -> None:
-        """Back off on failure (capped at 30 s); restore on success."""
+        """Back off on failure (capped at 300 s); restore on success."""
         if success:
             self.consecutive_failures = 0
             next_seconds = self.base_scan_interval_seconds
@@ -164,7 +164,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             self.consecutive_failures += 1
             next_seconds = min(
                 self.base_scan_interval_seconds * (2 ** (self.consecutive_failures - 1)),
-                30,
+                300,
             )
 
         next_interval = timedelta(seconds=next_seconds)
