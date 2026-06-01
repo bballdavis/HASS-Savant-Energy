@@ -87,7 +87,7 @@
           "influx_token": "Influx Read Token"
         },
         "data_description": {
-          "influx_token": "Paste the InfluxDB read token from your Savant host. You can find it at: /home/RPM/.remote/rpm_modules/rpm-energy/current/influxdb/read.token"
+          "influx_token": "Paste the InfluxDB read token from your Savant host. You can find it at: /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken"
         },
         "description": "Paste the InfluxDB read token from your Savant host."
       },
@@ -166,7 +166,7 @@
           "influx_token": "Influx Read Token"
         },
         "data_description": {
-          "influx_token": "Paste the InfluxDB read token from your Savant host. Found at: /home/RPM/.remote/rpm_modules/rpm-energy/current/influxdb/read.token"
+          "influx_token": "Paste the InfluxDB read token from your Savant host. Found at: /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken"
         },
         "description": "Paste the InfluxDB read token from your Savant host."
       },

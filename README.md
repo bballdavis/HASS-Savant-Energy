@@ -98,7 +98,13 @@ During setup, choose **"Retrieve token via SSH"**. The integration will SSH into
 If you'd rather SSH in on your own terms, that's completely fine. Log in as `RPM` and the token can be extracted with:
 
 ```bash
-influx auth list --json 2>/dev/null | python3 -c "import sys,json; auths=json.load(sys.stdin); print(next(a['token'] for a in auths if 'read' in [p['action'] for p in a.get('permissions',[])]))"
+cat /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken
+```
+
+If that file is empty or missing, your host may use a different package layout. As a fallback, try the Influx CLI command below (using `nocorrect` avoids zsh autocorrect prompts on hosts where only `influxd` is present):
+
+```bash
+nocorrect influx auth list --json | python3 -c "import sys,json; auths=json.load(sys.stdin); print(next(a['token'] for a in auths if 'read' in [p['action'] for p in a.get('permissions',[])]))"
 ```
 
 Or use the discovery tool (see below) which automates this and caches the token locally.
