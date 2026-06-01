@@ -21,6 +21,8 @@ _LOGGER = logging.getLogger(__name__)
 _MWH_TO_KWH = 1_000_000.0
 _ENERGY_SCALE_CANDIDATES = (1_000.0, 1_000_000.0, 1_000_000_000.0)
 _DEFAULT_ENERGY_DIVISOR = _MWH_TO_KWH
+_SCALE_LEARN_MIN_POWER_W = 300.0
+_SCALE_LEARN_MIN_EXPECTED_DELTA_KWH = 0.001
 
 # Flux query: fetch last reading for every circuit — relay-controlled and CT-only.
 # We filter on savantUUID being present rather than a specific type code so that
@@ -203,7 +205,10 @@ def _resolve_energy_scale(
     if isinstance(last_raw, (int, float)) and raw_energy >= float(last_raw):
         raw_delta = raw_energy - float(last_raw)
         measured_delta = raw_delta / current_divisor
-        if expected_delta >= 1e-6:
+        if (
+            expected_delta >= _SCALE_LEARN_MIN_EXPECTED_DELTA_KWH
+            and power_w >= _SCALE_LEARN_MIN_POWER_W
+        ):
             for divisor in _ENERGY_SCALE_CANDIDATES:
                 candidate_delta = raw_delta / divisor
                 candidate_errors[divisor] = abs(candidate_delta - expected_delta) / expected_delta
@@ -222,7 +227,7 @@ def _resolve_energy_scale(
         if ordered_votes:
             top_divisor, top_votes = ordered_votes[0]
             second_votes = ordered_votes[1][1] if len(ordered_votes) > 1 else 0
-            if top_votes >= 3 and (top_votes - second_votes) >= 2:
+            if top_votes >= 2 and (top_votes - second_votes) >= 1:
                 if top_divisor != current_divisor:
                     _LOGGER.warning(
                         "Energy scale selected for %s: divisor %.0f -> %.0f",
@@ -331,7 +336,11 @@ async def fetch_influx_snapshot(
         if field:
             by_uuid[uuid][field] = _safe_float(raw_value)
 
-    scale_state = scale_state or {}
+    if scale_state is None:
+        scale_state = {}
+
+    # Fetch SEM relay map early so we can classify circuits before any scaling decisions.
+    sem_ok, relay_uids = await fetch_relay_uids_from_sem(sem_host=sem_host, sem_port=sem_port)
 
     present_demands: list[dict[str, Any]] = []
     for uuid, circuit in by_uuid.items():
@@ -352,13 +361,48 @@ async def fetch_influx_snapshot(
         raw_energy = _safe_float(circuit.get("energy"))
         pct_commanded = _safe_float(circuit.get("percentCommanded"))
         flags = int(_safe_float(circuit.get("flags")))
-        energy_kwh, energy_diag = _resolve_energy_scale(
-            uuid,
-            raw_energy,
-            power_w,
-            sample_seconds,
-            scale_state,
+
+        matched_uid = _match_relay_uid(circuit.get("name", ""), relay_uids)
+        is_ct_tagged = _is_ct_from_tags(
+            str(circuit.get("classification", "")),
+            str(circuit.get("type", "")),
         )
+
+        if matched_uid:
+            role = "relay"
+            relay_uid = matched_uid
+        elif sem_ok:
+            # SEM reachable but no relay mapping: treat as CT/read-only circuit.
+            role = "ct_sensor"
+            relay_uid = None
+        elif is_ct_tagged:
+            role = "ct_sensor"
+            relay_uid = None
+        else:
+            # SEM unavailable fallback: preserve historical relay behavior.
+            role = "relay"
+            relay_uid = str(uuid) or None
+
+        if role == "ct_sensor":
+            energy_kwh, energy_diag = _resolve_energy_scale(
+                uuid,
+                raw_energy,
+                power_w,
+                sample_seconds,
+                scale_state,
+            )
+        else:
+            # Relay circuits keep the known-good fixed conversion path.
+            scale_state.pop(uuid, None)
+            fixed_divisor = _DEFAULT_ENERGY_DIVISOR
+            energy_kwh = raw_energy / fixed_divisor
+            energy_diag = {
+                "energy_scale_divisor": int(fixed_divisor),
+                "energy_scale_confidence": 1.0,
+                "energy_scale_status": "fixed_relay",
+                "expected_delta_last_kwh": None,
+                "measured_delta_last_kwh": None,
+            }
 
         # Infer relay capacity from measured voltage.
         # 240 V nominal circuits → 7.2 kW (30 A); 120 V → 2.4 kW (20 A).
@@ -373,6 +417,9 @@ async def fetch_influx_snapshot(
                 "channel": circuit.get("channel", ""),
                 "classification": circuit.get("classification", ""),
                 "type": circuit.get("type", ""),
+                "role": role,
+                "relay_uid": relay_uid,
+                "has_relay": role == "relay",
                 # State
                 "dimmable": circuit.get("dimmable", False),
                 "override": circuit.get("override", False),
@@ -422,35 +469,11 @@ async def fetch_influx_snapshot(
         ),
     )
 
-    # --- Fetch relay UIDs from SEM and merge into presentDemands ---
-    # Relay role is authoritative when SEM mapping is available. For compatibility,
-    # unclassified circuits continue to behave as relay-backed unless tags clearly
-    # identify them as CT/read-only.
-    sem_ok, relay_uids = await fetch_relay_uids_from_sem(sem_host=sem_host, sem_port=sem_port)
+    # --- Finalize relay mapping metadata for logging/consistency ---
     for circuit in present_demands:
-        matched_uid = _match_relay_uid(circuit.get("name", ""), relay_uids)
+        matched_uid = circuit.get("relay_uid")
         if matched_uid:
             _LOGGER.debug("Mapped circuit '%s' to relay UID %s", circuit["name"], matched_uid)
-
-        is_ct_tagged = _is_ct_from_tags(
-            str(circuit.get("classification", "")),
-            str(circuit.get("type", "")),
-        )
-
-        if matched_uid:
-            role = "relay"
-            relay_uid = matched_uid
-        elif is_ct_tagged:
-            role = "ct_sensor"
-            relay_uid = None
-        else:
-            role = "relay"
-            relay_uid = str(circuit.get("uid", "")) or None
-
-        circuit["role"] = role
-        circuit["relay_uid"] = relay_uid
-        # Compatibility flag used by existing entity setup logic.
-        circuit["has_relay"] = role == "relay"
 
     # --- Assign legacy_uid for entity identity preservation ---
     # Group relay-controlled circuits by relay_uid, sort by channel, assign a
