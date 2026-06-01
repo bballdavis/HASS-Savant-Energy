@@ -36,6 +36,7 @@ from .const import (
     MODE_AUTO,
     DEFAULT_PORT,
     DEFAULT_OLA_PORT,
+    DEFAULT_SEM_COMPANION_PORT,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_INFLUX_URL,
     DEFAULT_INFLUX_ORG,
@@ -99,17 +100,28 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.cached_present_demands: list = []
         self.last_fetch_error: dict | None = None
         self._legacy_feed_notification_key: tuple[str | None, str | None] | None = None
+        self.energy_scale_state: dict[str, dict] = {}
 
         self.ssh_private_key = entry.options.get(
             CONF_SSH_PRIVATE_KEY, entry.data.get(CONF_SSH_PRIVATE_KEY, "")
         )
         self._token_refresh_in_progress = False
 
+        self.sem_host = os.getenv("SAVANT_SEM_HOST", self.address or "192.168.1.108")
+        try:
+            self.sem_companion_port = int(
+                os.getenv("SAVANT_SEM_COMPANION_PORT", str(DEFAULT_SEM_COMPANION_PORT))
+            )
+        except ValueError:
+            self.sem_companion_port = DEFAULT_SEM_COMPANION_PORT
+
         self.relay_controller: SavantRelayController | None = None
         if self.mode == MODE_CURRENT:
             # Relay control only applies to current mode.
-            sem_host = os.getenv("SAVANT_SEM_HOST", self.address or "192.168.1.108")
-            self.relay_controller = SavantRelayController(sem_host=sem_host, sem_port=DEFAULT_PORT)
+            self.relay_controller = SavantRelayController(
+                sem_host=self.sem_host,
+                sem_port=DEFAULT_PORT,
+            )
 
     async def _async_refresh_influx_token(self) -> bool:
         """SSH to the Savant host using the stored Ed25519 key and update the token.
@@ -187,7 +199,13 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         now = datetime.now()
 
         result = await fetch_influx_snapshot(
-            self.influx_url, self.influx_token, self.influx_org
+            self.influx_url,
+            self.influx_token,
+            self.influx_org,
+            sem_host=self.sem_host,
+            sem_port=self.sem_companion_port,
+            scale_state=self.energy_scale_state,
+            sample_seconds=float(self.update_interval.total_seconds()),
         )
 
         if not result.success or result.data is None:
@@ -199,7 +217,13 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 refreshed = await self._async_refresh_influx_token()
                 if refreshed:
                     result = await fetch_influx_snapshot(
-                        self.influx_url, self.influx_token, self.influx_org
+                        self.influx_url,
+                        self.influx_token,
+                        self.influx_org,
+                        sem_host=self.sem_host,
+                        sem_port=self.sem_companion_port,
+                        scale_state=self.energy_scale_state,
+                        sample_seconds=float(self.update_interval.total_seconds()),
                     )
 
             if not result.success or result.data is None:

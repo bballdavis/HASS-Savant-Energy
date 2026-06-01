@@ -32,7 +32,12 @@ def _device_info(device: dict, dmx_uid: str) -> DeviceInfo:
         name=device["name"],
         serial_number=dmx_uid,
         manufacturer=MANUFACTURER,
-        model=get_device_model(device.get("capacity", 0)),
+        model=get_device_model(
+            device.get("capacity", 0),
+            role=device.get("role"),
+            classification=device.get("classification"),
+            device_type=device.get("type"),
+        ),
     )
 
 
@@ -140,6 +145,17 @@ class EnergyDeviceSensor(CoordinatorEntity, SensorEntity):
         if device:
             return _device_info(device, self._dmx_uid)
         return _device_info(self._device, self._dmx_uid)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, float | int | str | None]:
+        device = self._find_device() or self._device
+        return {
+            "energy_scale_divisor": device.get("energy_scale_divisor"),
+            "energy_scale_confidence": device.get("energy_scale_confidence"),
+            "energy_scale_status": device.get("energy_scale_status"),
+            "expected_delta_last_kwh": device.get("expected_delta_last_kwh"),
+            "measured_delta_last_kwh": device.get("measured_delta_last_kwh"),
+        }
 
 
 class IndividualLoadEnergySensor(CoordinatorEntity, SensorEntity):

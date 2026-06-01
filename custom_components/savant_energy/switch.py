@@ -33,6 +33,14 @@ from .relay_control import SavantRelayController
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _is_relay_device(device: dict) -> bool:
+    """Return True only for devices explicitly classified as relay-backed."""
+    role = str(device.get("role", "")).strip().lower()
+    if role:
+        return role == "relay"
+    return device.get("has_relay") is True
+
 async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entities):
     """
     Set up Savant Energy switch entities.
@@ -58,7 +66,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
                 len(snapshot_data["presentDemands"]),
             )
             for device in snapshot_data["presentDemands"]:
-                if not device.get("has_relay", True):
+                if not _is_relay_device(device):
                     _LOGGER.debug(
                         "Skipping switch for CT-monitored device (no relay): %s",
                         device.get("name", device.get("uid")),
@@ -100,7 +108,10 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             name=device["name"],
             manufacturer=MANUFACTURER,
             model=get_device_model(
-                device.get("capacity", 0)
+                device.get("capacity", 0),
+                role=device.get("role"),
+                classification=device.get("classification"),
+                device_type=device.get("type"),
             ),
             serial_number=self._dmx_uid,
         )

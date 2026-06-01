@@ -8,6 +8,7 @@ import asyncio
 import csv
 import io
 import logging
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -18,6 +19,8 @@ _LOGGER = logging.getLogger(__name__)
 
 # InfluxDB stores per-circuit energy in mWh; HASS energy dashboard uses kWh.
 _MWH_TO_KWH = 1_000_000.0
+_ENERGY_SCALE_CANDIDATES = (1_000.0, 1_000_000.0, 1_000_000_000.0)
+_DEFAULT_ENERGY_DIVISOR = _MWH_TO_KWH
 
 # Flux query: fetch last reading for every circuit — relay-controlled and CT-only.
 # We filter on savantUUID being present rather than a specific type code so that
@@ -132,10 +135,129 @@ def _safe_bool(value: Any) -> bool:
     return str(value).strip().lower() not in ("false", "0", "")
 
 
+def _normalize_name(value: str) -> str:
+    """Normalize names for robust relay matching."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", (value or "").lower())).strip()
+
+
+def _is_ct_from_tags(classification: str, device_type: str) -> bool:
+    """Infer whether a circuit is CT-monitored from Influx metadata tags."""
+    text = f"{classification or ''} {device_type or ''}".lower()
+    ct_tokens = (
+        "ct",
+        "current transformer",
+        "current_transformer",
+        "sensor",
+        "read only",
+        "readonly",
+        "meter",
+    )
+    return any(token in text for token in ct_tokens)
+
+
+def _match_relay_uid(circuit_name: str, relay_uids: dict[str, str]) -> str | None:
+    """Match a circuit name to a relay UID with exact-first then bounded fallback."""
+    normalized_circuit = _normalize_name(circuit_name)
+    if not normalized_circuit:
+        return None
+
+    normalized_map: dict[str, str] = {}
+    for relay_name, relay_uid in relay_uids.items():
+        norm = _normalize_name(relay_name)
+        if norm and norm not in normalized_map:
+            normalized_map[norm] = relay_uid
+
+    direct = normalized_map.get(normalized_circuit)
+    if direct:
+        return direct
+
+    for relay_name, relay_uid in normalized_map.items():
+        shorter = min(len(relay_name), len(normalized_circuit))
+        if shorter < 5:
+            continue
+        if relay_name in normalized_circuit or normalized_circuit in relay_name:
+            return relay_uid
+    return None
+
+
+def _resolve_energy_scale(
+    uid: str,
+    raw_energy: float,
+    power_w: float,
+    sample_seconds: float,
+    scale_state: dict[str, dict[str, Any]],
+) -> tuple[float, dict[str, Any]]:
+    """Resolve per-circuit energy scaling using power-based delta plausibility."""
+    state = scale_state.setdefault(uid, {})
+    current_divisor = float(state.get("divisor", _DEFAULT_ENERGY_DIVISOR))
+    votes = state.get("votes")
+    if not isinstance(votes, dict):
+        votes = {str(int(current_divisor)): 1}
+        state["votes"] = votes
+
+    expected_delta = max(power_w, 0.0) * max(sample_seconds, 1.0) / 3_600_000.0
+    last_raw = state.get("last_raw")
+
+    measured_delta = None
+    candidate_errors: dict[float, float] = {}
+    if isinstance(last_raw, (int, float)) and raw_energy >= float(last_raw):
+        raw_delta = raw_energy - float(last_raw)
+        measured_delta = raw_delta / current_divisor
+        if expected_delta >= 1e-6:
+            for divisor in _ENERGY_SCALE_CANDIDATES:
+                candidate_delta = raw_delta / divisor
+                candidate_errors[divisor] = abs(candidate_delta - expected_delta) / expected_delta
+
+    if candidate_errors:
+        best_divisor = min(candidate_errors, key=candidate_errors.get)
+        votes_key = str(int(best_divisor))
+        votes[votes_key] = min(int(votes.get(votes_key, 0)) + 1, 20)
+
+        # Choose a new divisor only after repeated consistent observations.
+        ordered_votes = sorted(
+            ((float(key), int(value)) for key, value in votes.items()),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        if ordered_votes:
+            top_divisor, top_votes = ordered_votes[0]
+            second_votes = ordered_votes[1][1] if len(ordered_votes) > 1 else 0
+            if top_votes >= 3 and (top_votes - second_votes) >= 2:
+                if top_divisor != current_divisor:
+                    _LOGGER.warning(
+                        "Energy scale selected for %s: divisor %.0f -> %.0f",
+                        uid,
+                        current_divisor,
+                        top_divisor,
+                    )
+                current_divisor = top_divisor
+
+    state["last_raw"] = raw_energy
+    state["divisor"] = current_divisor
+
+    divisor_votes = int(votes.get(str(int(current_divisor)), 0))
+    confidence = min(divisor_votes / 6.0, 1.0)
+    status = "locked" if confidence >= 0.7 else "learning"
+
+    energy_kwh = raw_energy / current_divisor
+    diagnostics = {
+        "energy_scale_divisor": int(current_divisor),
+        "energy_scale_confidence": round(confidence, 3),
+        "energy_scale_status": status,
+        "expected_delta_last_kwh": round(expected_delta, 6),
+        "measured_delta_last_kwh": round(measured_delta, 6) if measured_delta is not None else None,
+    }
+    return energy_kwh, diagnostics
+
+
 async def fetch_influx_snapshot(
     influx_url: str,
     influx_token: str,
     influx_org: str,
+    sem_host: str = "192.168.1.108",
+    sem_port: int = 8644,
+    scale_state: dict[str, dict[str, Any]] | None = None,
+    sample_seconds: float = 5.0,
 ) -> InfluxFetchResult:
     """Fetch the latest circuit and system data from InfluxDB.
 
@@ -209,6 +331,8 @@ async def fetch_influx_snapshot(
         if field:
             by_uuid[uuid][field] = _safe_float(raw_value)
 
+    scale_state = scale_state or {}
+
     present_demands: list[dict[str, Any]] = []
     for uuid, circuit in by_uuid.items():
         # --- A/B device handling ---
@@ -225,9 +349,16 @@ async def fetch_influx_snapshot(
         power_w = _safe_float(circuit.get("power"))
         voltage_v = _safe_float(circuit.get("voltage"))
         current_a = _safe_float(circuit.get("current"))
-        energy_kwh = _safe_float(circuit.get("energy")) / _MWH_TO_KWH
+        raw_energy = _safe_float(circuit.get("energy"))
         pct_commanded = _safe_float(circuit.get("percentCommanded"))
         flags = int(_safe_float(circuit.get("flags")))
+        energy_kwh, energy_diag = _resolve_energy_scale(
+            uuid,
+            raw_energy,
+            power_w,
+            sample_seconds,
+            scale_state,
+        )
 
         # Infer relay capacity from measured voltage.
         # 240 V nominal circuits → 7.2 kW (30 A); 120 V → 2.4 kW (20 A).
@@ -241,6 +372,7 @@ async def fetch_influx_snapshot(
                 "name": circuit.get("name", f"Circuit {circuit.get('channel', uuid)}"),
                 "channel": circuit.get("channel", ""),
                 "classification": circuit.get("classification", ""),
+                "type": circuit.get("type", ""),
                 # State
                 "dimmable": circuit.get("dimmable", False),
                 "override": circuit.get("override", False),
@@ -251,6 +383,12 @@ async def fetch_influx_snapshot(
                 "current": current_a,
                 "voltage": voltage_v,
                 "energy": energy_kwh,   # kWh (converted from mWh)
+                "energy_raw": raw_energy,
+                "energy_scale_divisor": energy_diag["energy_scale_divisor"],
+                "energy_scale_confidence": energy_diag["energy_scale_confidence"],
+                "energy_scale_status": energy_diag["energy_scale_status"],
+                "expected_delta_last_kwh": energy_diag["expected_delta_last_kwh"],
+                "measured_delta_last_kwh": energy_diag["measured_delta_last_kwh"],
                 # Device metadata
                 "capacity": capacity,
             }
@@ -285,27 +423,34 @@ async def fetch_influx_snapshot(
     )
 
     # --- Fetch relay UIDs from SEM and merge into presentDemands ---
-    # has_relay is authoritative only when the SEM API is reachable.
-    # If it's unreachable we fall back to True for all so the integration
-    # keeps working during a transient outage.
-    sem_ok, relay_uids = await fetch_relay_uids_from_sem()
+    # Relay role is authoritative when SEM mapping is available. For compatibility,
+    # unclassified circuits continue to behave as relay-backed unless tags clearly
+    # identify them as CT/read-only.
+    sem_ok, relay_uids = await fetch_relay_uids_from_sem(sem_host=sem_host, sem_port=sem_port)
     for circuit in present_demands:
-        circuit_name = circuit.get("name", "").lower()
-        matched_uid: str | None = None
-        for relay_name, relay_uid in relay_uids.items():
-            if relay_name in circuit_name or circuit_name in relay_name:
-                matched_uid = relay_uid
-                _LOGGER.debug("Mapped circuit '%s' to relay UID %s", circuit["name"], relay_uid)
-                break
+        matched_uid = _match_relay_uid(circuit.get("name", ""), relay_uids)
+        if matched_uid:
+            _LOGGER.debug("Mapped circuit '%s' to relay UID %s", circuit["name"], matched_uid)
 
-        if sem_ok:
-            # API reachable: only circuits the SEM knows about have a real relay
-            circuit["relay_uid"] = matched_uid
-            circuit["has_relay"] = matched_uid is not None
+        is_ct_tagged = _is_ct_from_tags(
+            str(circuit.get("classification", "")),
+            str(circuit.get("type", "")),
+        )
+
+        if matched_uid:
+            role = "relay"
+            relay_uid = matched_uid
+        elif is_ct_tagged:
+            role = "ct_sensor"
+            relay_uid = None
         else:
-            # API unreachable: optimistically assume relay so commands still work
-            circuit["relay_uid"] = matched_uid or circuit.get("uid")
-            circuit["has_relay"] = True
+            role = "relay"
+            relay_uid = str(circuit.get("uid", "")) or None
+
+        circuit["role"] = role
+        circuit["relay_uid"] = relay_uid
+        # Compatibility flag used by existing entity setup logic.
+        circuit["has_relay"] = role == "relay"
 
     # --- Assign legacy_uid for entity identity preservation ---
     # Group relay-controlled circuits by relay_uid, sort by channel, assign a

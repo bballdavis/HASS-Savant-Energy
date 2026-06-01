@@ -49,7 +49,12 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
             name=device["name"],
             serial_number=dmx_uid,
             manufacturer=MANUFACTURER,
-            model=get_device_model(device.get("capacity", 0)),
+            model=get_device_model(
+                device.get("capacity", 0),
+                role=device.get("role"),
+                classification=device.get("classification"),
+                device_type=device.get("type"),
+            ),
         )
         self._attr_extra_state_attributes = {"uid": device["uid"], "dmx_uid": dmx_uid}
         self._slug_name = slugify(device["name"])
@@ -98,7 +103,12 @@ class DMXAddressSensor(CoordinatorEntity, RestoreSensor):
             name=device_name,
             serial_number=self._dmx_uid,
             manufacturer=MANUFACTURER,
-            model=get_device_model(self._device.get("capacity", 0)),
+            model=get_device_model(
+                self._device.get("capacity", 0),
+                role=self._device.get("role"),
+                classification=self._device.get("classification"),
+                device_type=self._device.get("type"),
+            ),
         )
 
     async def async_added_to_hass(self):
