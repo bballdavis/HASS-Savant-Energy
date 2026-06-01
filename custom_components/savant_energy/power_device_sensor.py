@@ -54,6 +54,8 @@ class EnergyDeviceSensor(CoordinatorEntity, SensorEntity):
         self._attr_unique_id = unique_id
         self._attr_device_info = _device_info(device, dmx_uid)
         self._attr_native_unit_of_measurement = _unit_for(sensor_type)
+        if sensor_type == "current":
+            self._attr_suggested_display_precision = 1
         self._dmx_uid = dmx_uid
         self._slug_name = slugify(device["name"])
 
@@ -171,7 +173,7 @@ class IndividualLoadEnergySensor(CoordinatorEntity, SensorEntity):
     _attr_icon = "mdi:lightning-bolt-circle"
     _attr_native_unit_of_measurement = "kWh"
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
-    _attr_suggested_display_precision = 3
+    _attr_suggested_display_precision = 0
 
     def __init__(self, coordinator, device: dict, unique_id: str, dmx_uid: str):
         super().__init__(coordinator)
