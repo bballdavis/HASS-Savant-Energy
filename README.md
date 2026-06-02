@@ -87,7 +87,9 @@ InfluxDB uses a token-based auth model, and Savant stores a read token on the ho
 
 ### Option A - Let the integration grab it automatically (SSH)
 
-During setup, choose **"Retrieve token via SSH"**. The integration will SSH into the Savant host as the `RPM` user, read the token from its known location, and hand it straight to the integration config. Your SSH password is used only for that single operation and is never stored anywhere - it's held ephemerally in memory just long enough to make the connection, grab the token, and discard it. The stored credential is the InfluxDB token itself, not your password.
+During setup, choose **"Retrieve token via SSH"**. The integration will SSH into the Savant host as the `RPM` user, read the token from its known location, and hand it straight to the integration config. Your SSH password is used only for that bootstrap operation and is never stored anywhere - it's held ephemerally in memory just long enough to make the connection, install the SSH key, grab the token, and discard it. The stored credentials are the generated SSH private key and the InfluxDB token, both managed by Home Assistant's encrypted config storage.
+
+That SSH key is not just for first setup. If InfluxDB later rejects the token with an auth failure, the integration uses the stored key to fetch a fresh token automatically, so normal token rotation or host restarts do not require re-entering the SSH password.
 
 **To find or set your SSH password:**
 - Try the default: **`RPM`**

@@ -154,6 +154,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             self.hass.config_entries.async_update_entry(
                 self.config_entry, options=updated_options
             )
+            self._adjust_interval(success=True)
             return True
         finally:
             self._token_refresh_in_progress = False
@@ -209,11 +210,13 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         )
 
         if not result.success or result.data is None:
-            # If the failure looks like a 401, try to auto-refresh the token via SSH
-            # and immediately retry once with the new token.
-            is_401 = result.error_message and "401" in result.error_message
-            if is_401:
-                _LOGGER.warning("InfluxDB returned 401 — attempting SSH token refresh")
+            # If the failure looks like an auth/token failure, try to auto-refresh
+            # the token via SSH and immediately retry once with the new token.
+            if result.auth_failure:
+                _LOGGER.warning(
+                    "InfluxDB auth failure (%s) — attempting SSH token refresh",
+                    result.error_type,
+                )
                 refreshed = await self._async_refresh_influx_token()
                 if refreshed:
                     result = await fetch_influx_snapshot(

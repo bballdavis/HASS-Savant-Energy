@@ -72,6 +72,8 @@ For current (>=11.2) operation:
 
 The relay command path and companion status path do not require JWT authentication in the validated workflow.
 
+The validated SSH bootstrap path also installs a reusable SSH key on the Savant host. That key is stored in Home Assistant config storage and is used later to recover from token-auth failures without asking the user for the SSH password again.
+
 ## Auto Setup Intent (Target Behavior)
 
 Auto mode should ask for PBC IP first, then:
@@ -81,12 +83,14 @@ Auto mode should ask for PBC IP first, then:
 3. If legacy feed is not available:
    - Show a second step requesting host IP and SSH password.
    - Use SSH workflow to retrieve InfluxDB token.
+    - Persist the generated SSH private key so later auth failures can refresh the token automatically.
    - Store current mode config and finish.
 
 ## Upgrade Behavior Intent
 
 Existing installs should remain in legacy mode by default after upgrade.
 Users can run a reconfigure/upgrade flow to switch to current mode by adding host IP and obtaining Influx token.
+If the token later becomes invalid, the current-mode coordinator will try a key-based refresh before falling back to manual reconfigure.
 
 ## Notes for Implementation
 
@@ -94,5 +98,5 @@ Users can run a reconfigure/upgrade flow to switch to current mode by adding hos
 - Ask only for:
   - PBC IP (legacy and current)
   - Host IP (current only)
-  - SSH password (auto/current onboarding only when token retrieval is needed)
+  - SSH password (bootstrap only when token retrieval is needed)
 - Keep localization-first labels and descriptions for all new flow steps.
