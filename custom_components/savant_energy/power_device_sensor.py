@@ -157,6 +157,10 @@ class EnergyDeviceSensor(CoordinatorEntity, SensorEntity):
             "energy_scale_status": device.get("energy_scale_status"),
             "expected_delta_last_kwh": device.get("expected_delta_last_kwh"),
             "measured_delta_last_kwh": device.get("measured_delta_last_kwh"),
+            "energy_guard_applied": device.get("energy_guard_applied"),
+            "energy_guard_reason": device.get("energy_guard_reason"),
+            "energy_guard_blocked_samples": device.get("energy_guard_blocked_samples"),
+            "energy_role_source": device.get("energy_role_source"),
         }
 
 
