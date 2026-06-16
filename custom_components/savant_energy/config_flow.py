@@ -111,6 +111,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Build entry data for current mode, preserving existing non-option values."""
         current = dict(base or {})
         host_ip = self._pending[CONF_HOST]
+        current_url = current.get(CONF_INFLUX_URL)
+        current_host = current.get(CONF_HOST, "")
+        derived_current_url = _derive_influx_url(current_host) if current_host else ""
+        influx_url = (
+            current_url
+            if current_url and current_url != derived_current_url
+            else _derive_influx_url(host_ip)
+        )
         return {
             CONF_OLA_PORT: current.get(CONF_OLA_PORT, DEFAULT_OLA_PORT),
             CONF_SCAN_INTERVAL: current.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
@@ -124,7 +132,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_INFLUX_AUTH_METHOD,
                 current.get(CONF_INFLUX_AUTH_METHOD, DEFAULT_INFLUX_AUTH_METHOD),
             ),
-            CONF_INFLUX_URL: _derive_influx_url(host_ip),
+            CONF_INFLUX_URL: influx_url,
             CONF_INFLUX_TOKEN: self._pending[CONF_INFLUX_TOKEN],
             CONF_INFLUX_ORG: self._pending.get(
                 CONF_INFLUX_ORG,
@@ -142,7 +150,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def _async_discover_pending_org(self) -> tuple[str | None, str | None]:
         """Resolve the best org for the currently pending host/token pair."""
         result = await async_discover_influx_org(
-            self._pending.get(CONF_INFLUX_URL, _derive_influx_url(self._pending[CONF_HOST])),
+            self._resolve_pending_influx_url(),
             self._pending[CONF_INFLUX_TOKEN],
         )
         if result.selected_org_id:
@@ -153,6 +161,19 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._remember_org_candidates(result.candidates)
             return None, "select"
         return None, result.error_key or "org_discovery_failed"
+
+    def _resolve_pending_influx_url(self) -> str:
+        """Return the best URL for discovery and persistence."""
+        entry = self._get_reconfigure_entry() if self.context.get("entry_id") else None
+        base = entry.data if entry else {}
+        current = dict(base or {})
+        host_ip = self._pending.get(CONF_HOST, current.get(CONF_HOST, ""))
+        current_url = current.get(CONF_INFLUX_URL)
+        current_host = current.get(CONF_HOST, "")
+        derived_current_url = _derive_influx_url(current_host) if current_host else ""
+        if current_url and current_url != derived_current_url:
+            return current_url
+        return _derive_influx_url(host_ip)
 
     async def _async_finish_current_setup(self):
         """Create the new current-mode entry from pending values."""
@@ -221,7 +242,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 self._pending[CONF_ADDRESS] = pbc_ip
                 self._pending[CONF_HOST] = host_ip
-                self._pending[CONF_INFLUX_URL] = _derive_influx_url(host_ip)
                 return await self.async_step_current_auth()
 
         return self.async_show_form(
@@ -367,7 +387,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors[CONF_HOST] = "invalid_address"
             else:
                 self._pending[CONF_HOST] = host_ip
-                self._pending[CONF_INFLUX_URL] = _derive_influx_url(host_ip)
                 return await self.async_step_current_auth()
 
         return self.async_show_form(
@@ -442,7 +461,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 self._pending[CONF_ADDRESS] = pbc_ip
                 self._pending[CONF_HOST] = host_ip
-                self._pending[CONF_INFLUX_URL] = _derive_influx_url(host_ip)
                 return await self.async_step_reconfigure_auth()
 
         return self.async_show_form(

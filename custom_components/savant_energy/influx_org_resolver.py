@@ -14,9 +14,13 @@ _LOGGER = logging.getLogger(__name__)
 
 _EXPECTED_FIELDS = ("power", "current", "voltage", "energy")
 _PLAUSIBLE_FIELDS = ("power", "energy")
-_PROBE_QUERY = """\
+_PROBE_WINDOWS = ("-15m", "-24h", "-7d")
+
+
+def _probe_query(range_start: str) -> str:
+    return f"""\
 from(bucket: "localHub")
-  |> range(start: -15m)
+  |> range(start: {range_start})
   |> filter(fn: (r) => exists r.savantUUID and r.savantUUID != "")
   |> filter(fn: (r) =>
       r._field == "power" or r._field == "current" or r._field == "voltage" or
@@ -175,6 +179,7 @@ async def _probe_org(
     token: str,
     org_id: str,
     org_name: str,
+    range_start: str,
 ) -> InfluxOrgCandidate | None:
     url = f"{base_url.rstrip('/')}/api/v2/query"
     try:
@@ -186,7 +191,7 @@ async def _probe_org(
                 "Content-Type": "application/vnd.flux",
                 "Accept": "text/csv",
             },
-            data=_PROBE_QUERY,
+            data=_probe_query(range_start),
             timeout=aiohttp.ClientTimeout(total=10),
         ) as response:
             text = await response.text()
@@ -202,7 +207,13 @@ async def _probe_org(
             rows = _parse_influx_csv(text)
             return _build_candidate(org_id, org_name, rows)
     except (aiohttp.ClientError, TimeoutError) as exc:
-        _LOGGER.debug("Influx org probe error for %s (%s): %s", org_name, org_id, exc)
+        _LOGGER.debug(
+            "Influx org probe error for %s (%s, %s): %s",
+            org_name,
+            org_id,
+            range_start,
+            exc,
+        )
         return None
 
 
@@ -245,19 +256,26 @@ async def async_discover_influx_org(
                     )
 
             candidates: list[InfluxOrgCandidate] = []
-            for org in orgs:
-                org_id = str(org.get("id", "")).strip()
-                if not org_id:
-                    continue
-                candidate = await _probe_org(
-                    session,
-                    base_url,
-                    token,
-                    org_id,
-                    str(org.get("name", org_id)),
-                )
-                if candidate is not None:
-                    candidates.append(candidate)
+            org_list = [
+                (str(org.get("id", "")).strip(), str(org.get("name", org.get("id", "unknown"))))
+                for org in orgs
+                if str(org.get("id", "")).strip()
+            ]
+            for range_start in _PROBE_WINDOWS:
+                candidates = []
+                for org_id, org_name in org_list:
+                    candidate = await _probe_org(
+                        session,
+                        base_url,
+                        token,
+                        org_id,
+                        org_name,
+                        range_start,
+                    )
+                    if candidate is not None:
+                        candidates.append(candidate)
+                if candidates:
+                    break
     except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
         return InfluxOrgDiscoveryResult(
             error_key="org_discovery_failed",
@@ -265,6 +283,23 @@ async def async_discover_influx_org(
         )
 
     if not candidates:
+        if len(org_list) == 1:
+            org_id, org_name = org_list[0]
+            return InfluxOrgDiscoveryResult(
+                selected_org_id=org_id,
+                candidates=[
+                    InfluxOrgCandidate(
+                        org_id=org_id,
+                        org_name=org_name,
+                        circuit_count=0,
+                        field_names=(),
+                        total_power_w=0.0,
+                        last_seen=None,
+                        score=1,
+                        summary=f"{org_name} - no recent Savant rows, using the only available org",
+                    )
+                ],
+            )
         return InfluxOrgDiscoveryResult(
             error_key="org_discovery_no_data",
             error_message="No organizations matched the expected Savant data shape",
