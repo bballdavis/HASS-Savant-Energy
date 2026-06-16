@@ -23,6 +23,9 @@ _ENERGY_SCALE_CANDIDATES = (1_000.0, 1_000_000.0, 1_000_000_000.0)
 _DEFAULT_ENERGY_DIVISOR = _MWH_TO_KWH
 _SCALE_LEARN_MIN_POWER_W = 300.0
 _SCALE_LEARN_MIN_EXPECTED_DELTA_KWH = 0.001
+_CT_ENERGY_REASONABLE_MAX_KWH = 100_000.0
+_CT_ENERGY_GUARD_MIN_ABSOLUTE_JUMP_KWH = 0.25
+_CT_ENERGY_GUARD_DELTA_MULTIPLIER = 25.0
 
 # Flux query: fetch last reading for every circuit — relay-controlled and CT-only.
 # We filter on savantUUID being present rather than a specific type code so that
@@ -196,6 +199,95 @@ def _match_relay_uid(circuit_name: str, relay_uids: dict[str, str]) -> str | Non
     return None
 
 
+def _classify_circuit_role(
+    uid: str,
+    matched_uid: str | None,
+    sem_ok: bool,
+    is_ct_tagged: bool,
+    state: dict[str, Any],
+) -> tuple[str, str | None, str]:
+    """Classify a circuit role while preserving previously learned CT identity."""
+    if matched_uid:
+        state["stable_role"] = "relay"
+        return "relay", matched_uid, "matched_relay"
+
+    learned_divisor = float(state.get("divisor", _DEFAULT_ENERGY_DIVISOR))
+    sticky_ct = state.get("stable_role") == "ct_sensor" or learned_divisor != _DEFAULT_ENERGY_DIVISOR
+
+    if sem_ok:
+        state["stable_role"] = "ct_sensor"
+        return "ct_sensor", None, "sem_unmatched"
+
+    if is_ct_tagged:
+        state["stable_role"] = "ct_sensor"
+        return "ct_sensor", None, "ct_tags"
+
+    if sticky_ct:
+        return "ct_sensor", None, "sticky_ct"
+
+    state["stable_role"] = "relay"
+    return "relay", str(uid) or None, "sem_fallback_relay"
+
+
+def _guard_ct_energy_reading(
+    energy_kwh: float,
+    expected_delta_kwh: float,
+    state: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    """Hold the last published CT energy reading when a new sample is implausible."""
+    last_published = state.get("last_published_energy_kwh")
+    guard_reason = ""
+    guarded = False
+
+    if isinstance(last_published, (int, float)):
+        last_published = float(last_published)
+        max_allowed_jump = max(
+            _CT_ENERGY_GUARD_MIN_ABSOLUTE_JUMP_KWH,
+            max(expected_delta_kwh, 0.0) * _CT_ENERGY_GUARD_DELTA_MULTIPLIER,
+        )
+        jump_kwh = energy_kwh - last_published
+
+        if jump_kwh < 0:
+            energy_kwh = last_published
+            guard_reason = "decrease"
+            guarded = True
+        elif jump_kwh > max_allowed_jump:
+            energy_kwh = last_published
+            guard_reason = "jump"
+            guarded = True
+
+    if not guarded:
+        state["last_published_energy_kwh"] = energy_kwh
+        state["guard_blocked_samples"] = 0
+    else:
+        state["guard_blocked_samples"] = int(state.get("guard_blocked_samples", 0)) + 1
+
+    state["last_guard_reason"] = guard_reason
+
+    return energy_kwh, {
+        "energy_guard_applied": guarded,
+        "energy_guard_reason": guard_reason or None,
+        "energy_guard_blocked_samples": int(state.get("guard_blocked_samples", 0)),
+    }
+
+
+def _bootstrap_ct_divisor(raw_energy: float, current_divisor: float) -> float:
+    """Pick a safer starting CT divisor when the default yields absurd lifetime kWh."""
+    if current_divisor != _DEFAULT_ENERGY_DIVISOR:
+        return current_divisor
+
+    default_energy_kwh = raw_energy / _DEFAULT_ENERGY_DIVISOR
+    if default_energy_kwh <= _CT_ENERGY_REASONABLE_MAX_KWH:
+        return current_divisor
+
+    for divisor in reversed(_ENERGY_SCALE_CANDIDATES):
+        candidate_energy_kwh = raw_energy / divisor
+        if candidate_energy_kwh <= _CT_ENERGY_REASONABLE_MAX_KWH:
+            return divisor
+
+    return current_divisor
+
+
 def _resolve_energy_scale(
     uid: str,
     raw_energy: float,
@@ -206,10 +298,13 @@ def _resolve_energy_scale(
     """Resolve per-circuit energy scaling using power-based delta plausibility."""
     state = scale_state.setdefault(uid, {})
     current_divisor = float(state.get("divisor", _DEFAULT_ENERGY_DIVISOR))
+    current_divisor = _bootstrap_ct_divisor(raw_energy, current_divisor)
     votes = state.get("votes")
     if not isinstance(votes, dict):
         votes = {str(int(current_divisor)): 1}
         state["votes"] = votes
+    elif str(int(current_divisor)) not in votes:
+        votes[str(int(current_divisor))] = 1
 
     expected_delta = max(power_w, 0.0) * max(sample_seconds, 1.0) / 3_600_000.0
     last_raw = state.get("last_raw")
@@ -383,21 +478,14 @@ async def fetch_influx_snapshot(
             str(circuit.get("classification", "")),
             str(circuit.get("type", "")),
         )
-
-        if matched_uid:
-            role = "relay"
-            relay_uid = matched_uid
-        elif sem_ok:
-            # SEM reachable but no relay mapping: treat as CT/read-only circuit.
-            role = "ct_sensor"
-            relay_uid = None
-        elif is_ct_tagged:
-            role = "ct_sensor"
-            relay_uid = None
-        else:
-            # SEM unavailable fallback: preserve historical relay behavior.
-            role = "relay"
-            relay_uid = str(uuid) or None
+        state = scale_state.setdefault(uuid, {})
+        role, relay_uid, role_source = _classify_circuit_role(
+            uuid,
+            matched_uid,
+            sem_ok,
+            is_ct_tagged,
+            state,
+        )
 
         if role == "ct_sensor":
             energy_kwh, energy_diag = _resolve_energy_scale(
@@ -407,9 +495,14 @@ async def fetch_influx_snapshot(
                 sample_seconds,
                 scale_state,
             )
+            energy_kwh, guard_diag = _guard_ct_energy_reading(
+                energy_kwh,
+                float(energy_diag["expected_delta_last_kwh"] or 0.0),
+                state,
+            )
+            energy_diag.update(guard_diag)
         else:
             # Relay circuits keep the known-good fixed conversion path.
-            scale_state.pop(uuid, None)
             fixed_divisor = _DEFAULT_ENERGY_DIVISOR
             energy_kwh = raw_energy / fixed_divisor
             energy_diag = {
@@ -418,7 +511,13 @@ async def fetch_influx_snapshot(
                 "energy_scale_status": "fixed_relay",
                 "expected_delta_last_kwh": None,
                 "measured_delta_last_kwh": None,
+                "energy_guard_applied": False,
+                "energy_guard_reason": None,
+                "energy_guard_blocked_samples": 0,
             }
+            state["last_published_energy_kwh"] = energy_kwh
+
+        energy_diag["energy_role_source"] = role_source
 
         # Infer relay capacity from measured voltage.
         # 240 V nominal circuits → 7.2 kW (30 A); 120 V → 2.4 kW (20 A).
@@ -452,6 +551,10 @@ async def fetch_influx_snapshot(
                 "energy_scale_status": energy_diag["energy_scale_status"],
                 "expected_delta_last_kwh": energy_diag["expected_delta_last_kwh"],
                 "measured_delta_last_kwh": energy_diag["measured_delta_last_kwh"],
+                "energy_guard_applied": energy_diag["energy_guard_applied"],
+                "energy_guard_reason": energy_diag["energy_guard_reason"],
+                "energy_guard_blocked_samples": energy_diag["energy_guard_blocked_samples"],
+                "energy_role_source": energy_diag["energy_role_source"],
                 # Device metadata
                 "capacity": capacity,
             }
