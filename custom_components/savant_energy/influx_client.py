@@ -58,6 +58,7 @@ class InfluxFetchResult:
     error_type: Optional[str] = None
     error_message: Optional[str] = None
     auth_failure: bool = False
+    org_failure: bool = False
 
 
 def parse_uid(uid: str) -> tuple[str, str]:
@@ -98,8 +99,11 @@ async def _post_flux(
     token: str,
     org: str,
     query: str,
-) -> tuple[bool, str, str, bool]:
-    """POST a Flux query. Returns (success, body_text, error_message, auth_failure)."""
+) -> tuple[bool, str, str, bool, bool]:
+    """POST a Flux query.
+
+    Returns (success, body_text, error_message, auth_failure, org_failure).
+    """
     url = f"{base_url.rstrip('/')}/api/v2/query"
     try:
         async with session.post(
@@ -115,16 +119,25 @@ async def _post_flux(
         ) as resp:
             text = await resp.text()
             if resp.status == 401:
-                return False, "", "Unauthorized (401) — token is invalid or expired", True
+                return False, "", "Unauthorized (401) - token is invalid or expired", True, False
             if resp.status == 403:
-                return False, "", "Forbidden (403) — token lacks read permission", True
+                return False, "", "Forbidden (403) - token lacks read permission", True, False
             if resp.status != 200:
-                return False, "", f"HTTP {resp.status}: {text[:200]}", False
-            return True, text, "", False
+                lowered = text.lower()
+                org_failure = (
+                    resp.status == 400
+                    and (
+                        "orgid or org" in lowered
+                        or "organization not found" in lowered
+                        or "org not found" in lowered
+                    )
+                )
+                return False, "", f"HTTP {resp.status}: {text[:200]}", False, org_failure
+            return True, text, "", False, False
     except asyncio.TimeoutError:
-        return False, "", "InfluxDB query timed out after 10 s", False
+        return False, "", "InfluxDB query timed out after 10 s", False, False
     except aiohttp.ClientError as exc:
-        return False, "", f"Connection error: {exc}", False
+        return False, "", f"Connection error: {exc}", False, False
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -273,7 +286,7 @@ async def fetch_influx_snapshot(
     """
     try:
         async with aiohttp.ClientSession() as session:
-            ok, circuit_text, err, auth_failure = await _post_flux(
+            ok, circuit_text, err, auth_failure, org_failure = await _post_flux(
                 session, influx_url, influx_token, influx_org, _CIRCUIT_QUERY
             )
             if not ok:
@@ -282,10 +295,11 @@ async def fetch_influx_snapshot(
                     error_type="circuit_query_failed",
                     error_message=err,
                     auth_failure=auth_failure,
+                    org_failure=org_failure,
                 )
 
             # System query failure is non-fatal — degrade gracefully.
-            ok_sys, system_text, _, _ = await _post_flux(
+            ok_sys, system_text, _, _, _ = await _post_flux(
                 session, influx_url, influx_token, influx_org, _SYSTEM_QUERY
             )
     except Exception as exc:  # pragma: no cover

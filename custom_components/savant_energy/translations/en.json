@@ -4,21 +4,14 @@
       "init": {
         "title": "Savant Energy Options",
         "data": {
-          "mode": "Mode",
-          "address": "PBC IP",
-          "host": "Host IP",
-          "influx_url": "Influx URL",
-          "influx_token": "Influx Token",
-          "influx_org": "Influx Org",
-          "influx_auth_method": "Influx Credential Method",
-          "ola_port": "OLA Port",
           "scan_interval": "Scan Interval",
           "switch_cooldown": "Breaker Cooldown",
           "dmx_testing_mode": "DMX Testing Mode",
           "pending_confirm_multiplier": "Breaker Switch Debounce Delay (scan intervals)",
-          "disable_scene_builder": "Disable Scene Builder"
+          "disable_scene_builder": "Disable Scene Builder",
+          "reprovision_ssh_key": "Refresh SSH Key And Token"
         },
-        "description": "Configure advanced options. Ports typically remain on defaults."
+        "description": "Configure runtime options here. Use Reconfigure for host, token, and organization changes."
       },
       "reprovision_ssh": {
         "title": "Re-provision SSH Key",
@@ -26,9 +19,9 @@
           "ssh_password": "RPM User Password"
         },
         "data_description": {
-          "ssh_password": "Password for the 'RPM' user account on the Savant host. A new SSH key will be generated and the latest Influx token will be fetched."
+          "ssh_password": "Password for the 'RPM' user account on the Savant host. A new SSH key will be generated, the latest Influx token will be fetched, and the organization will be rediscovered automatically."
         },
-        "description": "Enter the RPM user password to generate a new SSH key and refresh the Influx token."
+        "description": "Enter the RPM user password to generate a new SSH key, refresh the Influx token, and rediscover the correct Influx organization."
       }
     },
     "error": {
@@ -37,7 +30,12 @@
       "ssh_unavailable": "The paramiko library is not installed. SSH token fetch is unavailable — paste the token manually instead.",
       "ssh_token_empty": "SSH connection succeeded but the token file was empty or not found. Verify the host is running rpm-energy ≥11.2.",
       "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password.",
-      "host_not_available": "No host IP is configured. Go back and set a Host IP before re-provisioning."
+      "host_not_available": "No host IP is configured. Go back and set a Host IP before re-provisioning.",
+      "org_auth_failed": "The token was accepted for setup, but organization lookup was rejected. Verify the token and try again.",
+      "org_discovery_failed": "Could not discover a valid Influx organization. Check the host IP and credentials, then try again.",
+      "org_discovery_no_orgs": "The token was accepted, but Influx returned no organizations.",
+      "org_discovery_no_data": "Influx organizations were found, but none matched the expected Savant energy data shape.",
+      "org_reconfigure_required": "Multiple plausible organizations were found. Run Reconfigure to choose the correct one."
     }
   },
   "config": {
@@ -100,6 +98,13 @@
           "ssh_password": "Password for the 'RPM' user account on the Savant host. The integration will SSH in and retrieve the Influx read token automatically."
         },
         "description": "Enter the RPM user password. The integration will connect via SSH and fetch the Influx token from the host."
+      },
+      "current_org_select": {
+        "title": "Current Setup — Choose Influx Organization",
+        "data": {
+          "influx_org": "Detected Influx Organization"
+        },
+        "description": "Multiple plausible Influx organizations were found. Choose the one that matches your Savant energy data."
       },
       "auto_probe": {
         "title": "Auto Detect — PBC IP",
@@ -179,6 +184,13 @@
           "ssh_password": "Password for the 'RPM' user account on the Savant host. The integration will SSH in and retrieve the Influx read token automatically."
         },
         "description": "Enter the RPM user password. The integration will connect via SSH and fetch the Influx token from the host."
+      },
+      "reconfigure_org_select": {
+        "title": "Reconfigure — Choose Influx Organization",
+        "data": {
+          "influx_org": "Detected Influx Organization"
+        },
+        "description": "Multiple plausible Influx organizations were found. Choose the one that matches your Savant energy data."
       }
     },
     "error": {
@@ -187,7 +199,12 @@
       "keygen_failed": "Failed to generate an SSH key pair. Check that the cryptography library is installed.",
       "ssh_unavailable": "The paramiko library is not installed. SSH token fetch is unavailable — paste the token manually instead.",
       "ssh_token_empty": "SSH connection succeeded but the token file was empty or not found. Verify the host is running rpm-energy ≥11.2.",
-      "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password."
+      "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password.",
+      "org_auth_failed": "The token was accepted for setup, but organization lookup was rejected. Verify the token and try again.",
+      "org_discovery_failed": "Could not discover a valid Influx organization. Check the host IP and credentials, then try again.",
+      "org_discovery_no_orgs": "The token was accepted, but Influx returned no organizations.",
+      "org_discovery_no_data": "Influx organizations were found, but none matched the expected Savant energy data shape.",
+      "org_selection_required": "Multiple plausible organizations were found. Choose the correct one to continue."
     },
     "abort": {
       "reconfigure_successful": "Configuration updated successfully."
