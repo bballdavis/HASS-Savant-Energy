@@ -41,8 +41,12 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_INFLUX_ORG,
 )
-from .current.influx_client import InfluxFetchResult, fetch_influx_snapshot
+from .current.influx_client import (
+    InfluxFetchResult,
+    fetch_influx_snapshot_with_backfill,
+)
 from .current.relay_control import SavantRelayController
+from .config_storage import normalize_entry_storage
 from .influx_org_resolver import InfluxOrgCandidate, async_discover_influx_org
 from .legacy.snapshot_data import fetch_current_energy_snapshot
 
@@ -63,44 +67,8 @@ CONFIG_SCHEMA = vol.Schema(
 LOVELACE_CARD_FILENAME = "savant-energy-scenes-card.js"
 LEGACY_FEED_NOTIFICATION_ID = f"{DOMAIN}_legacy_feed_unavailable"
 INFLUX_ORG_NOTIFICATION_ID = f"{DOMAIN}_influx_org_selection_required"
+_BACKFILL_WINDOWS = ("-2m", "-15m", "-24h", "-7d")
 _UNSET = object()
-_ENTRY_DATA_KEYS = (
-    CONF_ADDRESS,
-    CONF_HOST,
-    CONF_MODE,
-    CONF_OLA_PORT,
-    CONF_INFLUX_AUTH_METHOD,
-    CONF_INFLUX_URL,
-    CONF_INFLUX_TOKEN,
-    CONF_INFLUX_ORG,
-    CONF_SSH_PRIVATE_KEY,
-)
-
-
-def _normalize_entry_storage(entry: ConfigEntry) -> tuple[dict, dict, bool]:
-    """Move connection/auth state out of options and into data."""
-    data = dict(entry.data)
-    options = dict(entry.options)
-    changed = False
-
-    if CONF_MODE not in data:
-        data[CONF_MODE] = MODE_LEGACY
-        changed = True
-
-    for key in _ENTRY_DATA_KEYS:
-        if key in options:
-            value = options.pop(key)
-            if key not in data or data.get(key) in (None, "", DEFAULT_INFLUX_ORG):
-                data[key] = value
-            changed = True
-
-    if data.get(CONF_MODE) == MODE_CURRENT:
-        host = data.get(CONF_HOST, data.get(CONF_ADDRESS, ""))
-        if host and not data.get(CONF_INFLUX_URL):
-            data[CONF_INFLUX_URL] = f"http://{host}:8086"
-            changed = True
-
-    return data, options, changed
 
 
 class SavantEnergyCoordinator(DataUpdateCoordinator):
@@ -179,6 +147,12 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             changed = True
 
         if changed:
+            _LOGGER.debug(
+                "Persisting Influx connection state: token=%s org=%s ssh_key=%s",
+                token is not _UNSET,
+                org is not _UNSET,
+                ssh_private_key is not _UNSET,
+            )
             self.hass.config_entries.async_update_entry(
                 self.config_entry,
                 data=updated_data,
@@ -221,29 +195,65 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
 
     async def _async_resolve_influx_org(
         self,
-        *,
-        prefer_existing: bool = False,
     ) -> tuple[bool, bool]:
         """Discover and persist a valid org, or signal ambiguity."""
         if not self.influx_token:
+            _LOGGER.debug("Skipping Influx org discovery because no token is available")
             return False, False
 
+        _LOGGER.debug(
+            "Discovering Influx organization for %s with existing org %s",
+            self.influx_url,
+            self.influx_org or "<unset>",
+        )
         result = await async_discover_influx_org(self.influx_url, self.influx_token)
         if result.selected_org_id:
+            _LOGGER.info(
+                "Resolved Influx organization %s from %d candidate(s)",
+                result.selected_org_id,
+                len(result.candidates),
+            )
             await self._async_persist_connection_state(org=result.selected_org_id)
             await self._async_dismiss_influx_org_notification()
             return True, False
 
-        if prefer_existing and self.influx_org and result.candidates:
-            if any(candidate.org_id == self.influx_org for candidate in result.candidates):
-                await self._async_dismiss_influx_org_notification()
-                return True, False
-
         if result.candidates:
+            _LOGGER.debug(
+                "Influx org discovery returned %d candidate(s) without a clear winner: %s",
+                len(result.candidates),
+                "; ".join(candidate.summary for candidate in result.candidates[:5]),
+            )
             await self._async_notify_influx_org_selection_required(result.candidates)
             return False, True
 
+        _LOGGER.debug(
+            "Influx org discovery produced no candidates (error_key=%s)",
+            result.error_key or "<unset>",
+        )
         return False, False
+
+    async def _async_fetch_influx_snapshot_with_backfill(self) -> InfluxFetchResult:
+        """Fetch a snapshot, widening the lookback window before failing."""
+        _LOGGER.debug(
+            "Fetching Influx snapshot for org %s with backfill",
+            self.influx_org or "<unset>",
+        )
+        result = await fetch_influx_snapshot_with_backfill(
+            self.influx_url,
+            self.influx_token,
+            self.influx_org,
+            sem_host=self.sem_host,
+            sem_port=self.sem_companion_port,
+            scale_state=self.energy_scale_state,
+            sample_seconds=float(self.update_interval.total_seconds()),
+        )
+        if result.success and result.data is not None and result.query_window and result.query_window != _BACKFILL_WINDOWS[0]:
+            _LOGGER.info(
+                "InfluxDB backfill succeeded for org %s using %s lookback",
+                self.influx_org or "<unset>",
+                result.query_window,
+            )
+        return result
 
     async def _async_refresh_influx_token(self) -> bool:
         """SSH to the Savant host using the stored Ed25519 key and update the token.
@@ -315,7 +325,34 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         """Fetch latest circuit and system data from InfluxDB (>=11.2 mode)."""
         now = datetime.now()
 
+        def _failure_payload(fetch_result: InfluxFetchResult) -> dict:
+            self._adjust_interval(success=False)
+            self.last_fetch_error = {
+                "type": fetch_result.error_type,
+                "message": fetch_result.error_message,
+                "timestamp": now.isoformat(),
+            }
+            _LOGGER.warning(
+                "Savant InfluxDB fetch failed (%s): %s",
+                fetch_result.error_type,
+                fetch_result.error_message,
+            )
+
+            existing = dict(self.data) if isinstance(self.data, dict) else {}
+            existing.setdefault("snapshot_data", None)
+            existing["cached_present_demands"] = copy.deepcopy(self.cached_present_demands)
+            existing["snapshot_status"] = {
+                "ok": False,
+                "error_type": fetch_result.error_type,
+                "error_message": fetch_result.error_message,
+                "failure_count": self.consecutive_failures,
+                "next_retry_seconds": int(self.update_interval.total_seconds()),
+                "used_cached_snapshot": bool(existing.get("snapshot_data")),
+            }
+            return existing
+
         if not self.influx_org:
+            _LOGGER.debug("Current-mode startup is missing an org; attempting discovery")
             resolved, ambiguous = await self._async_resolve_influx_org()
             if not resolved:
                 result = InfluxFetchResult(
@@ -329,53 +366,20 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                     ),
                     org_failure=ambiguous,
                 )
-                self._adjust_interval(success=False)
-                self.last_fetch_error = {
-                    "type": result.error_type,
-                    "message": result.error_message,
-                    "timestamp": now.isoformat(),
-                }
-                existing = dict(self.data) if isinstance(self.data, dict) else {}
-                existing.setdefault("snapshot_data", None)
-                existing["cached_present_demands"] = copy.deepcopy(self.cached_present_demands)
-                existing["snapshot_status"] = {
-                    "ok": False,
-                    "error_type": result.error_type,
-                    "error_message": result.error_message,
-                    "failure_count": self.consecutive_failures,
-                    "next_retry_seconds": int(self.update_interval.total_seconds()),
-                    "used_cached_snapshot": bool(existing.get("snapshot_data")),
-                }
-                return existing
+                return _failure_payload(result)
 
-        result = await fetch_influx_snapshot(
-            self.influx_url,
-            self.influx_token,
-            self.influx_org,
-            sem_host=self.sem_host,
-            sem_port=self.sem_companion_port,
-            scale_state=self.energy_scale_state,
-            sample_seconds=float(self.update_interval.total_seconds()),
-        )
+        result = await self._async_fetch_influx_snapshot_with_backfill()
 
-        if not result.success or result.data is None:
-            if result.org_failure:
-                _LOGGER.warning(
-                    "InfluxDB org failure (%s) - attempting org rediscovery",
-                    result.error_type,
-                )
-                resolved, ambiguous = await self._async_resolve_influx_org(prefer_existing=True)
-                if resolved:
-                    result = await fetch_influx_snapshot(
-                        self.influx_url,
-                        self.influx_token,
-                        self.influx_org,
-                        sem_host=self.sem_host,
-                        sem_port=self.sem_companion_port,
-                        scale_state=self.energy_scale_state,
-                        sample_seconds=float(self.update_interval.total_seconds()),
-                    )
-                elif ambiguous:
+        if result.auth_failure:
+            _LOGGER.warning(
+                "InfluxDB auth failure (%s) - attempting SSH token refresh",
+                result.error_type,
+            )
+            refreshed = await self._async_refresh_influx_token()
+            if refreshed:
+                _LOGGER.debug("Token refresh succeeded; rediscovering org and retrying snapshot")
+                resolved, ambiguous = await self._async_resolve_influx_org()
+                if ambiguous:
                     result = InfluxFetchResult(
                         success=False,
                         error_type="org_selection_required",
@@ -385,71 +389,64 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                         ),
                         org_failure=True,
                     )
-
-            if result.auth_failure:
-                _LOGGER.warning(
-                    "InfluxDB auth failure (%s) - attempting SSH token refresh",
-                    result.error_type,
-                )
-                refreshed = await self._async_refresh_influx_token()
-                if refreshed:
-                    resolved, ambiguous = await self._async_resolve_influx_org(prefer_existing=True)
-                    if ambiguous and not resolved:
-                        result = InfluxFetchResult(
-                            success=False,
-                            error_type="org_selection_required",
-                            error_message=(
-                                "Multiple plausible Influx organizations were found. "
-                                "Run Reconfigure to choose the correct organization."
-                            ),
-                            org_failure=True,
-                        )
-                    elif not self.influx_org:
-                        result = InfluxFetchResult(
-                            success=False,
-                            error_type="org_discovery_failed",
-                            error_message=(
-                                "Token refresh succeeded, but the integration could not "
-                                "discover a valid Influx organization."
-                            ),
-                            org_failure=True,
-                        )
-                    else:
-                        result = await fetch_influx_snapshot(
-                            self.influx_url,
-                            self.influx_token,
-                            self.influx_org,
-                            sem_host=self.sem_host,
-                            sem_port=self.sem_companion_port,
-                            scale_state=self.energy_scale_state,
-                            sample_seconds=float(self.update_interval.total_seconds()),
-                        )
+                elif not self.influx_org:
+                    result = InfluxFetchResult(
+                        success=False,
+                        error_type="org_discovery_failed",
+                        error_message=(
+                            "Token refresh succeeded, but the integration could not "
+                            "discover a valid Influx organization."
+                        ),
+                        org_failure=True,
+                    )
+                elif resolved:
+                    result = await self._async_fetch_influx_snapshot_with_backfill()
 
             if not result.success or result.data is None:
-                self._adjust_interval(success=False)
-                self.last_fetch_error = {
-                    "type": result.error_type,
-                    "message": result.error_message,
-                    "timestamp": now.isoformat(),
-                }
-                _LOGGER.warning(
-                    "Savant InfluxDB fetch failed (%s): %s",
-                    result.error_type,
-                    result.error_message,
+                return _failure_payload(result)
+
+        if result.error_type == "empty_response":
+            _LOGGER.warning(
+                "InfluxDB fetch returned no circuit data for org %s - attempting rediscovery",
+                self.influx_org or "<unset>",
+            )
+            _LOGGER.debug("Empty response details: window=%s", result.query_window or "<unset>")
+            resolved, ambiguous = await self._async_resolve_influx_org()
+            if resolved:
+                result = await self._async_fetch_influx_snapshot_with_backfill()
+            elif ambiguous:
+                result = InfluxFetchResult(
+                    success=False,
+                    error_type="org_selection_required",
+                    error_message=(
+                        "Multiple plausible Influx organizations were found. "
+                        "Run Reconfigure to choose the correct organization."
+                    ),
+                    org_failure=True,
                 )
 
-                existing = dict(self.data) if isinstance(self.data, dict) else {}
-                existing.setdefault("snapshot_data", None)
-                existing["cached_present_demands"] = copy.deepcopy(self.cached_present_demands)
-                existing["snapshot_status"] = {
-                    "ok": False,
-                    "error_type": result.error_type,
-                    "error_message": result.error_message,
-                    "failure_count": self.consecutive_failures,
-                    "next_retry_seconds": int(self.update_interval.total_seconds()),
-                    "used_cached_snapshot": bool(existing.get("snapshot_data")),
-                }
-                return existing
+        elif result.org_failure:
+            _LOGGER.warning(
+                "InfluxDB org failure (%s) - attempting org rediscovery",
+                result.error_type,
+            )
+            _LOGGER.debug("Org failure details: window=%s", result.query_window or "<unset>")
+            resolved, ambiguous = await self._async_resolve_influx_org()
+            if resolved:
+                result = await self._async_fetch_influx_snapshot_with_backfill()
+            elif ambiguous:
+                result = InfluxFetchResult(
+                    success=False,
+                    error_type="org_selection_required",
+                    error_message=(
+                        "Multiple plausible Influx organizations were found. "
+                        "Run Reconfigure to choose the correct organization."
+                    ),
+                    org_failure=True,
+                )
+
+        if not result.success or result.data is None:
+            return _failure_payload(result)
 
         snapshot_data = result.data
         self._adjust_interval(success=True)
@@ -475,11 +472,20 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 asyncio.create_task(self.relay_controller.set_relay_uid_map(relay_uid_map))
                 _LOGGER.debug("Updated relay controller UID map with %d entries", len(relay_uid_map))
 
-        _LOGGER.debug(
-            "InfluxDB: %d circuits, %d system channels",
-            len(present_demands),
-            len(snapshot_data.get("system_data", {})),
-        )
+        if result.query_window and result.query_window != _BACKFILL_WINDOWS[0]:
+            _LOGGER.info(
+                "InfluxDB snapshot ready from org %s via %s: %d circuits, %d system channels",
+                self.influx_org or "<unset>",
+                result.query_window,
+                len(present_demands),
+                len(snapshot_data.get("system_data", {})),
+            )
+        else:
+            _LOGGER.debug(
+                "InfluxDB: %d circuits, %d system channels",
+                len(present_demands),
+                len(snapshot_data.get("system_data", {})),
+            )
 
         return {
             "snapshot_data": snapshot_data,
@@ -741,7 +747,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Savant Energy from a config entry."""
-    normalized_data, normalized_options, changed = _normalize_entry_storage(entry)
+    normalized_data, normalized_options, changed = normalize_entry_storage(entry.data, entry.options)
     if changed:
         hass.config_entries.async_update_entry(entry, data=normalized_data, options=normalized_options)
         entry = hass.config_entries.async_get_entry(entry.entry_id) or entry
@@ -787,7 +793,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Normalize config entries and move connection/auth state into data."""
-    new_data, new_options, changed = _normalize_entry_storage(entry)
+    new_data, new_options, changed = normalize_entry_storage(entry.data, entry.options)
     if changed:
         hass.config_entries.async_update_entry(entry, data=new_data, options=new_options)
         _LOGGER.info("Migrated Savant Energy config entry %s to normalized storage", entry.entry_id)

@@ -149,17 +149,37 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def _async_discover_pending_org(self) -> tuple[str | None, str | None]:
         """Resolve the best org for the currently pending host/token pair."""
+        _LOGGER.debug(
+            "Discovering pending Influx org for host=%s url=%s",
+            self._pending.get(CONF_HOST, "<unset>"),
+            self._resolve_pending_influx_url(),
+        )
         result = await async_discover_influx_org(
             self._resolve_pending_influx_url(),
             self._pending[CONF_INFLUX_TOKEN],
         )
         if result.selected_org_id:
+            _LOGGER.info(
+                "Pending Influx org discovery selected %s from %d candidate(s)",
+                result.selected_org_id,
+                len(result.candidates),
+            )
             self._pending[CONF_INFLUX_ORG] = result.selected_org_id
             self._pending_org_candidates = {}
             return result.selected_org_id, None
         if result.candidates:
+            _LOGGER.debug(
+                "Pending Influx org discovery returned %d candidate(s): %s",
+                len(result.candidates),
+                "; ".join(candidate.summary for candidate in result.candidates[:5]),
+            )
             self._remember_org_candidates(result.candidates)
             return None, "select"
+        _LOGGER.debug(
+            "Pending Influx org discovery failed with %s: %s",
+            result.error_key or "<unset>",
+            result.error_message or "<no message>",
+        )
         return None, result.error_key or "org_discovery_failed"
 
     def _resolve_pending_influx_url(self) -> str:
@@ -177,6 +197,13 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def _async_finish_current_setup(self):
         """Create the new current-mode entry from pending values."""
+        _LOGGER.debug(
+            "Finishing current setup with org=%s url=%s token=%s ssh_key=%s",
+            self._pending.get(CONF_INFLUX_ORG, "<unset>"),
+            self._resolve_pending_influx_url(),
+            bool(self._pending.get(CONF_INFLUX_TOKEN)),
+            bool(self._pending.get(CONF_SSH_PRIVATE_KEY)),
+        )
         return self.async_create_entry(
             title="Savant Energy",
             data=self._build_current_data(),
@@ -184,6 +211,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def _async_finish_current_reconfigure(self, config_entry):
         """Persist current-mode data changes and reload the entry."""
+        _LOGGER.debug(
+            "Finishing reconfigure for entry %s with org=%s url=%s token=%s ssh_key=%s",
+            config_entry.entry_id,
+            self._pending.get(CONF_INFLUX_ORG, config_entry.data.get(CONF_INFLUX_ORG, "<unset>")),
+            self._resolve_pending_influx_url(),
+            bool(self._pending.get(CONF_INFLUX_TOKEN)),
+            bool(self._pending.get(CONF_SSH_PRIVATE_KEY)),
+        )
         self.hass.config_entries.async_update_entry(
             config_entry,
             data=self._build_current_data(config_entry.data),

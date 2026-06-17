@@ -138,6 +138,16 @@ def _build_candidate(
         f"{org_name} - {len(uuids)} circuits, {len(fields)} fields, "
         f"{total_power_w / 1000.0:.1f} kW, {_format_age(last_seen)}"
     )
+    _LOGGER.debug(
+        "Influx org candidate %s (%s): circuits=%d fields=%s power_w=%.1f last_seen=%s score=%d",
+        org_name,
+        org_id,
+        len(uuids),
+        ",".join(fields) or "-",
+        total_power_w,
+        last_seen or "-",
+        score,
+    )
     return InfluxOrgCandidate(
         org_id=org_id,
         org_name=org_name,
@@ -223,6 +233,7 @@ async def async_discover_influx_org(
 ) -> InfluxOrgDiscoveryResult:
     """Discover the best Influx organization for Savant energy data."""
     url = f"{base_url.rstrip('/')}/api/v2/orgs"
+    _LOGGER.debug("Starting Influx org discovery against %s", url)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -261,7 +272,13 @@ async def async_discover_influx_org(
                 for org in orgs
                 if str(org.get("id", "")).strip()
             ]
+            _LOGGER.debug("Influx org discovery found %d org(s): %s", len(org_list), ", ".join(name for _, name in org_list))
             for range_start in _PROBE_WINDOWS:
+                _LOGGER.debug(
+                    "Probing %d Influx org(s) with lookback %s",
+                    len(org_list),
+                    range_start,
+                )
                 candidates = []
                 for org_id, org_name in org_list:
                     candidate = await _probe_org(
@@ -274,6 +291,11 @@ async def async_discover_influx_org(
                     )
                     if candidate is not None:
                         candidates.append(candidate)
+                _LOGGER.debug(
+                    "Influx org discovery at %s produced %d candidate(s)",
+                    range_start,
+                    len(candidates),
+                )
                 if candidates:
                     break
     except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
@@ -283,23 +305,10 @@ async def async_discover_influx_org(
         )
 
     if not candidates:
-        if len(org_list) == 1:
-            org_id, org_name = org_list[0]
-            return InfluxOrgDiscoveryResult(
-                selected_org_id=org_id,
-                candidates=[
-                    InfluxOrgCandidate(
-                        org_id=org_id,
-                        org_name=org_name,
-                        circuit_count=0,
-                        field_names=(),
-                        total_power_w=0.0,
-                        last_seen=None,
-                        score=1,
-                        summary=f"{org_name} - no recent Savant rows, using the only available org",
-                    )
-                ],
-            )
+        _LOGGER.debug(
+            "Influx org discovery found no matching candidates for %d org(s)",
+            len(org_list),
+        )
         return InfluxOrgDiscoveryResult(
             error_key="org_discovery_no_data",
             error_message="No organizations matched the expected Savant data shape",
@@ -313,18 +322,36 @@ async def async_discover_influx_org(
     )
 
     if winner is not None:
+        _LOGGER.info(
+            "Influx org discovery selected %s from %d plausible candidate(s)",
+            winner,
+            len(plausible) or len(candidates),
+        )
         return InfluxOrgDiscoveryResult(
             selected_org_id=winner,
             candidates=plausible or sorted(candidates, key=lambda item: item.score, reverse=True),
         )
 
     if plausible:
+        _LOGGER.info(
+            "Influx org discovery found %d plausible candidate(s) but no clear winner",
+            len(plausible),
+        )
         return InfluxOrgDiscoveryResult(candidates=plausible[:5])
 
     scored = sorted(candidates, key=lambda item: item.score, reverse=True)
     if len(scored) == 1 and scored[0].circuit_count > 0:
+        _LOGGER.info(
+            "Influx org discovery selected only scored candidate %s with %d circuits",
+            scored[0].org_id,
+            scored[0].circuit_count,
+        )
         return InfluxOrgDiscoveryResult(selected_org_id=scored[0].org_id, candidates=scored)
 
+    _LOGGER.debug(
+        "Influx org discovery returning no-data after scoring %d candidate(s)",
+        len(scored),
+    )
     return InfluxOrgDiscoveryResult(
         error_key="org_discovery_no_data",
         error_message="Organizations were found, but none had Savant circuit data",

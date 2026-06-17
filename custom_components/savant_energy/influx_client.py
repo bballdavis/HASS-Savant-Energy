@@ -31,9 +31,11 @@ _CT_ENERGY_GUARD_DELTA_MULTIPLIER = 25.0
 # We filter on savantUUID being present rather than a specific type code so that
 # CT-monitored loads (EV chargers, solar inverters, etc.) are included alongside
 # relay-switched circuits regardless of their hardware type tag.
+_BACKFILL_WINDOWS = ("-2m", "-15m", "-24h", "-7d")
+
 _CIRCUIT_QUERY = """\
 from(bucket: "localHub")
-  |> range(start: -2m)
+  |> range(start: {range_start})
   |> filter(fn: (r) => exists r.savantUUID and r.savantUUID != "")
   |> filter(fn: (r) =>
       r._field == "power" or r._field == "current" or r._field == "voltage" or
@@ -45,7 +47,7 @@ from(bucket: "localHub")
 # (totals, groups, battery, solar). type="0000" is always the hub measurement.
 _SYSTEM_QUERY = """\
 from(bucket: "localHub")
-  |> range(start: -2m)
+  |> range(start: {range_start})
   |> filter(fn: (r) => r.type == "0000")
   |> filter(fn: (r) => r._field == "power")
   |> last()
@@ -62,6 +64,7 @@ class InfluxFetchResult:
     error_message: Optional[str] = None
     auth_failure: bool = False
     org_failure: bool = False
+    query_window: Optional[str] = None
 
 
 def parse_uid(uid: str) -> tuple[str, str]:
@@ -372,6 +375,7 @@ async def fetch_influx_snapshot(
     sem_port: int = 8644,
     scale_state: dict[str, dict[str, Any]] | None = None,
     sample_seconds: float = 5.0,
+    range_start: str = "-2m",
 ) -> InfluxFetchResult:
     """Fetch the latest circuit and system data from InfluxDB.
 
@@ -382,7 +386,11 @@ async def fetch_influx_snapshot(
     try:
         async with aiohttp.ClientSession() as session:
             ok, circuit_text, err, auth_failure, org_failure = await _post_flux(
-                session, influx_url, influx_token, influx_org, _CIRCUIT_QUERY
+                session,
+                influx_url,
+                influx_token,
+                influx_org,
+                _CIRCUIT_QUERY.format(range_start=range_start),
             )
             if not ok:
                 return InfluxFetchResult(
@@ -391,17 +399,23 @@ async def fetch_influx_snapshot(
                     error_message=err,
                     auth_failure=auth_failure,
                     org_failure=org_failure,
+                    query_window=range_start,
                 )
 
             # System query failure is non-fatal — degrade gracefully.
             ok_sys, system_text, _, _, _ = await _post_flux(
-                session, influx_url, influx_token, influx_org, _SYSTEM_QUERY
+                session,
+                influx_url,
+                influx_token,
+                influx_org,
+                _SYSTEM_QUERY.format(range_start=range_start),
             )
     except Exception as exc:  # pragma: no cover
         return InfluxFetchResult(
             success=False,
             error_type="unexpected_error",
             error_message=str(exc),
+            query_window=range_start,
         )
 
     # --- Build presentDemands from circuit CSV ---
@@ -569,6 +583,7 @@ async def fetch_influx_snapshot(
                 "check that the SEM is writing to the 'localHub' bucket "
                 "and that the token has read access"
             ),
+            query_window=range_start,
         )
 
     # Sort by channel number for stable, predictable ordering.
@@ -641,6 +656,74 @@ async def fetch_influx_snapshot(
             "system_data": system_data,
             "pbc_device_id": pbc_device_id,  # PBC SignalR target device ID
         },
+        query_window=range_start,
+    )
+
+
+async def fetch_influx_snapshot_with_backfill(
+    influx_url: str,
+    influx_token: str,
+    influx_org: str,
+    sem_host: str = "192.168.1.108",
+    sem_port: int = 8644,
+    scale_state: dict[str, dict[str, Any]] | None = None,
+    sample_seconds: float = 5.0,
+    backfill_windows: tuple[str, ...] = _BACKFILL_WINDOWS,
+) -> InfluxFetchResult:
+    """Fetch a snapshot, widening the lookback window before failing."""
+    last_empty_result: InfluxFetchResult | None = None
+    for range_start in backfill_windows:
+        _LOGGER.debug(
+            "InfluxDB snapshot attempt for org %s using lookback %s",
+            influx_org or "<unset>",
+            range_start,
+        )
+        result = await fetch_influx_snapshot(
+            influx_url,
+            influx_token,
+            influx_org,
+            sem_host=sem_host,
+            sem_port=sem_port,
+            scale_state=scale_state,
+            sample_seconds=sample_seconds,
+            range_start=range_start,
+        )
+        if result.success and result.data is not None:
+            _LOGGER.debug(
+                "InfluxDB snapshot attempt succeeded for org %s using %s",
+                influx_org or "<unset>",
+                range_start,
+            )
+            return result
+        if result.auth_failure or result.org_failure:
+            _LOGGER.debug(
+                "InfluxDB snapshot attempt stopped for org %s at %s due to %s",
+                influx_org or "<unset>",
+                range_start,
+                result.error_type,
+            )
+            return result
+        _LOGGER.debug(
+            "InfluxDB snapshot attempt returned no data for org %s at %s",
+            influx_org or "<unset>",
+            range_start,
+        )
+        last_empty_result = result
+
+    _LOGGER.debug(
+        "InfluxDB snapshot backfill exhausted for org %s after windows %s",
+        influx_org or "<unset>",
+        ", ".join(backfill_windows),
+    )
+    return last_empty_result or InfluxFetchResult(
+        success=False,
+        error_type="empty_response",
+        error_message=(
+            "InfluxDB returned no circuit data — "
+            "check that the SEM is writing to the 'localHub' bucket "
+            "and that the token has read access"
+        ),
+        query_window=backfill_windows[-1] if backfill_windows else None,
     )
 
 
