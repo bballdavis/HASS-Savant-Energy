@@ -32,8 +32,8 @@
       "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password.",
       "host_not_available": "No host IP is configured. Go back and set a Host IP before re-provisioning.",
       "org_auth_failed": "The token was accepted for setup, but organization lookup was rejected. Verify the token and try again.",
-      "org_discovery_failed": "Could not discover a valid Influx organization. Check the host IP and credentials, then try again.",
-      "org_discovery_no_orgs": "The token was accepted, but Influx returned no organizations.",
+      "org_discovery_failed": "Could not discover a valid Influx organization from host metadata, buckets, or the org list. Check the host IP and credentials, then try again.",
+      "org_discovery_no_orgs": "The token was accepted, but Influx's org list was empty.",
       "org_discovery_no_data": "Influx organizations were found, but none matched the expected Savant energy data shape.",
       "org_reconfigure_required": "Multiple plausible organizations were found. Run Reconfigure to choose the correct one."
     }
@@ -201,8 +201,8 @@
       "ssh_token_empty": "SSH connection succeeded but the token file was empty or not found. Verify the host is running rpm-energy ≥11.2.",
       "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password.",
       "org_auth_failed": "The token was accepted for setup, but organization lookup was rejected. Verify the token and try again.",
-      "org_discovery_failed": "Could not discover a valid Influx organization. Check the host IP and credentials, then try again.",
-      "org_discovery_no_orgs": "The token was accepted, but Influx returned no organizations.",
+      "org_discovery_failed": "Could not discover a valid Influx organization from host metadata, buckets, or the org list. Check the host IP and credentials, then try again.",
+      "org_discovery_no_orgs": "The token was accepted, but Influx's org list was empty.",
       "org_discovery_no_data": "Influx organizations were found, but none matched the expected Savant energy data shape.",
       "org_selection_required": "Multiple plausible organizations were found. Choose the correct one to continue."
     },

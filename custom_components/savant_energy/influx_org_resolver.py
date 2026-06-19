@@ -10,11 +10,14 @@ from datetime import datetime, timezone
 
 import aiohttp
 
+from .ssh_helper import InfluxHostMetadata
+
 _LOGGER = logging.getLogger(__name__)
 
 _EXPECTED_FIELDS = ("power", "current", "voltage", "energy")
 _PLAUSIBLE_FIELDS = ("power", "energy")
 _PROBE_WINDOWS = ("-15m", "-24h", "-7d")
+_BUCKET_SCAN_PREFIXES = ("localHub",)
 
 
 def _probe_query(range_start: str) -> str:
@@ -41,6 +44,9 @@ class InfluxOrgCandidate:
     last_seen: str | None
     score: int
     summary: str
+    source: str = "org_list"
+    query_window: str | None = None
+    bucket_names: tuple[str, ...] = ()
 
     @property
     def field_count(self) -> int:
@@ -56,6 +62,7 @@ class InfluxOrgDiscoveryResult:
     error_key: str | None = None
     error_message: str | None = None
     auth_failure: bool = False
+    source: str | None = None
 
 
 def _parse_influx_csv(text: str) -> list[dict[str, str]]:
@@ -109,6 +116,10 @@ def _build_candidate(
     org_id: str,
     org_name: str,
     rows: list[dict[str, str]],
+    *,
+    source: str = "org_list",
+    query_window: str | None = None,
+    bucket_names: tuple[str, ...] = (),
 ) -> InfluxOrgCandidate:
     uuids = {row.get("savantUUID", "").strip() for row in rows if row.get("savantUUID", "").strip()}
     fields = sorted({row.get("_field", "").strip() for row in rows if row.get("_field", "").strip()})
@@ -133,15 +144,23 @@ def _build_candidate(
         score += 40
     if total_power_w >= 100:
         score += min(int(total_power_w // 500), 40)
+    if source == "ssh_metadata":
+        score += 60
+    elif source == "bucket_scan":
+        score += 30
 
+    bucket_label = ", ".join(bucket_names[:3]) if bucket_names else "bucket unknown"
     summary = (
-        f"{org_name} - {len(uuids)} circuits, {len(fields)} fields, "
+        f"{org_name} [{source}] - {bucket_label} - {len(uuids)} circuits, {len(fields)} fields, "
         f"{total_power_w / 1000.0:.1f} kW, {_format_age(last_seen)}"
     )
     _LOGGER.debug(
-        "Influx org candidate %s (%s): circuits=%d fields=%s power_w=%.1f last_seen=%s score=%d",
+        "Influx org candidate %s (%s): source=%s window=%s buckets=%s circuits=%d fields=%s power_w=%.1f last_seen=%s score=%d",
         org_name,
         org_id,
+        source,
+        query_window or "-",
+        ",".join(bucket_names) or "-",
         len(uuids),
         ",".join(fields) or "-",
         total_power_w,
@@ -157,6 +176,9 @@ def _build_candidate(
         last_seen=last_seen,
         score=score,
         summary=summary,
+        source=source,
+        query_window=query_window,
+        bucket_names=bucket_names,
     )
 
 
@@ -170,13 +192,14 @@ def _is_plausible(candidate: InfluxOrgCandidate) -> bool:
 
 def _pick_clear_winner(candidates: list[InfluxOrgCandidate]) -> str | None:
     plausible = [candidate for candidate in candidates if _is_plausible(candidate)]
-    if len(plausible) == 1:
-        return plausible[0].org_id
-    if len(plausible) < 2:
+    if not plausible:
         return None
 
     ranked = sorted(plausible, key=lambda item: item.score, reverse=True)
     top = ranked[0]
+    if len(ranked) == 1:
+        return top.org_id if top.score >= 180 else None
+
     runner_up = ranked[1]
     if top.score >= runner_up.score + 60 and top.circuit_count >= max(runner_up.circuit_count + 4, int(runner_up.circuit_count * 1.5)):
         return top.org_id
@@ -190,6 +213,9 @@ async def _probe_org(
     org_id: str,
     org_name: str,
     range_start: str,
+    *,
+    source: str = "org_list",
+    bucket_names: tuple[str, ...] = (),
 ) -> InfluxOrgCandidate | None:
     url = f"{base_url.rstrip('/')}/api/v2/query"
     try:
@@ -215,7 +241,14 @@ async def _probe_org(
                 )
                 return None
             rows = _parse_influx_csv(text)
-            return _build_candidate(org_id, org_name, rows)
+            return _build_candidate(
+                org_id,
+                org_name,
+                rows,
+                source=source,
+                query_window=range_start,
+                bucket_names=bucket_names,
+            )
     except (aiohttp.ClientError, TimeoutError) as exc:
         _LOGGER.debug(
             "Influx org probe error for %s (%s, %s): %s",
@@ -227,17 +260,220 @@ async def _probe_org(
         return None
 
 
+async def _list_buckets(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    token: str,
+) -> tuple[list[dict[str, str]], str | None]:
+    url = f"{base_url.rstrip('/')}/api/v2/buckets"
+    try:
+        async with session.get(
+            url,
+            headers={"Authorization": f"Token {token}"},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as response:
+            text = await response.text()
+            if response.status == 401:
+                return [], "auth"
+            if response.status == 403:
+                return [], "forbidden"
+            if response.status != 200:
+                _LOGGER.debug("Influx bucket listing failed: HTTP %s: %s", response.status, text[:200])
+                return [], "failed"
+            payload = await response.json()
+            buckets = payload.get("buckets", [])
+            if not isinstance(buckets, list):
+                return [], "failed"
+            return [bucket for bucket in buckets if isinstance(bucket, dict)], None
+    except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
+        _LOGGER.debug("Influx bucket listing error: %s", exc)
+        return [], "failed"
+
+
+def _group_bucket_orgs(
+    buckets: list[dict[str, str]],
+    host_metadata: InfluxHostMetadata | None,
+) -> list[tuple[str, str, tuple[str, ...]]]:
+    grouped: dict[str, list[str]] = {}
+    for bucket in buckets:
+        org_id = str(bucket.get("orgID", "")).strip()
+        name = str(bucket.get("name", "")).strip()
+        if not org_id or not name:
+            continue
+        grouped.setdefault(org_id, []).append(name)
+
+    ordered_org_ids = sorted(
+        grouped,
+        key=lambda org_id: (
+            0 if any(bucket_name.startswith(_BUCKET_SCAN_PREFIXES) for bucket_name in grouped[org_id]) else 1,
+            org_id,
+        ),
+    )
+
+    result: list[tuple[str, str, tuple[str, ...]]] = []
+    for org_id in ordered_org_ids:
+        bucket_names = tuple(sorted(grouped[org_id]))
+        if host_metadata and host_metadata.org_id == org_id and host_metadata.org_name:
+            org_name = host_metadata.org_name
+        else:
+            org_name = bucket_names[0] if bucket_names else org_id
+        result.append((org_id, org_name, bucket_names))
+    return result
+
+
+async def _probe_orgs_for_candidates(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    token: str,
+    orgs: list[tuple[str, str, tuple[str, ...]]],
+    *,
+    source: str,
+) -> list[InfluxOrgCandidate]:
+    candidates: list[InfluxOrgCandidate] = []
+    for range_start in _PROBE_WINDOWS:
+        _LOGGER.debug(
+            "Probing %d Influx org(s) from %s with lookback %s",
+            len(orgs),
+            source,
+            range_start,
+        )
+        candidates = []
+        for org_id, org_name, bucket_names in orgs:
+            candidate = await _probe_org(
+                session,
+                base_url,
+                token,
+                org_id,
+                org_name,
+                range_start,
+                source=source,
+                bucket_names=bucket_names,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        _LOGGER.debug(
+            "Influx org discovery at %s from %s produced %d candidate(s)",
+            range_start,
+            source,
+            len(candidates),
+        )
+        if candidates:
+            break
+    return candidates
+
+
 async def async_discover_influx_org(
     base_url: str,
     token: str,
+    host_metadata: InfluxHostMetadata | None = None,
 ) -> InfluxOrgDiscoveryResult:
     """Discover the best Influx organization for Savant energy data."""
-    url = f"{base_url.rstrip('/')}/api/v2/orgs"
-    _LOGGER.debug("Starting Influx org discovery against %s", url)
+    org_url = f"{base_url.rstrip('/')}/api/v2/orgs"
+    _LOGGER.debug(
+        "Starting Influx org discovery against %s (host_metadata=%s)",
+        org_url,
+        bool(host_metadata and (host_metadata.org_id or host_metadata.bucket_name)),
+    )
+
+    org_candidates: list[InfluxOrgCandidate] = []
     try:
         async with aiohttp.ClientSession() as session:
+            if host_metadata and host_metadata.org_id:
+                _LOGGER.debug(
+                    "Trying host-provided org metadata first: org_id=%s org_name=%s bucket=%s",
+                    host_metadata.org_id,
+                    host_metadata.org_name or "<unset>",
+                    host_metadata.bucket_name or "<unset>",
+                )
+                metadata_candidates = await _probe_orgs_for_candidates(
+                    session,
+                    base_url,
+                    token,
+                    [
+                        (
+                            host_metadata.org_id,
+                            host_metadata.org_name or host_metadata.bucket_name or host_metadata.org_id,
+                            (host_metadata.bucket_name,) if host_metadata.bucket_name else (),
+                        )
+                    ],
+                    source="ssh_metadata",
+                )
+                if metadata_candidates:
+                    metadata_candidate = metadata_candidates[0]
+                    if metadata_candidate.score >= 120:
+                        _LOGGER.info(
+                            "Influx org discovery selected host metadata org %s (%s)",
+                            metadata_candidate.org_id,
+                            metadata_candidate.summary,
+                        )
+                        return InfluxOrgDiscoveryResult(
+                            selected_org_id=metadata_candidate.org_id,
+                            candidates=metadata_candidates,
+                            source="ssh_metadata",
+                        )
+                    _LOGGER.debug(
+                        "Host metadata org %s returned no strong data shape; continuing discovery",
+                        host_metadata.org_id,
+                    )
+
+            buckets, bucket_error = await _list_buckets(session, base_url, token)
+            if bucket_error == "auth":
+                return InfluxOrgDiscoveryResult(
+                    error_key="org_auth_failed",
+                    error_message="Unauthorized (401) while listing buckets",
+                    auth_failure=True,
+                    source="bucket_scan",
+                )
+            if bucket_error == "forbidden":
+                return InfluxOrgDiscoveryResult(
+                    error_key="org_discovery_failed",
+                    error_message="Forbidden (403) while listing buckets",
+                    source="bucket_scan",
+                )
+
+            bucket_orgs = _group_bucket_orgs(buckets, host_metadata)
+            if bucket_orgs:
+                _LOGGER.debug(
+                    "Influx bucket scan found %d bucket org(s): %s",
+                    len(bucket_orgs),
+                    ", ".join(f"{org_id}:{','.join(names[:3])}" for org_id, _, names in bucket_orgs),
+                )
+                bucket_candidates = await _probe_orgs_for_candidates(
+                    session,
+                    base_url,
+                    token,
+                    bucket_orgs,
+                    source="bucket_scan",
+                )
+                if bucket_candidates:
+                    winner = _pick_clear_winner(bucket_candidates)
+                    plausible = sorted(
+                        [candidate for candidate in bucket_candidates if _is_plausible(candidate)],
+                        key=lambda item: item.score,
+                        reverse=True,
+                    )
+                    if winner is not None:
+                        _LOGGER.info(
+                            "Influx org discovery selected %s from bucket scan",
+                            winner,
+                        )
+                        return InfluxOrgDiscoveryResult(
+                            selected_org_id=winner,
+                            candidates=plausible or sorted(bucket_candidates, key=lambda item: item.score, reverse=True),
+                            source="bucket_scan",
+                        )
+                    if plausible:
+                        _LOGGER.info(
+                            "Influx bucket scan found %d plausible candidate(s) but no clear winner",
+                            len(plausible),
+                        )
+                        return InfluxOrgDiscoveryResult(
+                            candidates=plausible[:5],
+                            source="bucket_scan",
+                        )
+
             async with session.get(
-                url,
+                org_url,
                 headers={"Authorization": f"Token {token}"},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as response:
@@ -247,76 +483,73 @@ async def async_discover_influx_org(
                         error_key="org_auth_failed",
                         error_message="Unauthorized (401) while listing organizations",
                         auth_failure=True,
+                        source="org_list",
                     )
                 if response.status == 403:
                     return InfluxOrgDiscoveryResult(
                         error_key="org_discovery_failed",
                         error_message="Forbidden (403) while listing organizations",
+                        source="org_list",
                     )
                 if response.status != 200:
                     return InfluxOrgDiscoveryResult(
                         error_key="org_discovery_failed",
                         error_message=f"HTTP {response.status}: {text[:200]}",
+                        source="org_list",
                     )
                 payload = await response.json()
                 orgs = payload.get("orgs", [])
                 if not orgs:
+                    _LOGGER.debug("Influx /api/v2/orgs returned no entries; falling back to bucket metadata only")
+                    if bucket_orgs:
+                        return InfluxOrgDiscoveryResult(
+                            error_key="org_discovery_no_data",
+                            error_message="Buckets were visible, but no matching Savant rows were found",
+                            source="bucket_scan",
+                        )
                     return InfluxOrgDiscoveryResult(
                         error_key="org_discovery_no_orgs",
-                        error_message="Token returned no organizations",
+                        error_message="Token returned no organizations from the org listing endpoint",
+                        source="org_list",
                     )
 
-            candidates: list[InfluxOrgCandidate] = []
             org_list = [
                 (str(org.get("id", "")).strip(), str(org.get("name", org.get("id", "unknown"))))
                 for org in orgs
                 if str(org.get("id", "")).strip()
             ]
-            _LOGGER.debug("Influx org discovery found %d org(s): %s", len(org_list), ", ".join(name for _, name in org_list))
-            for range_start in _PROBE_WINDOWS:
-                _LOGGER.debug(
-                    "Probing %d Influx org(s) with lookback %s",
-                    len(org_list),
-                    range_start,
-                )
-                candidates = []
-                for org_id, org_name in org_list:
-                    candidate = await _probe_org(
-                        session,
-                        base_url,
-                        token,
-                        org_id,
-                        org_name,
-                        range_start,
-                    )
-                    if candidate is not None:
-                        candidates.append(candidate)
-                _LOGGER.debug(
-                    "Influx org discovery at %s produced %d candidate(s)",
-                    range_start,
-                    len(candidates),
-                )
-                if candidates:
-                    break
+            _LOGGER.debug(
+                "Influx org discovery found %d org(s): %s",
+                len(org_list),
+                ", ".join(name for _, name in org_list),
+            )
+            org_candidates = await _probe_orgs_for_candidates(
+                session,
+                base_url,
+                token,
+                [(org_id, org_name, ()) for org_id, org_name in org_list],
+                source="org_list",
+            )
     except (aiohttp.ClientError, TimeoutError, ValueError) as exc:
         return InfluxOrgDiscoveryResult(
             error_key="org_discovery_failed",
             error_message=str(exc),
+            source="org_list",
         )
 
-    if not candidates:
+    if not org_candidates:
         _LOGGER.debug(
-            "Influx org discovery found no matching candidates for %d org(s)",
-            len(org_list),
+            "Influx org discovery found no matching candidates for the current token",
         )
         return InfluxOrgDiscoveryResult(
             error_key="org_discovery_no_data",
             error_message="No organizations matched the expected Savant data shape",
+            source="org_list",
         )
 
-    winner = _pick_clear_winner(candidates)
+    winner = _pick_clear_winner(org_candidates)
     plausible = sorted(
-        [candidate for candidate in candidates if _is_plausible(candidate)],
+        [candidate for candidate in org_candidates if _is_plausible(candidate)],
         key=lambda item: item.score,
         reverse=True,
     )
@@ -325,11 +558,12 @@ async def async_discover_influx_org(
         _LOGGER.info(
             "Influx org discovery selected %s from %d plausible candidate(s)",
             winner,
-            len(plausible) or len(candidates),
+            len(plausible) or len(org_candidates),
         )
         return InfluxOrgDiscoveryResult(
             selected_org_id=winner,
-            candidates=plausible or sorted(candidates, key=lambda item: item.score, reverse=True),
+            candidates=plausible or sorted(org_candidates, key=lambda item: item.score, reverse=True),
+            source="org_list",
         )
 
     if plausible:
@@ -337,17 +571,9 @@ async def async_discover_influx_org(
             "Influx org discovery found %d plausible candidate(s) but no clear winner",
             len(plausible),
         )
-        return InfluxOrgDiscoveryResult(candidates=plausible[:5])
+        return InfluxOrgDiscoveryResult(candidates=plausible[:5], source="org_list")
 
-    scored = sorted(candidates, key=lambda item: item.score, reverse=True)
-    if len(scored) == 1 and scored[0].circuit_count > 0:
-        _LOGGER.info(
-            "Influx org discovery selected only scored candidate %s with %d circuits",
-            scored[0].org_id,
-            scored[0].circuit_count,
-        )
-        return InfluxOrgDiscoveryResult(selected_org_id=scored[0].org_id, candidates=scored)
-
+    scored = sorted(org_candidates, key=lambda item: item.score, reverse=True)
     _LOGGER.debug(
         "Influx org discovery returning no-data after scoring %d candidate(s)",
         len(scored),
@@ -355,4 +581,5 @@ async def async_discover_influx_org(
     return InfluxOrgDiscoveryResult(
         error_key="org_discovery_no_data",
         error_message="Organizations were found, but none had Savant circuit data",
+        source="org_list",
     )

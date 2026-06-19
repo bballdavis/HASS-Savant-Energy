@@ -49,6 +49,7 @@ from .current.relay_control import SavantRelayController
 from .config_storage import normalize_entry_storage
 from .influx_org_resolver import InfluxOrgCandidate, async_discover_influx_org
 from .legacy.snapshot_data import fetch_current_energy_snapshot
+from .ssh_helper import InfluxHostMetadata
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.influx_url = entry.data.get(CONF_INFLUX_URL, f"http://{self.host}:8086")
         self.influx_token = entry.data.get(CONF_INFLUX_TOKEN, "")
         self.influx_org = entry.data.get(CONF_INFLUX_ORG, DEFAULT_INFLUX_ORG)
+        self.influx_host_metadata: InfluxHostMetadata | None = None
         self.config_entry = entry
         self.base_scan_interval_seconds = scan_interval
         self.consecutive_failures = 0
@@ -195,6 +197,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
 
     async def _async_resolve_influx_org(
         self,
+        host_metadata: InfluxHostMetadata | None = None,
     ) -> tuple[bool, bool]:
         """Discover and persist a valid org, or signal ambiguity."""
         if not self.influx_token:
@@ -202,16 +205,19 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             return False, False
 
         _LOGGER.debug(
-            "Discovering Influx organization for %s with existing org %s",
+            "Discovering Influx organization for %s with existing org %s (metadata=%s)",
             self.influx_url,
             self.influx_org or "<unset>",
+            bool(host_metadata and (host_metadata.org_id or host_metadata.bucket_name)),
         )
-        result = await async_discover_influx_org(self.influx_url, self.influx_token)
+        result = await async_discover_influx_org(self.influx_url, self.influx_token, host_metadata)
+        self.influx_host_metadata = host_metadata
         if result.selected_org_id:
             _LOGGER.info(
-                "Resolved Influx organization %s from %d candidate(s)",
+                "Resolved Influx organization %s from %d candidate(s) via %s",
                 result.selected_org_id,
                 len(result.candidates),
+                result.source or "unknown",
             )
             await self._async_persist_connection_state(org=result.selected_org_id)
             await self._async_dismiss_influx_org_notification()
@@ -227,10 +233,50 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             return False, True
 
         _LOGGER.debug(
-            "Influx org discovery produced no candidates (error_key=%s)",
+            "Influx org discovery produced no candidates (error_key=%s source=%s)",
             result.error_key or "<unset>",
+            result.source or "<unset>",
         )
         return False, False
+
+    async def _async_refresh_influx_token_and_metadata(self) -> tuple[bool, InfluxHostMetadata | None]:
+        """Fetch a fresh token over SSH and capture any host-side Influx metadata."""
+        if self._token_refresh_in_progress:
+            return False, None
+        if not self.ssh_private_key:
+            _LOGGER.debug("401 detected but no SSH private key configured â€” skipping auto-refresh")
+            return False, None
+
+        self._token_refresh_in_progress = True
+        try:
+            from .ssh_helper import async_ssh_fetch_influx_bundle_with_key
+
+            host = self.host or self._hub_host_from_influx_url()
+            new_token, metadata = await async_ssh_fetch_influx_bundle_with_key(
+                self.hass, host, DEFAULT_SSH_USERNAME, self.ssh_private_key
+            )
+            if not new_token:
+                return False, metadata
+
+            if new_token != self.influx_token:
+                _LOGGER.info("Auto-refreshed InfluxDB token via SSH key from %s", host)
+                await self._async_persist_connection_state(token=new_token)
+            else:
+                _LOGGER.debug("SSH token refresh returned the current token unchanged")
+
+            if metadata:
+                _LOGGER.debug(
+                    "SSH token refresh metadata: org_id=%s org_name=%s bucket=%s auth_org_id=%s",
+                    metadata.org_id or "<unset>",
+                    metadata.org_name or "<unset>",
+                    metadata.bucket_name or "<unset>",
+                    metadata.auth_org_id or "<unset>",
+                )
+                self.influx_host_metadata = metadata
+            self._adjust_interval(success=True)
+            return True, metadata
+        finally:
+            self._token_refresh_in_progress = False
 
     async def _async_fetch_influx_snapshot_with_backfill(self) -> InfluxFetchResult:
         """Fetch a snapshot, widening the lookback window before failing."""
@@ -353,7 +399,11 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
 
         if not self.influx_org:
             _LOGGER.debug("Current-mode startup is missing an org; attempting discovery")
-            resolved, ambiguous = await self._async_resolve_influx_org()
+            host_metadata = self.influx_host_metadata
+            if host_metadata is None and self.ssh_private_key:
+                _LOGGER.debug("Trying SSH metadata refresh before first discovery")
+                _refresh_result, host_metadata = await self._async_refresh_influx_token_and_metadata()
+            resolved, ambiguous = await self._async_resolve_influx_org(host_metadata)
             if not resolved:
                 result = InfluxFetchResult(
                     success=False,
@@ -375,10 +425,10 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 "InfluxDB auth failure (%s) - attempting SSH token refresh",
                 result.error_type,
             )
-            refreshed = await self._async_refresh_influx_token()
+            refreshed, host_metadata = await self._async_refresh_influx_token_and_metadata()
             if refreshed:
                 _LOGGER.debug("Token refresh succeeded; rediscovering org and retrying snapshot")
-                resolved, ambiguous = await self._async_resolve_influx_org()
+                resolved, ambiguous = await self._async_resolve_influx_org(host_metadata)
                 if ambiguous:
                     result = InfluxFetchResult(
                         success=False,
@@ -411,7 +461,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 self.influx_org or "<unset>",
             )
             _LOGGER.debug("Empty response details: window=%s", result.query_window or "<unset>")
-            resolved, ambiguous = await self._async_resolve_influx_org()
+            resolved, ambiguous = await self._async_resolve_influx_org(self.influx_host_metadata)
             if resolved:
                 result = await self._async_fetch_influx_snapshot_with_backfill()
             elif ambiguous:
@@ -431,7 +481,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 result.error_type,
             )
             _LOGGER.debug("Org failure details: window=%s", result.query_window or "<unset>")
-            resolved, ambiguous = await self._async_resolve_influx_org()
+            resolved, ambiguous = await self._async_resolve_influx_org(self.influx_host_metadata)
             if resolved:
                 result = await self._async_fetch_influx_snapshot_with_backfill()
             elif ambiguous:

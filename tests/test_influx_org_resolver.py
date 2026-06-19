@@ -1,13 +1,31 @@
 import importlib.util
 import sys
+import types
 from pathlib import Path
 import unittest
 from unittest import mock
 
 
 def _load_resolver_module():
-    module_path = Path(__file__).resolve().parents[1] / "custom_components" / "savant_energy" / "influx_org_resolver.py"
-    spec = importlib.util.spec_from_file_location("savant_energy_influx_org_resolver", module_path)
+    repo_root = Path(__file__).resolve().parents[1]
+    package_root = repo_root / "custom_components"
+    savant_root = package_root / "savant_energy"
+
+    if "custom_components" not in sys.modules:
+        package = types.ModuleType("custom_components")
+        package.__path__ = [str(package_root)]
+        sys.modules["custom_components"] = package
+
+    if "custom_components.savant_energy" not in sys.modules:
+        package = types.ModuleType("custom_components.savant_energy")
+        package.__path__ = [str(savant_root)]
+        sys.modules["custom_components.savant_energy"] = package
+
+    module_path = savant_root / "influx_org_resolver.py"
+    spec = importlib.util.spec_from_file_location(
+        "custom_components.savant_energy.influx_org_resolver",
+        module_path,
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
@@ -113,18 +131,18 @@ class InfluxOrgResolverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(winner, "org-1")
 
-    async def test_discovery_returns_candidates_when_multiple_orgs_are_plausible(self):
+    async def test_discovery_uses_bucket_scan_when_org_list_is_empty(self):
         resolver = _load_resolver_module()
-        org_rows = {
-            "org-1": _build_circuit_csv("org-1", 1),
-            "org-2": _build_circuit_csv("org-2", 1),
-        }
+        org_rows = _build_circuit_csv("org-1", 1)
 
         def handler(method, url, kwargs):
-            if method == "GET":
-                return _FakeResponse(200, payload={"orgs": [{"id": "org-1"}, {"id": "org-2"}]})
-            org_id = kwargs["params"]["org"]
-            return _FakeResponse(200, text=org_rows[org_id])
+            if method == "GET" and url.endswith("/buckets"):
+                return _FakeResponse(200, payload={"buckets": [{"orgID": "org-1", "name": "localHub"}]})
+            if method == "GET" and url.endswith("/orgs"):
+                return _FakeResponse(200, payload={"orgs": []})
+            if method == "POST":
+                return _FakeResponse(200, text=org_rows)
+            self.fail(f"unexpected call: {method} {url}")
 
         with mock.patch.object(
             resolver.aiohttp,
@@ -133,16 +151,50 @@ class InfluxOrgResolverTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await resolver.async_discover_influx_org("http://example", "token")
 
-        self.assertIsNone(result.selected_org_id)
-        self.assertGreaterEqual(len(result.candidates), 2)
+        self.assertEqual(result.selected_org_id, "org-1")
+        self.assertEqual(result.source, "bucket_scan")
+        self.assertGreaterEqual(len(result.candidates), 1)
+
+    async def test_discovery_prefers_host_metadata_when_it_has_real_rows(self):
+        resolver = _load_resolver_module()
+        metadata = resolver.InfluxHostMetadata(
+            org_id="org-meta",
+            org_name="Racepoint Energy",
+            bucket_name="localHub",
+        )
+
+        def handler(method, url, kwargs):
+            if method == "POST":
+                org_id = kwargs["params"]["org"]
+                if org_id == "org-meta":
+                    return _FakeResponse(200, text=_build_circuit_csv("org-meta", 2))
+            if method == "GET" and url.endswith("/buckets"):
+                return _FakeResponse(200, payload={"buckets": []})
+            if method == "GET" and url.endswith("/orgs"):
+                return _FakeResponse(200, payload={"orgs": []})
+            self.fail(f"unexpected call: {method} {url}")
+
+        with mock.patch.object(
+            resolver.aiohttp,
+            "ClientSession",
+            side_effect=lambda: _FakeClientSession(handler),
+        ):
+            result = await resolver.async_discover_influx_org("http://example", "token", metadata)
+
+        self.assertEqual(result.selected_org_id, "org-meta")
+        self.assertEqual(result.source, "ssh_metadata")
 
     async def test_discovery_does_not_guess_for_a_single_weak_org(self):
         resolver = _load_resolver_module()
 
         def handler(method, url, kwargs):
-            if method == "GET":
+            if method == "GET" and url.endswith("/buckets"):
+                return _FakeResponse(200, payload={"buckets": []})
+            if method == "GET" and url.endswith("/orgs"):
                 return _FakeResponse(200, payload={"orgs": [{"id": "org-1"}]})
-            return _FakeResponse(200, text="")
+            if method == "POST":
+                return _FakeResponse(200, text="")
+            self.fail(f"unexpected call: {method} {url}")
 
         with mock.patch.object(
             resolver.aiohttp,

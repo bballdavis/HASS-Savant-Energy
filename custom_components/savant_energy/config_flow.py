@@ -47,6 +47,7 @@ from .const import (
     SCAN_INTERVAL_OPTIONS,
 )
 from .influx_org_resolver import InfluxOrgCandidate, async_discover_influx_org
+from .ssh_helper import InfluxHostMetadata, async_ssh_bootstrap
 from .legacy.snapshot_data import fetch_current_energy_snapshot
 
 _LOGGER = logging.getLogger(__name__)
@@ -147,16 +148,21 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def _remember_org_candidates(self, candidates: list[InfluxOrgCandidate]) -> None:
         self._pending_org_candidates = {candidate.org_id: candidate for candidate in candidates}
 
-    async def _async_discover_pending_org(self) -> tuple[str | None, str | None]:
+    async def _async_discover_pending_org(
+        self,
+        host_metadata: InfluxHostMetadata | None = None,
+    ) -> tuple[str | None, str | None]:
         """Resolve the best org for the currently pending host/token pair."""
         _LOGGER.debug(
-            "Discovering pending Influx org for host=%s url=%s",
+            "Discovering pending Influx org for host=%s url=%s metadata=%s",
             self._pending.get(CONF_HOST, "<unset>"),
             self._resolve_pending_influx_url(),
+            bool(host_metadata and (host_metadata.org_id or host_metadata.bucket_name)),
         )
         result = await async_discover_influx_org(
             self._resolve_pending_influx_url(),
             self._pending[CONF_INFLUX_TOKEN],
+            host_metadata,
         )
         if result.selected_org_id:
             _LOGGER.info(
@@ -341,9 +347,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                from .ssh_helper import async_ssh_bootstrap
-
-                private_key, token, error_key = await async_ssh_bootstrap(
+                private_key, token, metadata, error_key = await async_ssh_bootstrap(
                     self.hass, self._pending[CONF_HOST], DEFAULT_SSH_USERNAME, ssh_password
                 )
                 if error_key:
@@ -351,7 +355,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 else:
                     self._pending[CONF_INFLUX_TOKEN] = token
                     self._pending[CONF_SSH_PRIVATE_KEY] = private_key
-                    _, outcome = await self._async_discover_pending_org()
+                    _, outcome = await self._async_discover_pending_org(metadata)
                     if outcome is None:
                         return await self._async_finish_current_setup()
                     if outcome == "select":
@@ -579,9 +583,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                from .ssh_helper import async_ssh_bootstrap
-
-                private_key, token, error_key = await async_ssh_bootstrap(
+                private_key, token, metadata, error_key = await async_ssh_bootstrap(
                     self.hass, self._pending[CONF_HOST], DEFAULT_SSH_USERNAME, ssh_password
                 )
                 if error_key:
@@ -589,7 +591,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 else:
                     self._pending[CONF_INFLUX_TOKEN] = token
                     self._pending[CONF_SSH_PRIVATE_KEY] = private_key
-                    _, outcome = await self._async_discover_pending_org()
+                    _, outcome = await self._async_discover_pending_org(metadata)
                     if outcome is None:
                         return await self._async_finish_current_reconfigure(config_entry)
                     if outcome == "select":
@@ -707,13 +709,11 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                from .ssh_helper import async_ssh_bootstrap
-
                 host = self.config_entry.data.get(CONF_HOST, "")
                 if not host:
                     errors[CONF_SSH_PASSWORD] = "host_not_available"
                 else:
-                    private_key, token, error_key = await async_ssh_bootstrap(
+                    private_key, token, metadata, error_key = await async_ssh_bootstrap(
                         self.hass, host, DEFAULT_SSH_USERNAME, ssh_password
                     )
                     if error_key:
@@ -722,6 +722,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         result = await async_discover_influx_org(
                             self.config_entry.data.get(CONF_INFLUX_URL, _derive_influx_url(host)),
                             token,
+                            metadata,
                         )
                         chosen_org = result.selected_org_id
                         current_org = self.config_entry.data.get(CONF_INFLUX_ORG, "")
