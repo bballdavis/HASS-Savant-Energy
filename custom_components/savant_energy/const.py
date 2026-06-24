@@ -29,6 +29,7 @@ CONF_PENDING_CONFIRM_MULTIPLIER = "pending_confirm_multiplier"
 CONF_INFLUX_URL = "influx_url"    # InfluxDB base URL, e.g. http://192.168.1.14:8086
 CONF_INFLUX_TOKEN = "influx_token"  # InfluxDB read token
 CONF_INFLUX_ORG = "influx_org"    # InfluxDB org ID
+CONF_CIRCUIT_MAP = "circuit_map"  # Persisted circuit classification and relay mapping
 
 # Default values
 DEFAULT_SWITCH_COOLDOWN = 15  # seconds

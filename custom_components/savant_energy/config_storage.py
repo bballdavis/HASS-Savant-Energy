@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .const import (
     CONF_ADDRESS,
+    CONF_CIRCUIT_MAP,
     CONF_HOST,
     CONF_INFLUX_AUTH_METHOD,
     CONF_INFLUX_ORG,
@@ -26,6 +27,7 @@ _ENTRY_DATA_KEYS = (
     CONF_INFLUX_URL,
     CONF_INFLUX_TOKEN,
     CONF_INFLUX_ORG,
+    CONF_CIRCUIT_MAP,
     CONF_SSH_PRIVATE_KEY,
 )
 

@@ -41,7 +41,9 @@ class InfluxClientBackfillTests(unittest.IsolatedAsyncioTestCase):
             self.fail(f"unexpected query: {query}")
 
         with mock.patch.object(influx_client, "_post_flux", side_effect=fake_post_flux), mock.patch.object(
-            influx_client, "fetch_relay_uids_from_sem", new=mock.AsyncMock(return_value=(False, {}))
+            influx_client,
+            "fetch_sem_devices_from_sem",
+            new=mock.AsyncMock(return_value=(True, [{"uid": "001AAE1733DB", "load_name": "Circuit 1", "device_label": "Circuit 1"}])),
         ):
             result = await influx_client.fetch_influx_snapshot_with_backfill(
                 "http://example",
@@ -50,6 +52,22 @@ class InfluxClientBackfillTests(unittest.IsolatedAsyncioTestCase):
                 sem_host="sem",
                 sem_port=8644,
                 sample_seconds=5.0,
+                circuit_metadata={
+                    "uuid-1::1": {
+                        "circuit_key": "uuid-1::1",
+                        "savant_uuid": "uuid-1",
+                        "channel": "1",
+                        "type": "0000",
+                        "role": "relay",
+                        "relay_uid": "001AAE1733DB",
+                        "display_name": "Circuit 1",
+                        "influx_name": "Circuit 1",
+                        "legacy_uid": "001AAE1733DB.0",
+                        "legacy_base_uid": "001AAE1733DB",
+                        "role_source": "sem_device_label",
+                        "relay_match_name": "Circuit 1",
+                    }
+                },
             )
 
         self.assertTrue(result.success)

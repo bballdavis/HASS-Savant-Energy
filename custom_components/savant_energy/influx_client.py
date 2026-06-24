@@ -26,6 +26,9 @@ _SCALE_LEARN_MIN_EXPECTED_DELTA_KWH = 0.001
 _CT_ENERGY_REASONABLE_MAX_KWH = 100_000.0
 _CT_ENERGY_GUARD_MIN_ABSOLUTE_JUMP_KWH = 0.25
 _CT_ENERGY_GUARD_DELTA_MULTIPLIER = 25.0
+_CIRCUIT_KEY_SEPARATOR = "::"
+_KNOWN_CT_DEVICE_TYPES = {"007A"}
+_INVALID_NAME_TOKENS = {"", "false", "true", "name", "override"}
 
 # Flux query: fetch last reading for every circuit — relay-controlled and CT-only.
 # We filter on savantUUID being present rather than a specific type code so that
@@ -67,12 +70,34 @@ class InfluxFetchResult:
     query_window: Optional[str] = None
 
 
+@dataclass(slots=True)
+class CircuitDiscoveryResult:
+    """Structured result from resolving the persisted circuit map."""
+
+    success: bool
+    circuit_map: Optional[dict[str, dict[str, Any]]] = None
+    error_key: Optional[str] = None
+    error_message: Optional[str] = None
+    query_window: Optional[str] = None
+
+
 def parse_uid(uid: str) -> tuple[str, str]:
     """Split 'BASE.0' → ('BASE', '0').  Returns (uid, '') when no suffix."""
     base, sep, suffix = uid.partition(".")
     if sep and suffix in ("0", "1"):
         return base, suffix
     return uid, ""
+
+
+def build_circuit_key(savant_uuid: str, channel: str) -> str:
+    """Build a stable circuit key from Influx identity tags."""
+    return f"{savant_uuid.strip()}{_CIRCUIT_KEY_SEPARATOR}{channel.strip()}"
+
+
+def split_circuit_key(circuit_key: str) -> tuple[str, str]:
+    """Split a persisted circuit key into (savantUUID, channel)."""
+    savant_uuid, _sep, channel = str(circuit_key or "").partition(_CIRCUIT_KEY_SEPARATOR)
+    return savant_uuid, channel
 
 
 def _parse_influx_csv(text: str) -> list[dict[str, str]]:
@@ -83,17 +108,18 @@ def _parse_influx_csv(text: str) -> list[dict[str, str]]:
     those and collect only real data rows.
     """
     rows: list[dict[str, str]] = []
-    for block in text.split("\r\n\r\n"):
-        block = block.strip()
-        if not block:
+    for block in re.split(r"\r?\n\r?\n+", text or ""):
+        lines = [
+            line
+            for line in block.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        if not lines:
             continue
-        reader = csv.DictReader(io.StringIO(block))
+        reader = csv.DictReader(io.StringIO("\n".join(lines)))
         if not reader.fieldnames:
             continue
         for row in reader:
-            # Annotation rows have keys starting with '#'
-            if any(str(k).startswith("#") for k in row):
-                continue
             if row:
                 rows.append(row)
     return rows
@@ -162,6 +188,11 @@ def _normalize_name(value: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", (value or "").lower())).strip()
 
 
+def _is_usable_name(value: str) -> bool:
+    """Return True when a name-like tag can be trusted for matching."""
+    return _normalize_name(value) not in _INVALID_NAME_TOKENS
+
+
 def _is_ct_from_tags(classification: str, device_type: str) -> bool:
     """Infer whether a circuit is CT-monitored from Influx metadata tags."""
     text = f"{classification or ''} {device_type or ''}".lower()
@@ -177,59 +208,181 @@ def _is_ct_from_tags(classification: str, device_type: str) -> bool:
     return any(token in text for token in ct_tokens)
 
 
-def _match_relay_uid(circuit_name: str, relay_uids: dict[str, str]) -> str | None:
-    """Match a circuit name to a relay UID with exact-first then bounded fallback."""
-    normalized_circuit = _normalize_name(circuit_name)
-    if not normalized_circuit:
-        return None
+def _is_known_ct_circuit(classification: str, device_type: str) -> bool:
+    """Return True for CT/monitor circuits that should never create switches."""
+    normalized_type = str(device_type or "").strip().upper()
+    return normalized_type in _KNOWN_CT_DEVICE_TYPES or _is_ct_from_tags(classification, device_type)
 
-    normalized_map: dict[str, str] = {}
-    for relay_name, relay_uid in relay_uids.items():
-        norm = _normalize_name(relay_name)
-        if norm and norm not in normalized_map:
-            normalized_map[norm] = relay_uid
 
-    direct = normalized_map.get(normalized_circuit)
-    if direct:
-        return direct
+def _safe_int_channel(value: Any) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 9999
 
-    for relay_name, relay_uid in normalized_map.items():
-        shorter = min(len(relay_name), len(normalized_circuit))
-        if shorter < 5:
+
+def _build_circuit_rows(circuit_text: str) -> tuple[str, dict[str, dict[str, Any]]]:
+    """Collapse Flux CSV rows into one dict per (savantUUID, channel) circuit."""
+    by_circuit_key: dict[str, dict[str, Any]] = {}
+    pbc_device_id = ""
+
+    for row in _parse_influx_csv(circuit_text):
+        savant_uuid = (row.get("savantUUID") or "").strip()
+        channel = (row.get("channel") or "").strip()
+        if (
+            not savant_uuid
+            or not channel
+            or savant_uuid == "savantUUID"
+            or channel == "channel"
+        ):
             continue
-        if relay_name in normalized_circuit or normalized_circuit in relay_name:
-            return relay_uid
-    return None
+
+        if not pbc_device_id:
+            pbc_device_id = (row.get("_measurement") or "").strip()
+
+        circuit_key = build_circuit_key(savant_uuid, channel)
+        if circuit_key not in by_circuit_key:
+            known_keys = {
+                "savantUUID",
+                "name",
+                "channel",
+                "classification",
+                "dimmable",
+                "group",
+                "override",
+                "regarding",
+                "type",
+                "_field",
+                "_value",
+                "_measurement",
+                "_time",
+                "_start",
+                "_stop",
+                "result",
+                "table",
+            }
+            extra_tags = {k: v for k, v in row.items() if k not in known_keys and v}
+            if extra_tags and not by_circuit_key:
+                _LOGGER.debug("InfluxDB extra circuit tags (first row): %s", extra_tags)
+
+            by_circuit_key[circuit_key] = {
+                "circuit_key": circuit_key,
+                "savantUUID": savant_uuid,
+                "channel": channel,
+                "name": (row.get("name") or "").strip(),
+                "classification": (row.get("classification") or "").strip(),
+                "dimmable": _safe_bool(row.get("dimmable", "False")),
+                "group": (row.get("group") or "").strip(),
+                "override": _safe_bool(row.get("override", "False")),
+                "regarding": (row.get("regarding") or "").strip(),
+                "type": (row.get("type") or "").strip(),
+                "_extra_tags": extra_tags,
+            }
+
+        field = (row.get("_field") or "").strip()
+        if field:
+            by_circuit_key[circuit_key][field] = _safe_float(row.get("_value"))
+
+    return pbc_device_id, by_circuit_key
 
 
-def _classify_circuit_role(
-    uid: str,
-    matched_uid: str | None,
-    sem_ok: bool,
-    is_ct_tagged: bool,
-    state: dict[str, Any],
-) -> tuple[str, str | None, str]:
-    """Classify a circuit role while preserving previously learned CT identity."""
-    if matched_uid:
-        state["stable_role"] = "relay"
-        return "relay", matched_uid, "matched_relay"
+def _build_sem_index(
+    devices: list[dict[str, Any]],
+    name_field: str,
+) -> dict[str, dict[str, Any]]:
+    """Index SEM devices by one normalized name field."""
+    indexed: dict[str, dict[str, Any]] = {}
+    for device in devices:
+        normalized = _normalize_name(str(device.get(name_field, "")))
+        if normalized and normalized not in indexed:
+            indexed[normalized] = device
+    return indexed
 
-    learned_divisor = float(state.get("divisor", _DEFAULT_ENERGY_DIVISOR))
-    sticky_ct = state.get("stable_role") == "ct_sensor" or learned_divisor != _DEFAULT_ENERGY_DIVISOR
 
-    if sem_ok:
-        state["stable_role"] = "ct_sensor"
-        return "ct_sensor", None, "sem_unmatched"
+def _match_sem_device(
+    circuit_name: str,
+    by_label: dict[str, dict[str, Any]],
+    by_load_name: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve a circuit name to one SEM relay device."""
+    normalized_name = _normalize_name(circuit_name)
+    if normalized_name in _INVALID_NAME_TOKENS:
+        return None, None
 
-    if is_ct_tagged:
-        state["stable_role"] = "ct_sensor"
-        return "ct_sensor", None, "ct_tags"
+    matched = by_label.get(normalized_name)
+    if matched:
+        return matched, "device_label"
 
-    if sticky_ct:
-        return "ct_sensor", None, "sticky_ct"
+    matched = by_load_name.get(normalized_name)
+    if matched:
+        return matched, "load_name"
 
-    state["stable_role"] = "relay"
-    return "relay", str(uid) or None, "sem_fallback_relay"
+    return None, None
+
+
+def _assign_legacy_identity(circuit_map: dict[str, dict[str, Any]]) -> None:
+    """Assign stable legacy IDs for relay and CT circuits."""
+    relay_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for metadata in circuit_map.values():
+        if metadata.get("role") == "relay" and metadata.get("relay_uid"):
+            relay_groups[str(metadata["relay_uid"])].append(metadata)
+
+    for relay_uid, circuits in relay_groups.items():
+        circuits.sort(key=lambda item: _safe_int_channel(item.get("channel")))
+        for slot, metadata in enumerate(circuits):
+            metadata["legacy_uid"] = f"{relay_uid}.{slot}"
+            metadata["legacy_base_uid"] = relay_uid
+
+    for metadata in circuit_map.values():
+        if metadata.get("legacy_uid"):
+            continue
+        savant_uuid = str(metadata.get("savant_uuid", "")).strip()
+        channel = str(metadata.get("channel", "")).strip()
+        metadata["legacy_uid"] = f"{savant_uuid}.{channel}" if savant_uuid and channel else metadata["circuit_key"]
+        metadata["legacy_base_uid"] = savant_uuid or metadata["circuit_key"]
+
+
+async def fetch_sem_devices_from_sem(
+    sem_host: str = "192.168.1.108",
+    sem_port: int = 8644,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Fetch relay device metadata from the SEM companion API."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"http://{sem_host}:{sem_port}/companion/status"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    _LOGGER.warning("SEM companion API returned HTTP %d", resp.status)
+                    return False, []
+
+                data = await resp.json()
+                devices: list[dict[str, Any]] = []
+                for raw_device in data.get("Devices", []):
+                    uid = str(raw_device.get("UID", "")).strip()
+                    load_name = str(raw_device.get("LoadName", "")).strip()
+                    device_label = str(raw_device.get("DeviceLabel", "")).strip()
+                    if not uid or (not load_name and not device_label):
+                        continue
+                    devices.append(
+                        {
+                            "uid": uid,
+                            "load_name": load_name,
+                            "device_label": device_label,
+                            "model": str(raw_device.get("DeviceModelDescription", "")).strip(),
+                            "slot_number": raw_device.get("SlotNumber"),
+                            "start_address": raw_device.get("StartAddress"),
+                        }
+                    )
+                _LOGGER.debug("SEM companion API: %d relay device(s)", len(devices))
+                return True, devices
+    except Exception as exc:
+        _LOGGER.warning(
+            "Failed to fetch relay devices from SEM %s:%d: %s",
+            sem_host,
+            sem_port,
+            exc,
+        )
+    return False, []
 
 
 def _guard_ct_energy_reading(
@@ -374,6 +527,7 @@ async def fetch_influx_snapshot(
     sem_host: str = "192.168.1.108",
     sem_port: int = 8644,
     scale_state: dict[str, dict[str, Any]] | None = None,
+    circuit_metadata: dict[str, dict[str, Any]] | None = None,
     sample_seconds: float = 5.0,
     range_start: str = "-2m",
 ) -> InfluxFetchResult:
@@ -418,67 +572,39 @@ async def fetch_influx_snapshot(
             query_window=range_start,
         )
 
-    # --- Build presentDemands from circuit CSV ---
-    # Group flat rows (one per field) by savantUUID so we get one dict per circuit.
-    by_uuid: dict[str, dict[str, Any]] = {}
-    pbc_device_id: str = ""  # _measurement tag = PBC device ID (e.g. "60640523DAC90074")
-    for row in _parse_influx_csv(circuit_text):
-        uuid = row.get("savantUUID", "").strip()
-        if not uuid:
-            continue
-
-        # Capture PBC device ID from _measurement (same for all circuit rows)
-        if not pbc_device_id:
-            pbc_device_id = row.get("_measurement", "").strip()
-
-        if uuid not in by_uuid:
-            # Capture all string tag columns — dump any extras at DEBUG level on first
-            # circuit so operators can see the full InfluxDB schema (helps locate
-            # fields like the legacy hex UID if Savant stores it as an additional tag).
-            known_keys = {
-                "savantUUID", "name", "channel", "classification", "dimmable",
-                "override", "type", "_field", "_value", "_measurement", "_time",
-                "_start", "_stop", "result", "table",
-            }
-            extra_tags = {k: v for k, v in row.items() if k not in known_keys and v}
-            if extra_tags and not by_uuid:  # log once, on the first circuit
-                _LOGGER.debug("InfluxDB extra circuit tags (first row): %s", extra_tags)
-
-            by_uuid[uuid] = {
-                "savantUUID": uuid,
-                "name": row.get("name", "").strip(),
-                "channel": row.get("channel", "").strip(),
-                "classification": row.get("classification", "").strip(),
-                "dimmable": _safe_bool(row.get("dimmable", "False")),
-                "override": _safe_bool(row.get("override", "False")),
-                "type": row.get("type", "").strip(),
-                # Preserve any extra tags so callers can inspect them
-                "_extra_tags": extra_tags,
-            }
-
-        field = row.get("_field", "").strip()
-        raw_value = row.get("_value", "")
-        if field:
-            by_uuid[uuid][field] = _safe_float(raw_value)
+    pbc_device_id, by_circuit_key = _build_circuit_rows(circuit_text)
 
     if scale_state is None:
         scale_state = {}
-
-    # Fetch SEM relay map early so we can classify circuits before any scaling decisions.
-    sem_ok, relay_uids = await fetch_relay_uids_from_sem(sem_host=sem_host, sem_port=sem_port)
+    stored_metadata = circuit_metadata or {}
 
     present_demands: list[dict[str, Any]] = []
-    for uuid, circuit in by_uuid.items():
-        # --- A/B device handling ---
-        # In legacy Savant hardware, two circuit slots on the same physical
-        # relay module share a base UID (e.g. "001AAE17329B") and are
-        # distinguished by a ".0" / ".1" suffix.  In current UUID-based
-        # systems each circuit has a fully unique UUID with no suffix, but
-        # we remain robust to the suffix form.
-        #
-        # uid       — used as entity unique_id (one entity per circuit)
-        # base_uid  — used as HASS device identifier (A+B share one device)
-        base_uid, _ab_side = parse_uid(uuid)
+    unknown_circuit_keys: list[str] = []
+    seen_circuit_keys: set[str] = set()
+    for circuit_key, circuit in by_circuit_key.items():
+        seen_circuit_keys.add(circuit_key)
+        metadata = stored_metadata.get(circuit_key)
+        if metadata is None:
+            unknown_circuit_keys.append(circuit_key)
+            _LOGGER.warning(
+                "Skipping unmapped Savant circuit %s (%s, channel=%s, type=%s). Run Reconfigure to classify new circuits.",
+                circuit_key,
+                circuit.get("name", "<unnamed>"),
+                circuit.get("channel", "?"),
+                circuit.get("type", "<unknown>"),
+            )
+            continue
+
+        savant_uuid = str(circuit.get("savantUUID", "")).strip()
+        base_uid, _ab_side = parse_uid(savant_uuid)
+        role = str(metadata.get("role", "unknown")).strip().lower()
+        if role not in ("relay", "ct_sensor"):
+            _LOGGER.warning(
+                "Skipping circuit %s because stored role %r is not actionable",
+                circuit_key,
+                metadata.get("role"),
+            )
+            continue
 
         power_w = _safe_float(circuit.get("power"))
         voltage_v = _safe_float(circuit.get("voltage"))
@@ -486,24 +612,13 @@ async def fetch_influx_snapshot(
         raw_energy = _safe_float(circuit.get("energy"))
         pct_commanded = _safe_float(circuit.get("percentCommanded"))
         flags = int(_safe_float(circuit.get("flags")))
-
-        matched_uid = _match_relay_uid(circuit.get("name", ""), relay_uids)
-        is_ct_tagged = _is_ct_from_tags(
-            str(circuit.get("classification", "")),
-            str(circuit.get("type", "")),
-        )
-        state = scale_state.setdefault(uuid, {})
-        role, relay_uid, role_source = _classify_circuit_role(
-            uuid,
-            matched_uid,
-            sem_ok,
-            is_ct_tagged,
-            state,
-        )
+        state = scale_state.setdefault(circuit_key, {})
+        relay_uid = str(metadata.get("relay_uid", "")).strip() or None
+        role_source = str(metadata.get("role_source", "config_entry")).strip() or "config_entry"
 
         if role == "ct_sensor":
             energy_kwh, energy_diag = _resolve_energy_scale(
-                uuid,
+                circuit_key,
                 raw_energy,
                 power_w,
                 sample_seconds,
@@ -540,15 +655,21 @@ async def fetch_influx_snapshot(
         present_demands.append(
             {
                 # Identity
-                "uid": uuid,          # Full savantUUID (stable entity key)
+                "uid": circuit_key,   # Stable entity key = (savantUUID, channel)
+                "circuit_key": circuit_key,
                 "base_uid": base_uid, # Base UID for HASS device grouping
-                "name": circuit.get("name", f"Circuit {circuit.get('channel', uuid)}"),
+                "name": metadata.get("display_name")
+                or circuit.get("name")
+                or f"Circuit {circuit.get('channel', savant_uuid)}",
+                "influx_name": circuit.get("name", ""),
                 "channel": circuit.get("channel", ""),
                 "classification": circuit.get("classification", ""),
                 "type": circuit.get("type", ""),
                 "role": role,
                 "relay_uid": relay_uid,
                 "has_relay": role == "relay",
+                "relay_match_name": metadata.get("relay_match_name"),
+                "relay_match_source": metadata.get("role_source"),
                 # State
                 "dimmable": circuit.get("dimmable", False),
                 "override": circuit.get("override", False),
@@ -571,10 +692,12 @@ async def fetch_influx_snapshot(
                 "energy_role_source": energy_diag["energy_role_source"],
                 # Device metadata
                 "capacity": capacity,
+                "legacy_uid": metadata.get("legacy_uid", circuit_key),
+                "legacy_base_uid": metadata.get("legacy_base_uid", base_uid or circuit_key),
             }
         )
 
-    if not present_demands:
+    if not by_circuit_key:
         return InfluxFetchResult(
             success=False,
             error_type="empty_response",
@@ -603,37 +726,6 @@ async def fetch_influx_snapshot(
         ),
     )
 
-    # --- Finalize relay mapping metadata for logging/consistency ---
-    for circuit in present_demands:
-        matched_uid = circuit.get("relay_uid")
-        if matched_uid:
-            _LOGGER.debug("Mapped circuit '%s' to relay UID %s", circuit["name"], matched_uid)
-
-    # --- Assign legacy_uid for entity identity preservation ---
-    # Group relay-controlled circuits by relay_uid, sort by channel, assign a
-    # ".0"/".1" slot index. This reconstructs the MAC-based hex UIDs that were
-    # used as entity unique_ids in legacy TCP mode (e.g. "001AAE17CF15.0"),
-    # so existing entities are updated rather than recreated when transitioning
-    # an installed system from legacy to current (InfluxDB) mode.
-    relay_groups: dict[str, list] = defaultdict(list)
-    for circuit in present_demands:
-        if circuit.get("has_relay") and circuit.get("relay_uid"):
-            relay_groups[circuit["relay_uid"]].append(circuit)
-
-    for relay_uid_key, circuits in relay_groups.items():
-        circuits.sort(
-            key=lambda c: int(c["channel"]) if str(c.get("channel", "")).isdigit() else 9999
-        )
-        for slot, circuit in enumerate(circuits):
-            circuit["legacy_uid"] = f"{relay_uid_key}.{slot}"
-            circuit["legacy_base_uid"] = relay_uid_key
-
-    # CT-monitored circuits have no legacy MAC UID — fall back to their InfluxDB UUID.
-    for circuit in present_demands:
-        if "legacy_uid" not in circuit:
-            circuit["legacy_uid"] = circuit["uid"]
-            circuit["legacy_base_uid"] = circuit.get("base_uid", circuit["uid"])
-
     # --- Build system_data from hub CSV ---
     # Keys are the InfluxDB channel tag values, e.g. "Energy.Total.Consumption.Power"
     system_data: dict[str, float] = {}
@@ -649,12 +741,24 @@ async def fetch_influx_snapshot(
         len(system_data),
     )
 
+    missing_circuit_keys = sorted(set(stored_metadata) - seen_circuit_keys)
+    if missing_circuit_keys:
+        _LOGGER.warning(
+            "Stored Savant circuits were not present in the latest Influx snapshot: %s",
+            ", ".join(missing_circuit_keys[:10]),
+        )
+
     return InfluxFetchResult(
         success=True,
         data={
             "presentDemands": present_demands,
             "system_data": system_data,
             "pbc_device_id": pbc_device_id,  # PBC SignalR target device ID
+            "circuit_map_status": {
+                "reconfigure_required": bool(unknown_circuit_keys or missing_circuit_keys),
+                "unknown_circuit_keys": unknown_circuit_keys,
+                "missing_circuit_keys": missing_circuit_keys,
+            },
         },
         query_window=range_start,
     )
@@ -667,6 +771,7 @@ async def fetch_influx_snapshot_with_backfill(
     sem_host: str = "192.168.1.108",
     sem_port: int = 8644,
     scale_state: dict[str, dict[str, Any]] | None = None,
+    circuit_metadata: dict[str, dict[str, Any]] | None = None,
     sample_seconds: float = 5.0,
     backfill_windows: tuple[str, ...] = _BACKFILL_WINDOWS,
 ) -> InfluxFetchResult:
@@ -685,6 +790,7 @@ async def fetch_influx_snapshot_with_backfill(
             sem_host=sem_host,
             sem_port=sem_port,
             scale_state=scale_state,
+            circuit_metadata=circuit_metadata,
             sample_seconds=sample_seconds,
             range_start=range_start,
         )
@@ -727,31 +833,162 @@ async def fetch_influx_snapshot_with_backfill(
     )
 
 
-async def fetch_relay_uids_from_sem(
-    sem_host: str = "192.168.1.108", sem_port: int = 8644
-) -> tuple[bool, dict[str, str]]:
-    """Fetch relay device UIDs from SEM companion API.
-
-    Returns (api_ok, devices) where api_ok indicates whether the SEM was reachable.
-    devices maps lowercase load names to legacy UIDs (e.g., "smoke detector" -> "001AAE1733DB").
-    Only devices that appear here have physical relays; everything else is CT-monitored only.
-    """
+async def discover_circuit_metadata(
+    influx_url: str,
+    influx_token: str,
+    influx_org: str,
+    sem_host: str = "192.168.1.108",
+    sem_port: int = 8644,
+    range_start: str = "-2m",
+) -> CircuitDiscoveryResult:
+    """Resolve relay/CT identity once during setup or reconfigure."""
     try:
         async with aiohttp.ClientSession() as session:
-            url = f"http://{sem_host}:{sem_port}/companion/status"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    devices: dict[str, str] = {}
-                    for device in data.get("Devices", []):
-                        uid = device.get("UID")
-                        name = device.get("LoadName", "")
-                        if uid and name:
-                            devices[name.lower()] = uid
-                    _LOGGER.debug("SEM companion API: %d relay device(s)", len(devices))
-                    return True, devices
-                _LOGGER.warning("SEM companion API returned HTTP %d", resp.status)
-    except Exception as exc:
-        _LOGGER.warning("Failed to fetch relay UIDs from SEM %s:%d: %s", sem_host, sem_port, exc)
+            ok, circuit_text, err, auth_failure, org_failure = await _post_flux(
+                session,
+                influx_url,
+                influx_token,
+                influx_org,
+                _CIRCUIT_QUERY.format(range_start=range_start),
+            )
+    except Exception as exc:  # pragma: no cover
+        return CircuitDiscoveryResult(
+            success=False,
+            error_key="circuit_discovery_failed",
+            error_message=str(exc),
+            query_window=range_start,
+        )
 
-    return False, {}
+    if not ok:
+        return CircuitDiscoveryResult(
+            success=False,
+            error_key=(
+                "org_auth_failed"
+                if auth_failure
+                else "org_discovery_failed"
+                if org_failure
+                else "circuit_discovery_failed"
+            ),
+            error_message=err,
+            query_window=range_start,
+        )
+
+    _pbc_device_id, by_circuit_key = _build_circuit_rows(circuit_text)
+    if not by_circuit_key:
+        return CircuitDiscoveryResult(
+            success=False,
+            error_key="circuit_discovery_failed",
+            error_message="InfluxDB returned no circuit rows during discovery.",
+            query_window=range_start,
+        )
+
+    sem_ok, sem_devices = await fetch_sem_devices_from_sem(sem_host=sem_host, sem_port=sem_port)
+    if not sem_ok or not sem_devices:
+        return CircuitDiscoveryResult(
+            success=False,
+            error_key="sem_companion_failed",
+            error_message="Could not reach the SEM companion status API or no relay devices were returned.",
+            query_window=range_start,
+        )
+
+    by_label = _build_sem_index(sem_devices, "device_label")
+    by_load_name = _build_sem_index(sem_devices, "load_name")
+
+    circuit_map: dict[str, dict[str, Any]] = {}
+    unresolved: list[str] = []
+    for circuit_key, circuit in sorted(
+        by_circuit_key.items(),
+        key=lambda item: (_safe_int_channel(item[1].get("channel")), str(item[1].get("name", ""))),
+    ):
+        circuit_name = str(circuit.get("name", "")).strip()
+        matched_device, match_source = _match_sem_device(circuit_name, by_label, by_load_name)
+        role = "ct_sensor" if _is_known_ct_circuit(circuit.get("classification", ""), circuit.get("type", "")) else "relay_candidate"
+
+        if matched_device is not None:
+            role = "relay"
+        elif role != "ct_sensor":
+            unresolved.append(
+                f"{circuit_name or '<unnamed>'} (channel {circuit.get('channel', '?')}, type {circuit.get('type', '<unknown>')})"
+            )
+            continue
+
+        savant_uuid = str(circuit.get("savantUUID", "")).strip()
+        circuit_map[circuit_key] = {
+            "circuit_key": circuit_key,
+            "savant_uuid": savant_uuid,
+            "channel": str(circuit.get("channel", "")).strip(),
+            "type": str(circuit.get("type", "")).strip(),
+            "role": role if role != "relay_candidate" else "relay",
+            "relay_uid": matched_device.get("uid", "") if matched_device else "",
+            "display_name": (
+                matched_device.get("load_name")
+                or matched_device.get("device_label")
+                or circuit_name
+            )
+            if matched_device
+            else (circuit_name or f"Circuit {circuit.get('channel', '?')}"),
+            "influx_name": circuit_name,
+            "legacy_uid": "",
+            "legacy_base_uid": "",
+            "role_source": (
+                f"sem_{match_source}"
+                if matched_device and match_source
+                else "known_ct_type"
+                if str(circuit.get("type", "")).strip().upper() in _KNOWN_CT_DEVICE_TYPES
+                else "ct_tags"
+            ),
+            "relay_match_name": (
+                matched_device.get("device_label")
+                if match_source == "device_label"
+                else matched_device.get("load_name")
+            )
+            if matched_device
+            else None,
+        }
+
+    if unresolved:
+        return CircuitDiscoveryResult(
+            success=False,
+            error_key="circuit_relay_mapping_failed",
+            error_message="; ".join(unresolved[:5]),
+            query_window=range_start,
+        )
+
+    _assign_legacy_identity(circuit_map)
+    return CircuitDiscoveryResult(
+        success=True,
+        circuit_map=circuit_map,
+        query_window=range_start,
+    )
+
+
+async def discover_circuit_metadata_with_backfill(
+    influx_url: str,
+    influx_token: str,
+    influx_org: str,
+    sem_host: str = "192.168.1.108",
+    sem_port: int = 8644,
+    backfill_windows: tuple[str, ...] = _BACKFILL_WINDOWS,
+) -> CircuitDiscoveryResult:
+    """Resolve the persisted circuit map, widening the lookback window before failing."""
+    last_result: CircuitDiscoveryResult | None = None
+    for range_start in backfill_windows:
+        result = await discover_circuit_metadata(
+            influx_url,
+            influx_token,
+            influx_org,
+            sem_host=sem_host,
+            sem_port=sem_port,
+            range_start=range_start,
+        )
+        if result.success and result.circuit_map:
+            return result
+        last_result = result
+        if result.error_key in {"org_auth_failed", "org_discovery_failed", "sem_companion_failed"}:
+            return result
+    return last_result or CircuitDiscoveryResult(
+        success=False,
+        error_key="circuit_discovery_failed",
+        error_message="Circuit discovery did not return any data.",
+        query_window=backfill_windows[-1] if backfill_windows else None,
+    )

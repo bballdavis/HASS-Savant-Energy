@@ -46,21 +46,10 @@ class InfluxEnergyScalingTests(unittest.TestCase):
         self.assertEqual(diagnostics["energy_scale_divisor"], 1_000_000_000)
         self.assertEqual(diagnostics["energy_scale_status"], "locked")
 
-    def test_classify_circuit_role_keeps_sticky_ct_without_sem(self):
+    def test_known_ct_circuit_detects_tesla_type(self):
         module = _load_influx_client_module()
-        state = {"divisor": 1_000_000_000.0, "stable_role": "ct_sensor"}
-
-        role, relay_uid, role_source = module._classify_circuit_role(
-            "tesla-ct",
-            matched_uid=None,
-            sem_ok=False,
-            is_ct_tagged=False,
-            state=state,
-        )
-
-        self.assertEqual(role, "ct_sensor")
-        self.assertIsNone(relay_uid)
-        self.assertEqual(role_source, "sticky_ct")
+        self.assertTrue(module._is_known_ct_circuit("Consumption", "007A"))
+        self.assertFalse(module._is_known_ct_circuit("Consumption", "0074"))
 
     def test_guard_ct_energy_reading_blocks_implausible_jump(self):
         module = _load_influx_client_module()

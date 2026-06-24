@@ -8,6 +8,7 @@ import copy
 import logging
 from datetime import timedelta, datetime
 import os
+from typing import Any
 
 import homeassistant.helpers.config_validation as cv  # type: ignore
 import voluptuous as vol  # type: ignore
@@ -22,6 +23,7 @@ from .const import (
     DOMAIN,
     PLATFORMS,
     CONF_ADDRESS,
+    CONF_CIRCUIT_MAP,
     CONF_HOST,
     CONF_INFLUX_AUTH_METHOD,
     CONF_MODE,
@@ -68,6 +70,7 @@ CONFIG_SCHEMA = vol.Schema(
 LOVELACE_CARD_FILENAME = "savant-energy-scenes-card.js"
 LEGACY_FEED_NOTIFICATION_ID = f"{DOMAIN}_legacy_feed_unavailable"
 INFLUX_ORG_NOTIFICATION_ID = f"{DOMAIN}_influx_org_selection_required"
+CIRCUIT_MAP_NOTIFICATION_ID = f"{DOMAIN}_circuit_map_reconfigure_required"
 _BACKFILL_WINDOWS = ("-2m", "-15m", "-24h", "-7d")
 _UNSET = object()
 
@@ -96,6 +99,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.influx_url = entry.data.get(CONF_INFLUX_URL, f"http://{self.host}:8086")
         self.influx_token = entry.data.get(CONF_INFLUX_TOKEN, "")
         self.influx_org = entry.data.get(CONF_INFLUX_ORG, DEFAULT_INFLUX_ORG)
+        self.circuit_map = entry.data.get(CONF_CIRCUIT_MAP, {})
         self.influx_host_metadata: InfluxHostMetadata | None = None
         self.config_entry = entry
         self.base_scan_interval_seconds = scan_interval
@@ -195,6 +199,45 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             blocking=True,
         )
 
+    async def _async_notify_circuit_map_reconfigure_required(
+        self,
+        status: dict[str, Any],
+    ) -> None:
+        """Tell the user to reconfigure when Influx no longer matches the stored circuit map."""
+        unknown = status.get("unknown_circuit_keys") or []
+        missing = status.get("missing_circuit_keys") or []
+        message = (
+            "Savant Energy found a circuit inventory mismatch between InfluxDB and the stored "
+            "relay/CT map. Run Reconfigure so the integration can rebuild its circuit mapping."
+        )
+        details: list[str] = []
+        if unknown:
+            details.append(f"New/unmapped circuits: {', '.join(unknown[:5])}")
+        if missing:
+            details.append(f"Missing stored circuits: {', '.join(missing[:5])}")
+        if details:
+            message = f"{message}\n\n" + "\n".join(details)
+
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "create",
+            {
+                "title": "Savant Energy Reconfigure Required",
+                "message": message,
+                "notification_id": CIRCUIT_MAP_NOTIFICATION_ID,
+            },
+            blocking=True,
+        )
+
+    async def _async_dismiss_circuit_map_notification(self) -> None:
+        """Dismiss the reconfigure-needed notification once the circuit map is healthy."""
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": CIRCUIT_MAP_NOTIFICATION_ID},
+            blocking=True,
+        )
+
     async def _async_resolve_influx_org(
         self,
         host_metadata: InfluxHostMetadata | None = None,
@@ -291,6 +334,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             sem_host=self.sem_host,
             sem_port=self.sem_companion_port,
             scale_state=self.energy_scale_state,
+            circuit_metadata=self.circuit_map,
             sample_seconds=float(self.update_interval.total_seconds()),
         )
         if result.success and result.data is not None and result.query_window and result.query_window != _BACKFILL_WINDOWS[0]:
@@ -502,6 +546,11 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self._adjust_interval(success=True)
         self.last_fetch_error = None
         await self._async_dismiss_influx_org_notification()
+        circuit_map_status = snapshot_data.get("circuit_map_status", {})
+        if circuit_map_status.get("reconfigure_required"):
+            await self._async_notify_circuit_map_reconfigure_required(circuit_map_status)
+        else:
+            await self._async_dismiss_circuit_map_notification()
 
         present_demands = snapshot_data.get("presentDemands", [])
         if isinstance(present_demands, list):
@@ -547,6 +596,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 "failure_count": 0,
                 "next_retry_seconds": int(self.update_interval.total_seconds()),
                 "used_cached_snapshot": False,
+                "reconfigure_required": bool(circuit_map_status.get("reconfigure_required")),
             },
         }
 

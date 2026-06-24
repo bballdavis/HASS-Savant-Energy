@@ -204,7 +204,10 @@
       "org_discovery_failed": "Could not discover a valid Influx organization from host metadata, buckets, or the org list. Check the host IP and credentials, then try again.",
       "org_discovery_no_orgs": "The token was accepted, but Influx's org list was empty.",
       "org_discovery_no_data": "Influx organizations were found, but none matched the expected Savant energy data shape.",
-      "org_selection_required": "Multiple plausible organizations were found. Choose the correct one to continue."
+      "org_selection_required": "Multiple plausible organizations were found. Choose the correct one to continue.",
+      "sem_companion_failed": "Could not reach the Savant SEM companion status API on the configured PBC IP address.",
+      "circuit_discovery_failed": "Could not discover Savant circuit data from InfluxDB.",
+      "circuit_relay_mapping_failed": "One or more relay circuits could not be mapped to Savant relay UIDs. Verify the PBC IP and run Reconfigure again."
     },
     "abort": {
       "reconfigure_successful": "Configuration updated successfully."

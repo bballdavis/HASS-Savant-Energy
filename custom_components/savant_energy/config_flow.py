@@ -16,6 +16,7 @@ from .const import (
     AUTH_INFLUX_SSH,
     AUTH_INFLUX_TOKEN,
     CONF_ADDRESS,
+    CONF_CIRCUIT_MAP,
     CONF_DMX_TESTING_MODE,
     CONF_HOST,
     CONF_INFLUX_AUTH_METHOD,
@@ -46,6 +47,7 @@ from .const import (
     MODE_LEGACY,
     SCAN_INTERVAL_OPTIONS,
 )
+from .influx_client import discover_circuit_metadata_with_backfill
 from .influx_org_resolver import InfluxOrgCandidate, async_discover_influx_org
 from .ssh_helper import InfluxHostMetadata, async_ssh_bootstrap
 from .legacy.snapshot_data import fetch_current_energy_snapshot
@@ -139,6 +141,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_INFLUX_ORG,
                 current.get(CONF_INFLUX_ORG, DEFAULT_INFLUX_ORG),
             ),
+            CONF_CIRCUIT_MAP: self._pending.get(
+                CONF_CIRCUIT_MAP,
+                current.get(CONF_CIRCUIT_MAP, {}),
+            ),
             CONF_SSH_PRIVATE_KEY: self._pending.get(
                 CONF_SSH_PRIVATE_KEY,
                 current.get(CONF_SSH_PRIVATE_KEY, ""),
@@ -200,6 +206,25 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if current_url and current_url != derived_current_url:
             return current_url
         return _derive_influx_url(host_ip)
+
+    async def _async_discover_pending_circuit_map(self) -> str | None:
+        """Resolve the persisted circuit map for the pending current-mode config."""
+        result = await discover_circuit_metadata_with_backfill(
+            self._resolve_pending_influx_url(),
+            self._pending[CONF_INFLUX_TOKEN],
+            self._pending[CONF_INFLUX_ORG],
+            sem_host=self._pending[CONF_ADDRESS],
+        )
+        if result.success and result.circuit_map:
+            self._pending[CONF_CIRCUIT_MAP] = result.circuit_map
+            return None
+        _LOGGER.warning(
+            "Current-mode circuit discovery failed for %s via %s: %s",
+            self._pending.get(CONF_ADDRESS, "<unset>"),
+            result.query_window or "<unset>",
+            result.error_message or result.error_key or "<no details>",
+        )
+        return result.error_key or "circuit_discovery_failed"
 
     async def _async_finish_current_setup(self):
         """Create the new current-mode entry from pending values."""
@@ -328,10 +353,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._pending[CONF_INFLUX_TOKEN] = token
                 _, outcome = await self._async_discover_pending_org()
                 if outcome is None:
-                    return await self._async_finish_current_setup()
+                    circuit_error = await self._async_discover_pending_circuit_map()
+                    if circuit_error is None:
+                        return await self._async_finish_current_setup()
+                    errors["base"] = circuit_error
                 if outcome == "select":
                     return await self.async_step_current_org_select()
-                errors["base"] = outcome
+                elif "base" not in errors:
+                    errors["base"] = outcome
 
         return self.async_show_form(
             step_id="current_token",
@@ -357,10 +386,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     self._pending[CONF_SSH_PRIVATE_KEY] = private_key
                     _, outcome = await self._async_discover_pending_org(metadata)
                     if outcome is None:
-                        return await self._async_finish_current_setup()
+                        circuit_error = await self._async_discover_pending_circuit_map()
+                        if circuit_error is None:
+                            return await self._async_finish_current_setup()
+                        errors["base"] = circuit_error
                     if outcome == "select":
                         return await self.async_step_current_org_select()
-                    errors["base"] = outcome
+                    elif "base" not in errors:
+                        errors["base"] = outcome
 
         return self.async_show_form(
             step_id="current_ssh",
@@ -378,7 +411,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 self._pending[CONF_INFLUX_ORG] = org_id
                 self._pending_org_candidates = {}
-                return await self._async_finish_current_setup()
+                circuit_error = await self._async_discover_pending_circuit_map()
+                if circuit_error is None:
+                    return await self._async_finish_current_setup()
+                errors["base"] = circuit_error
 
         return self.async_show_form(
             step_id="current_org_select",
@@ -556,10 +592,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._pending[CONF_INFLUX_TOKEN] = token
                 _, outcome = await self._async_discover_pending_org()
                 if outcome is None:
-                    return await self._async_finish_current_reconfigure(config_entry)
+                    circuit_error = await self._async_discover_pending_circuit_map()
+                    if circuit_error is None:
+                        return await self._async_finish_current_reconfigure(config_entry)
+                    errors["base"] = circuit_error
                 if outcome == "select":
                     return await self.async_step_reconfigure_org_select()
-                errors["base"] = outcome
+                elif "base" not in errors:
+                    errors["base"] = outcome
 
         return self.async_show_form(
             step_id="reconfigure_token",
@@ -593,10 +633,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     self._pending[CONF_SSH_PRIVATE_KEY] = private_key
                     _, outcome = await self._async_discover_pending_org(metadata)
                     if outcome is None:
-                        return await self._async_finish_current_reconfigure(config_entry)
+                        circuit_error = await self._async_discover_pending_circuit_map()
+                        if circuit_error is None:
+                            return await self._async_finish_current_reconfigure(config_entry)
+                        errors["base"] = circuit_error
                     if outcome == "select":
                         return await self.async_step_reconfigure_org_select()
-                    errors["base"] = outcome
+                    elif "base" not in errors:
+                        errors["base"] = outcome
 
         return self.async_show_form(
             step_id="reconfigure_ssh",
@@ -615,7 +659,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 self._pending[CONF_INFLUX_ORG] = org_id
                 self._pending_org_candidates = {}
-                return await self._async_finish_current_reconfigure(config_entry)
+                circuit_error = await self._async_discover_pending_circuit_map()
+                if circuit_error is None:
+                    return await self._async_finish_current_reconfigure(config_entry)
+                errors["base"] = circuit_error
 
         return self.async_show_form(
             step_id="reconfigure_org_select",
