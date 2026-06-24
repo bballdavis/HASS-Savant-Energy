@@ -221,6 +221,96 @@ def _safe_int_channel(value: Any) -> int:
         return 9999
 
 
+def _combine_ct_current(legs: list[dict[str, Any]]) -> float:
+    """Combine split-leg CT current into one reader-friendly value."""
+    currents = [
+        _safe_float(leg.get("current"))
+        for leg in legs
+        if leg.get("current") not in (None, "")
+    ]
+    if not currents:
+        return 0.0
+    return sum(currents) / len(currents)
+
+
+def _combine_ct_voltage(legs: list[dict[str, Any]]) -> float:
+    """Combine split-leg CT voltage into a whole-load value."""
+    voltages = [
+        _safe_float(leg.get("voltage"))
+        for leg in legs
+        if leg.get("voltage") not in (None, "")
+    ]
+    if not voltages:
+        return 0.0
+    if len(voltages) == 1:
+        return voltages[0]
+    return sum(voltages)
+
+
+def _expand_multi_leg_ct_circuits(
+    present_demands: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add aggregate CT sensors while keeping each live leg visible."""
+    ct_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    passthrough: list[dict[str, Any]] = []
+
+    for device in present_demands:
+        if device.get("role") == "ct_sensor" and device.get("legacy_base_uid"):
+            ct_groups[str(device["legacy_base_uid"])].append(device)
+        else:
+            passthrough.append(device)
+
+    expanded = list(passthrough)
+    for base_uid, legs in ct_groups.items():
+        legs.sort(key=lambda item: _safe_int_channel(item.get("channel")))
+        if len(legs) <= 1:
+            leg = legs[0]
+            leg["ct_leg_index"] = 1
+            leg["ct_leg_count"] = 1
+            leg["ct_parent_uid"] = base_uid
+            expanded.append(leg)
+            continue
+
+        aggregate_name = str(legs[0].get("name") or legs[0].get("influx_name") or "CT Load").strip()
+        aggregate = dict(legs[0])
+        aggregate["uid"] = base_uid
+        aggregate["circuit_key"] = f"{base_uid}{_CIRCUIT_KEY_SEPARATOR}aggregate"
+        aggregate["name"] = aggregate_name
+        aggregate["channel"] = ",".join(str(leg.get("channel", "")).strip() for leg in legs if leg.get("channel"))
+        aggregate["power"] = sum(_safe_float(leg.get("power")) for leg in legs)
+        aggregate["energy"] = sum(_safe_float(leg.get("energy")) for leg in legs)
+        aggregate["energy_raw"] = sum(_safe_float(leg.get("energy_raw")) for leg in legs)
+        aggregate["current"] = _combine_ct_current(legs)
+        aggregate["voltage"] = _combine_ct_voltage(legs)
+        aggregate["legacy_uid"] = base_uid
+        aggregate["legacy_base_uid"] = base_uid
+        aggregate["energy_scale_divisor"] = None
+        aggregate["energy_scale_confidence"] = None
+        aggregate["energy_scale_status"] = "aggregated_ct"
+        aggregate["expected_delta_last_kwh"] = None
+        aggregate["measured_delta_last_kwh"] = None
+        aggregate["energy_guard_applied"] = any(bool(leg.get("energy_guard_applied")) for leg in legs)
+        aggregate["energy_guard_reason"] = None
+        aggregate["energy_guard_blocked_samples"] = sum(
+            int(leg.get("energy_guard_blocked_samples", 0) or 0) for leg in legs
+        )
+        aggregate["energy_role_source"] = "aggregated_ct"
+        aggregate["ct_leg_index"] = None
+        aggregate["ct_leg_count"] = len(legs)
+        aggregate["ct_parent_uid"] = base_uid
+        aggregate["ct_channels"] = [str(leg.get("channel", "")).strip() for leg in legs]
+        expanded.append(aggregate)
+
+        for idx, leg in enumerate(legs, start=1):
+            leg["name"] = f"{aggregate_name} Leg {idx}"
+            leg["ct_leg_index"] = idx
+            leg["ct_leg_count"] = len(legs)
+            leg["ct_parent_uid"] = base_uid
+            expanded.append(leg)
+
+    return expanded
+
+
 def _build_circuit_rows(circuit_text: str) -> tuple[str, dict[str, dict[str, Any]]]:
     """Collapse Flux CSV rows into one dict per (savantUUID, channel) circuit."""
     by_circuit_key: dict[str, dict[str, Any]] = {}
@@ -713,6 +803,7 @@ async def fetch_influx_snapshot(
     present_demands.sort(
         key=lambda d: int(d["channel"]) if str(d["channel"]).isdigit() else 9999
     )
+    present_demands = _expand_multi_leg_ct_circuits(present_demands)
 
     # Log all circuit names at INFO level so operators can see what came through
     # (useful for diagnosing missing devices like EV chargers that may have

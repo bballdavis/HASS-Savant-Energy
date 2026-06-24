@@ -161,6 +161,10 @@ class EnergyDeviceSensor(CoordinatorEntity, SensorEntity):
             "energy_guard_reason": device.get("energy_guard_reason"),
             "energy_guard_blocked_samples": device.get("energy_guard_blocked_samples"),
             "energy_role_source": device.get("energy_role_source"),
+            "ct_parent_uid": device.get("ct_parent_uid"),
+            "ct_leg_index": device.get("ct_leg_index"),
+            "ct_leg_count": device.get("ct_leg_count"),
+            "ct_channels": device.get("ct_channels"),
         }
 
 

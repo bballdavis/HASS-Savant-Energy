@@ -165,9 +165,16 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(snapshot.success)
         assert snapshot.data is not None
         demands = snapshot.data["presentDemands"]
-        self.assertEqual(len(demands), 30)
+        self.assertEqual(len(demands), 31)
         tesla_demands = [d for d in demands if d["influx_name"] == "Tesla"]
-        self.assertEqual(len(tesla_demands), 2)
+        self.assertEqual(len(tesla_demands), 3)
+        aggregate = next(d for d in tesla_demands if d["uid"] == _TESLA_UUID)
+        self.assertEqual(aggregate["name"], "Tesla")
+        self.assertEqual(round(float(aggregate["power"]), 3), round(1.04 + 2.03, 3))
+        self.assertEqual(round(float(aggregate["current"]), 3), round((0.022 + 0.022) / 2.0, 3))
+        self.assertEqual(round(float(aggregate["voltage"]), 3), round(121.5 + 121.5, 3))
+        leg_names = sorted(d["name"] for d in tesla_demands if d["uid"] != _TESLA_UUID)
+        self.assertEqual(leg_names, ["Tesla Leg 1", "Tesla Leg 2"])
         self.assertFalse(snapshot.data["circuit_map_status"]["reconfigure_required"])
 
     async def test_fetch_influx_snapshot_flags_reconfigure_when_new_circuit_appears(self):
