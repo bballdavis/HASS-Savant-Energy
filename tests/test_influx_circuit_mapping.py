@@ -98,6 +98,27 @@ def _sem_devices():
     ]
 
 
+def _single_circuit_csv(
+    *,
+    name: str,
+    savant_uuid: str = "UUID-1",
+    channel: str = "1",
+    classification: str = "relay",
+    device_type: str = "0000",
+    measurement: str = "PBC-1",
+) -> str:
+    rows = [
+        "result,table,_measurement,savantUUID,name,channel,classification,dimmable,override,type,_field,_value",
+        f",_result,{measurement},{savant_uuid},{name},{channel},{classification},false,false,{device_type},power,123.4",
+        f",_result,{measurement},{savant_uuid},{name},{channel},{classification},false,false,{device_type},current,12.3",
+        f",_result,{measurement},{savant_uuid},{name},{channel},{classification},false,false,{device_type},voltage,240",
+        f",_result,{measurement},{savant_uuid},{name},{channel},{classification},false,false,{device_type},energy,1000",
+        f",_result,{measurement},{savant_uuid},{name},{channel},{classification},false,false,{device_type},percentCommanded,100",
+        f",_result,{measurement},{savant_uuid},{name},{channel},{classification},false,false,{device_type},flags,1",
+    ]
+    return "\n".join(rows)
+
+
 class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
     async def test_build_circuit_rows_handles_mixed_headers_and_newlines(self):
         module = _load_influx_client_module()
@@ -138,6 +159,186 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.circuit_map["58DB62D6-6CDB-3000-45E0-321E9A03BB81::10"]["influx_name"], "Yvettes Off")
         self.assertEqual(result.circuit_map[f"{_TESLA_UUID}::6"]["legacy_uid"], f"{_TESLA_UUID}.6")
         self.assertEqual(result.circuit_map[f"{_TESLA_UUID}::7"]["legacy_uid"], f"{_TESLA_UUID}.7")
+
+    async def test_discover_circuit_metadata_uses_alias_match_for_relays(self):
+        module = _load_influx_client_module()
+        circuit_text = _single_circuit_csv(name="Patio Kitchen")
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            return True, circuit_text, "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux), mock.patch.object(
+            module,
+            "fetch_sem_devices_from_sem",
+            new=mock.AsyncMock(
+                return_value=(
+                    True,
+                    [
+                        {
+                            "uid": "001AAE17353D",
+                            "device_label": "Patio Kitch",
+                            "load_name": "Patio Kitchenette",
+                        }
+                    ],
+                ),
+            ),
+        ), mock.patch.object(
+            module,
+            "fetch_pbc_websocket_devices",
+            new=mock.AsyncMock(return_value=(False, [])),
+        ):
+            result = await module.discover_circuit_metadata(
+                "http://example",
+                "token",
+                "org-1",
+                sem_host="sem-host",
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.warnings, [])
+        assert result.circuit_map is not None
+        circuit = result.circuit_map["UUID-1::1"]
+        self.assertEqual(circuit["role"], "relay")
+        self.assertEqual(circuit["relay_uid"], "001AAE17353D")
+        self.assertTrue(str(circuit["role_source"]).startswith("sem_"))
+
+    async def test_discover_circuit_metadata_recovers_relay_via_websocket_fallback(self):
+        module = _load_influx_client_module()
+        circuit_text = _single_circuit_csv(name="Patio Kitchen")
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            return True, circuit_text, "", False, False
+
+        websocket_inventory = [
+            {
+                "uid": "001AAE17353D",
+                "device_label": "Patio Kitchen",
+                "load_name": "Patio Kitchen",
+                "model": "Relay",
+                "slot_number": 2,
+                "start_address": 2,
+                "source": "websocket",
+            }
+        ]
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux), mock.patch.object(
+            module,
+            "fetch_sem_devices_from_sem",
+            new=mock.AsyncMock(
+                return_value=(
+                    True,
+                    [
+                        {
+                            "uid": "001AAE17353D",
+                            "device_label": "Garage Lights",
+                            "load_name": "Garage Lights",
+                        }
+                    ],
+                ),
+            ),
+        ), mock.patch.object(
+            module,
+            "fetch_pbc_websocket_devices",
+            new=mock.AsyncMock(return_value=(True, websocket_inventory)),
+        ) as ws_mock:
+            result = await module.discover_circuit_metadata(
+                "http://example",
+                "token",
+                "org-1",
+                sem_host="sem-host",
+            )
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.websocket_inventory_used)
+        ws_mock.assert_awaited_once()
+        assert result.circuit_map is not None
+        circuit = result.circuit_map["UUID-1::1"]
+        self.assertEqual(circuit["role"], "relay")
+        self.assertEqual(circuit["relay_uid"], "001AAE17353D")
+        self.assertTrue(str(circuit["role_source"]).startswith("websocket_"))
+        self.assertEqual(circuit["resolution_source"], circuit["role_source"])
+
+    async def test_discover_circuit_metadata_downgrades_unmatched_relay_to_ct(self):
+        module = _load_influx_client_module()
+        circuit_text = _single_circuit_csv(name="Mystery Load")
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            return True, circuit_text, "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux), mock.patch.object(
+            module,
+            "fetch_sem_devices_from_sem",
+            new=mock.AsyncMock(
+                return_value=(
+                    True,
+                    [
+                        {
+                            "uid": "001AAE17353D",
+                            "device_label": "Garage Lights",
+                            "load_name": "Garage Lights",
+                        }
+                    ],
+                ),
+            ),
+        ), mock.patch.object(
+            module,
+            "fetch_pbc_websocket_devices",
+            new=mock.AsyncMock(return_value=(False, [])),
+        ):
+            result = await module.discover_circuit_metadata(
+                "http://example",
+                "token",
+                "org-1",
+                sem_host="sem-host",
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("Mystery Load", result.warnings[0])
+        assert result.circuit_map is not None
+        circuit = result.circuit_map["UUID-1::1"]
+        self.assertEqual(circuit["role"], "ct_sensor")
+        self.assertEqual(circuit["relay_uid"], "")
+        self.assertTrue(circuit["downgraded_from_relay"])
+        self.assertEqual(circuit["role_source"], "relay_downgraded_ct")
+
+    async def test_discover_circuit_metadata_recognizes_known_ct_without_warning(self):
+        module = _load_influx_client_module()
+        circuit_text = _single_circuit_csv(name="Tesla", classification="Consumption", device_type="007A")
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            return True, circuit_text, "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux), mock.patch.object(
+            module,
+            "fetch_sem_devices_from_sem",
+            new=mock.AsyncMock(
+                return_value=(
+                    True,
+                    [
+                        {
+                            "uid": "001AAE17353D",
+                            "device_label": "Garage Lights",
+                            "load_name": "Garage Lights",
+                        }
+                    ],
+                ),
+            ),
+        ):
+            result = await module.discover_circuit_metadata(
+                "http://example",
+                "token",
+                "org-1",
+                sem_host="sem-host",
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.warnings, [])
+        assert result.circuit_map is not None
+        circuit = result.circuit_map["UUID-1::1"]
+        self.assertEqual(circuit["role"], "ct_sensor")
+        self.assertEqual(circuit["role_source"], "known_ct_type")
+        self.assertFalse(circuit["downgraded_from_relay"])
 
     async def test_fetch_influx_snapshot_uses_stored_circuit_map_and_preserves_duplicate_ct_channels(self):
         module = _load_influx_client_module()

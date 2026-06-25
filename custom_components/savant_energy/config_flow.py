@@ -53,6 +53,7 @@ from .ssh_helper import InfluxHostMetadata, async_ssh_bootstrap
 from .legacy.snapshot_data import fetch_current_energy_snapshot
 
 _LOGGER = logging.getLogger(__name__)
+_CIRCUIT_MAP_WARNING_NOTIFICATION_ID = f"{DOMAIN}_circuit_map_reconfigure_warning"
 
 
 def _auth_method_selector():
@@ -84,6 +85,20 @@ def _candidate_options(candidates: dict[str, InfluxOrgCandidate]) -> dict[str, s
     return {org_id: candidate.summary for org_id, candidate in candidates.items()}
 
 
+def _format_circuit_map_warning_message(warnings: list[str]) -> str:
+    """Build a user-facing warning for downgraded relay candidates."""
+    intro = (
+        "Savant Energy completed reconfigure, but one or more circuits could not be "
+        "mapped confidently to a Savant relay UID. Those circuits were saved as "
+        "CT/read-only sensors so energy monitoring stays available."
+    )
+    if not warnings:
+        return intro
+
+    listed = "\n".join(f"- {warning}" for warning in warnings[:10])
+    return f"{intro}\n\nDowngraded circuits:\n{listed}"
+
+
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle the configuration flow for Savant Energy."""
 
@@ -94,6 +109,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._pending = {}
         self._pending_org_candidates: dict[str, InfluxOrgCandidate] = {}
+        self._pending_circuit_map_warnings: list[str] = []
 
     def _get_reconfigure_entry(self):
         return self.hass.config_entries.async_get_entry(self.context.get("entry_id"))
@@ -209,6 +225,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def _async_discover_pending_circuit_map(self) -> str | None:
         """Resolve the persisted circuit map for the pending current-mode config."""
+        self._pending_circuit_map_warnings = []
         result = await discover_circuit_metadata_with_backfill(
             self._resolve_pending_influx_url(),
             self._pending[CONF_INFLUX_TOKEN],
@@ -217,6 +234,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         if result.success and result.circuit_map:
             self._pending[CONF_CIRCUIT_MAP] = result.circuit_map
+            self._pending_circuit_map_warnings = list(result.warnings or [])
             return None
         _LOGGER.warning(
             "Current-mode circuit discovery failed for %s via %s: %s",
@@ -225,6 +243,29 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             result.error_message or result.error_key or "<no details>",
         )
         return result.error_key or "circuit_discovery_failed"
+
+    async def _async_update_circuit_map_warning_notification(self) -> None:
+        """Create or clear the reconfigure warning notification."""
+        warnings = self._pending_circuit_map_warnings
+        if warnings:
+            await self.hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "title": "Savant Energy Reconfigure Completed With Warnings",
+                    "message": _format_circuit_map_warning_message(warnings),
+                    "notification_id": _CIRCUIT_MAP_WARNING_NOTIFICATION_ID,
+                },
+                blocking=True,
+            )
+            return
+
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": _CIRCUIT_MAP_WARNING_NOTIFICATION_ID},
+            blocking=True,
+        )
 
     async def _async_finish_current_setup(self):
         """Create the new current-mode entry from pending values."""
@@ -235,6 +276,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             bool(self._pending.get(CONF_INFLUX_TOKEN)),
             bool(self._pending.get(CONF_SSH_PRIVATE_KEY)),
         )
+        await self._async_update_circuit_map_warning_notification()
         return self.async_create_entry(
             title="Savant Energy",
             data=self._build_current_data(),
@@ -255,6 +297,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data=self._build_current_data(config_entry.data),
         )
         await self.hass.config_entries.async_reload(config_entry.entry_id)
+        await self._async_update_circuit_map_warning_notification()
         return self.async_abort(reason="reconfigure_successful")
 
     async def async_step_user(self, user_input=None):

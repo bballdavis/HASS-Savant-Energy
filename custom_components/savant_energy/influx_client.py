@@ -6,11 +6,12 @@ live circuit data and system-level energy totals.
 
 import asyncio
 import csv
+import json
 import io
 import logging
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import aiohttp
@@ -79,6 +80,10 @@ class CircuitDiscoveryResult:
     error_key: Optional[str] = None
     error_message: Optional[str] = None
     query_window: Optional[str] = None
+    warnings: list[str] = field(default_factory=list)
+    downgraded_circuits: list[dict[str, Any]] = field(default_factory=list)
+    websocket_inventory_used: bool = False
+    resolution_sources: dict[str, str] = field(default_factory=dict)
 
 
 def parse_uid(uid: str) -> tuple[str, str]:
@@ -389,25 +394,317 @@ def _build_sem_index(
     return indexed
 
 
+def _normalize_inventory_device(
+    raw_device: dict[str, Any],
+    *,
+    source: str,
+) -> dict[str, Any] | None:
+    """Normalize a relay inventory record from SEM companion or websocket payloads."""
+    uid = str(
+        raw_device.get("uid")
+        or raw_device.get("UID")
+        or raw_device.get("relay_uid")
+        or raw_device.get("relayUid")
+        or raw_device.get("device_uid")
+        or raw_device.get("deviceUid")
+        or ""
+    ).strip()
+    load_name = str(
+        raw_device.get("load_name")
+        or raw_device.get("LoadName")
+        or raw_device.get("name")
+        or raw_device.get("Name")
+        or ""
+    ).strip()
+    device_label = str(
+        raw_device.get("device_label")
+        or raw_device.get("DeviceLabel")
+        or raw_device.get("label")
+        or raw_device.get("Label")
+        or ""
+    ).strip()
+
+    if not uid:
+        return None
+
+    normalized: dict[str, Any] = {
+        "uid": uid,
+        "load_name": load_name,
+        "device_label": device_label,
+        "model": str(
+            raw_device.get("model")
+            or raw_device.get("Model")
+            or raw_device.get("DeviceModelDescription")
+            or ""
+        ).strip(),
+        "slot_number": raw_device.get("slot_number", raw_device.get("SlotNumber")),
+        "start_address": raw_device.get("start_address", raw_device.get("StartAddress")),
+        "source": source,
+    }
+
+    if load_name or device_label:
+        return normalized
+
+    # Some websocket payloads only expose the UID alongside opaque status fields.
+    # Keep those records for diagnostics and future matching heuristics, but they
+    # will not match by name until richer metadata is available.
+    normalized["raw_device"] = dict(raw_device)
+    return normalized
+
+
+def _extract_websocket_device_candidates(payload: Any, *, source: str) -> list[dict[str, Any]]:
+    """Pull device-like records out of a websocket payload."""
+    candidates: list[dict[str, Any]] = []
+
+    def _visit(node: Any) -> None:
+        if isinstance(node, dict):
+            normalized = _normalize_inventory_device(node, source=source)
+            if normalized is not None:
+                candidates.append(normalized)
+
+            for key in ("Devices", "devices", "Inventory", "inventory", "Status", "status", "result", "Result", "data", "Data", "payload", "Payload", "contents", "Contents", "messages", "Messages"):
+                child = node.get(key)
+                if isinstance(child, (dict, list, str)):
+                    _visit(child)
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    _visit(value)
+                elif isinstance(value, str):
+                    _visit(value)
+            return
+
+        if isinstance(node, list):
+            for item in node:
+                _visit(item)
+            return
+
+        if not isinstance(node, str):
+            return
+
+        text = node.strip()
+        if not text:
+            return
+
+        if text.startswith("{") or text.startswith("["):
+            try:
+                _visit(json.loads(text))
+                return
+            except json.JSONDecodeError:
+                pass
+
+        if text.startswith("CON,") or "LoadName=" in text or "DeviceLabel=" in text or "UID=" in text:
+            raw_device: dict[str, Any] = {"raw_message": text}
+            if text.startswith("CON,"):
+                parts = [part.strip() for part in text.split(",")]
+                if len(parts) >= 3:
+                    raw_device["pbc_device_id"] = parts[1]
+                    raw_device["uid"] = parts[2]
+                if len(parts) >= 4:
+                    raw_device["state"] = parts[3]
+                if len(parts) >= 5:
+                    raw_device["signal"] = parts[4]
+            else:
+                for segment in re.split(r"[;| ]+", text):
+                    if "=" not in segment:
+                        continue
+                    key, value = segment.split("=", 1)
+                    raw_device[key.strip()] = value.strip().strip('"')
+            normalized = _normalize_inventory_device(raw_device, source=source)
+            if normalized is not None:
+                candidates.append(normalized)
+
+    _visit(payload)
+
+    # Deduplicate by UID while preserving the first rich record we saw.
+    deduped: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        uid = str(candidate.get("uid", "")).strip()
+        if uid and uid not in deduped:
+            deduped[uid] = candidate
+
+    return list(deduped.values())
+
+
+def _build_receive_letter_command(target_id: str, command_type: str) -> dict[str, Any]:
+    """Build a best-effort SignalR ReceiveLetter command."""
+    return {
+        "type": 1,
+        "target": "ReceiveLetter",
+        "arguments": [
+            target_id,
+            {
+                "deviceId": target_id,
+                "regarding": "command",
+                "contents": {
+                    "address": "",
+                    "command": {"commandType": command_type},
+                },
+                "timestamp": "1970-01-01T00:00:00.000Z",
+            },
+        ],
+    }
+
+
+async def fetch_pbc_websocket_devices(
+    pbc_host: str,
+    pbc_port: int = 8480,
+    pbc_device_id: str = "",
+    timeout_seconds: float = 6.0,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Best-effort websocket inventory probe for relay-capable circuits.
+
+    The websocket path is intentionally discovery-only. It attempts to coerce the
+    hub into emitting its UID-bearing inventory / status payloads, then harvests
+    any device-like records that include a UID plus one of the human-readable
+    naming fields used for relay matching.
+    """
+    websocket_paths = (
+        f"ws://{pbc_host}:{pbc_port}/localhub",
+        f"ws://{pbc_host}:{pbc_port}/",
+    )
+    trigger_commands = ("GET_VERSION", "SET_SEND_ENERGY_LETTERS=1", "GET_PBC_READY")
+
+    for websocket_url in websocket_paths:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(
+                    websocket_url,
+                    protocols=("savant_protocol",),
+                    timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                    heartbeat=15,
+                ) as ws:
+                    _LOGGER.debug("PBC websocket connected: %s", websocket_url)
+
+                    try:
+                        await ws.send_str(json.dumps({"protocol": "json", "version": 1}) + "\x1e")
+                    except Exception:
+                        pass
+
+                    if pbc_device_id:
+                        for command_type in trigger_commands:
+                            try:
+                                await ws.send_str(
+                                    json.dumps(_build_receive_letter_command(pbc_device_id, command_type))
+                                    + "\x1e"
+                                )
+                                await asyncio.sleep(0.1)
+                            except Exception:
+                                break
+
+                    raw_payloads: list[Any] = []
+                    deadline = asyncio.get_running_loop().time() + timeout_seconds
+                    while True:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            break
+                        try:
+                            message = await asyncio.wait_for(ws.receive(), timeout=min(remaining, 1.0))
+                        except asyncio.TimeoutError:
+                            break
+
+                        if message.type == aiohttp.WSMsgType.TEXT:
+                            text = message.data.strip()
+                            if not text:
+                                continue
+                            for frame in text.split("\x1e"):
+                                frame = frame.strip()
+                                if not frame:
+                                    continue
+                                try:
+                                    raw_payloads.append(json.loads(frame))
+                                except json.JSONDecodeError:
+                                    raw_payloads.append(frame)
+                        elif message.type == aiohttp.WSMsgType.BINARY:
+                            try:
+                                raw_payloads.append(message.data.decode("utf-8", errors="ignore"))
+                            except Exception:
+                                continue
+                        elif message.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+                            break
+
+                    devices: list[dict[str, Any]] = []
+                    for payload in raw_payloads:
+                        devices.extend(_extract_websocket_device_candidates(payload, source="websocket"))
+
+                    if devices:
+                        _LOGGER.debug(
+                            "PBC websocket inventory returned %d device candidate(s) from %s",
+                            len(devices),
+                            websocket_url,
+                        )
+                        return True, devices
+        except Exception as exc:
+            _LOGGER.debug(
+                "PBC websocket inventory probe failed for %s:%d via %s: %s",
+                pbc_host,
+                pbc_port,
+                websocket_url,
+                exc,
+            )
+
+    return False, []
+
+
 def _match_sem_device(
     circuit_name: str,
+    sem_devices: list[dict[str, Any]],
     by_label: dict[str, dict[str, Any]],
     by_load_name: dict[str, dict[str, Any]],
-) -> tuple[dict[str, Any] | None, str | None]:
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
     """Resolve a circuit name to one SEM relay device."""
     normalized_name = _normalize_name(circuit_name)
     if normalized_name in _INVALID_NAME_TOKENS:
-        return None, None
+        return None, None, []
 
     matched = by_label.get(normalized_name)
     if matched:
-        return matched, "device_label"
+        return matched, "device_label", []
 
     matched = by_load_name.get(normalized_name)
     if matched:
-        return matched, "load_name"
+        return matched, "load_name", []
 
-    return None, None
+    alias_candidates: list[tuple[dict[str, Any], str, str]] = []
+    seen_uids: set[str] = set()
+    for device in sem_devices:
+        uid = str(device.get("uid", "")).strip()
+        if not uid or uid in seen_uids:
+            continue
+        for field_name in ("device_label", "load_name"):
+            candidate_name = str(device.get(field_name, "")).strip()
+            normalized_candidate = _normalize_name(candidate_name)
+            if not normalized_candidate or normalized_candidate in _INVALID_NAME_TOKENS:
+                continue
+            shorter = min(len(normalized_candidate), len(normalized_name))
+            if shorter < 5:
+                continue
+            if normalized_candidate in normalized_name or normalized_name in normalized_candidate:
+                alias_candidates.append((device, field_name, candidate_name))
+                seen_uids.add(uid)
+                break
+
+    if len(alias_candidates) == 1:
+        device, field_name, _candidate_name = alias_candidates[0]
+        return device, f"{field_name}_alias", []
+
+    return None, None, [candidate_name for _device, _field_name, candidate_name in alias_candidates]
+
+
+def _describe_circuit_downgrade(
+    circuit_name: str,
+    channel: str,
+    device_type: str,
+    near_matches: list[str],
+) -> str:
+    """Format a human-readable warning for a downgraded relay candidate."""
+    base = (
+        f"{circuit_name or '<unnamed>'} (channel {channel or '?'}, type {device_type or '<unknown>'}) "
+        "could not be matched confidently to a Savant relay UID, so it was saved as a CT/read-only sensor."
+    )
+    if near_matches:
+        return f"{base} Near matches: {', '.join(near_matches[:5])}."
+    return f"{base}"
 
 
 def _assign_legacy_identity(circuit_map: dict[str, dict[str, Any]]) -> None:
@@ -930,6 +1227,7 @@ async def discover_circuit_metadata(
     influx_org: str,
     sem_host: str = "192.168.1.108",
     sem_port: int = 8644,
+    pbc_websocket_port: int = 8480,
     range_start: str = "-2m",
 ) -> CircuitDiscoveryResult:
     """Resolve relay/CT identity once during setup or reconfigure."""
@@ -986,69 +1284,199 @@ async def discover_circuit_metadata(
     by_load_name = _build_sem_index(sem_devices, "load_name")
 
     circuit_map: dict[str, dict[str, Any]] = {}
-    unresolved: list[str] = []
+    warnings: list[str] = []
+    downgraded_circuits: list[dict[str, Any]] = []
+    resolution_sources: dict[str, str] = {}
+    unresolved_relay_candidates: list[dict[str, Any]] = []
+
+    def _build_circuit_metadata_entry(
+        *,
+        circuit_key: str,
+        circuit: dict[str, Any],
+        role: str,
+        role_source: str,
+        matched_device: dict[str, Any] | None = None,
+        match_source: str | None = None,
+        alias_candidates: list[str] | None = None,
+        downgraded_from_relay: bool = False,
+    ) -> dict[str, Any]:
+        savant_uuid = str(circuit.get("savantUUID", "")).strip()
+        relay_uid = matched_device.get("uid", "") if matched_device and role == "relay" else ""
+        relay_match_name = None
+        if matched_device and role == "relay":
+            relay_match_name = (
+                matched_device.get("device_label")
+                if match_source == "device_label"
+                else matched_device.get("load_name")
+                if match_source == "load_name"
+                else matched_device.get("device_label")
+                or matched_device.get("load_name")
+            )
+
+        return {
+            "circuit_key": circuit_key,
+            "savant_uuid": savant_uuid,
+            "channel": str(circuit.get("channel", "")).strip(),
+            "type": str(circuit.get("type", "")).strip(),
+            "role": role,
+            "relay_uid": relay_uid,
+            "relay_candidate_uid": relay_uid,
+            "display_name": (
+                matched_device.get("load_name")
+                or matched_device.get("device_label")
+                or str(circuit.get("name", "")).strip()
+                or f"Circuit {circuit.get('channel', '?')}"
+            )
+            if matched_device and role == "relay"
+            else str(circuit.get("name", "")).strip() or f"Circuit {circuit.get('channel', '?')}",
+            "influx_name": str(circuit.get("name", "")).strip(),
+            "legacy_uid": "",
+            "legacy_base_uid": "",
+            "role_source": role_source,
+            "resolution_source": role_source,
+            "relay_match_name": relay_match_name,
+            "relay_match_candidates": alias_candidates or [],
+            "downgraded_from_relay": downgraded_from_relay,
+        }
+
+    def _finalize_relay_downgrade(
+        *,
+        circuit_key: str,
+        circuit: dict[str, Any],
+        alias_candidates: list[str],
+    ) -> None:
+        circuit_name = str(circuit.get("name", "")).strip()
+        warning = _describe_circuit_downgrade(
+            circuit_name,
+            str(circuit.get("channel", "")).strip(),
+            str(circuit.get("type", "")).strip(),
+            alias_candidates,
+        )
+        warnings.append(warning)
+        downgraded_circuits.append(
+            {
+                "circuit_key": circuit_key,
+                "circuit_name": circuit_name or f"Circuit {circuit.get('channel', '?')}",
+                "channel": str(circuit.get("channel", "")).strip(),
+                "type": str(circuit.get("type", "")).strip(),
+                "classification": str(circuit.get("classification", "")).strip(),
+                "warning": warning,
+                "near_matches": alias_candidates,
+            }
+        )
+        circuit_map[circuit_key] = _build_circuit_metadata_entry(
+            circuit_key=circuit_key,
+            circuit=circuit,
+            role="ct_sensor",
+            role_source="relay_downgraded_ct",
+            alias_candidates=alias_candidates,
+            downgraded_from_relay=True,
+        )
+        resolution_sources[circuit_key] = "relay_downgraded_ct"
+
     for circuit_key, circuit in sorted(
         by_circuit_key.items(),
         key=lambda item: (_safe_int_channel(item[1].get("channel")), str(item[1].get("name", ""))),
     ):
         circuit_name = str(circuit.get("name", "")).strip()
-        matched_device, match_source = _match_sem_device(circuit_name, by_label, by_load_name)
-        role = "ct_sensor" if _is_known_ct_circuit(circuit.get("classification", ""), circuit.get("type", "")) else "relay_candidate"
-
-        if matched_device is not None:
-            role = "relay"
-        elif role != "ct_sensor":
-            unresolved.append(
-                f"{circuit_name or '<unnamed>'} (channel {circuit.get('channel', '?')}, type {circuit.get('type', '<unknown>')})"
+        is_known_ct = _is_known_ct_circuit(circuit.get("classification", ""), circuit.get("type", ""))
+        type_code = str(circuit.get("type", "")).strip().upper()
+        if is_known_ct:
+            role_source = "known_ct_type" if type_code in _KNOWN_CT_DEVICE_TYPES else "ct_tags"
+            circuit_map[circuit_key] = _build_circuit_metadata_entry(
+                circuit_key=circuit_key,
+                circuit=circuit,
+                role="ct_sensor",
+                role_source=role_source,
             )
+            resolution_sources[circuit_key] = role_source
             continue
 
-        savant_uuid = str(circuit.get("savantUUID", "")).strip()
-        circuit_map[circuit_key] = {
-            "circuit_key": circuit_key,
-            "savant_uuid": savant_uuid,
-            "channel": str(circuit.get("channel", "")).strip(),
-            "type": str(circuit.get("type", "")).strip(),
-            "role": role if role != "relay_candidate" else "relay",
-            "relay_uid": matched_device.get("uid", "") if matched_device else "",
-            "display_name": (
-                matched_device.get("load_name")
-                or matched_device.get("device_label")
-                or circuit_name
-            )
-            if matched_device
-            else (circuit_name or f"Circuit {circuit.get('channel', '?')}"),
-            "influx_name": circuit_name,
-            "legacy_uid": "",
-            "legacy_base_uid": "",
-            "role_source": (
-                f"sem_{match_source}"
-                if matched_device and match_source
-                else "known_ct_type"
-                if str(circuit.get("type", "")).strip().upper() in _KNOWN_CT_DEVICE_TYPES
-                else "ct_tags"
-            ),
-            "relay_match_name": (
-                matched_device.get("device_label")
-                if match_source == "device_label"
-                else matched_device.get("load_name")
-            )
-            if matched_device
-            else None,
-        }
-
-    if unresolved:
-        return CircuitDiscoveryResult(
-            success=False,
-            error_key="circuit_relay_mapping_failed",
-            error_message="; ".join(unresolved[:5]),
-            query_window=range_start,
+        matched_device, match_source, alias_candidates = _match_sem_device(
+            circuit_name,
+            sem_devices,
+            by_label,
+            by_load_name,
         )
+        if matched_device is not None:
+            role_source = f"sem_{match_source}" if match_source else "relay_exact"
+            circuit_map[circuit_key] = _build_circuit_metadata_entry(
+                circuit_key=circuit_key,
+                circuit=circuit,
+                role="relay",
+                role_source=role_source,
+                matched_device=matched_device,
+                match_source=match_source,
+                alias_candidates=alias_candidates,
+            )
+            resolution_sources[circuit_key] = role_source
+            continue
+
+        unresolved_relay_candidates.append(
+            {
+                "circuit_key": circuit_key,
+                "circuit": circuit,
+                "alias_candidates": alias_candidates,
+            }
+        )
+
+    websocket_devices: list[dict[str, Any]] = []
+    if unresolved_relay_candidates:
+        ws_ok, websocket_devices = await fetch_pbc_websocket_devices(
+            sem_host=sem_host,
+            pbc_port=pbc_websocket_port,
+            pbc_device_id=_pbc_device_id,
+        )
+        if ws_ok and websocket_devices:
+            _LOGGER.info(
+                "PBC websocket inventory returned %d candidate device(s) for fallback relay matching",
+                len(websocket_devices),
+            )
+            for unresolved in unresolved_relay_candidates:
+                circuit_key = unresolved["circuit_key"]
+                circuit = unresolved["circuit"]
+                circuit_name = str(circuit.get("name", "")).strip()
+                matched_device, match_source, alias_candidates = _match_sem_device(
+                    circuit_name,
+                    websocket_devices,
+                    _build_sem_index(websocket_devices, "device_label"),
+                    _build_sem_index(websocket_devices, "load_name"),
+                )
+                if matched_device is not None:
+                    role_source = f"websocket_{match_source}" if match_source else "websocket_match"
+                    circuit_map[circuit_key] = _build_circuit_metadata_entry(
+                        circuit_key=circuit_key,
+                        circuit=circuit,
+                        role="relay",
+                        role_source=role_source,
+                        matched_device=matched_device,
+                        match_source=match_source,
+                        alias_candidates=alias_candidates,
+                    )
+                    resolution_sources[circuit_key] = role_source
+                    continue
+
+                _finalize_relay_downgrade(
+                    circuit_key=circuit_key,
+                    circuit=circuit,
+                    alias_candidates=unresolved["alias_candidates"],
+                )
+        else:
+            for unresolved in unresolved_relay_candidates:
+                _finalize_relay_downgrade(
+                    circuit_key=unresolved["circuit_key"],
+                    circuit=unresolved["circuit"],
+                    alias_candidates=unresolved["alias_candidates"],
+                )
 
     _assign_legacy_identity(circuit_map)
     return CircuitDiscoveryResult(
         success=True,
         circuit_map=circuit_map,
+        warnings=warnings,
+        downgraded_circuits=downgraded_circuits,
+        websocket_inventory_used=bool(websocket_devices),
+        resolution_sources=resolution_sources,
         query_window=range_start,
     )
 
@@ -1059,6 +1487,7 @@ async def discover_circuit_metadata_with_backfill(
     influx_org: str,
     sem_host: str = "192.168.1.108",
     sem_port: int = 8644,
+    pbc_websocket_port: int = 8480,
     backfill_windows: tuple[str, ...] = _BACKFILL_WINDOWS,
 ) -> CircuitDiscoveryResult:
     """Resolve the persisted circuit map, widening the lookback window before failing."""
@@ -1070,6 +1499,7 @@ async def discover_circuit_metadata_with_backfill(
             influx_org,
             sem_host=sem_host,
             sem_port=sem_port,
+            pbc_websocket_port=pbc_websocket_port,
             range_start=range_start,
         )
         if result.success and result.circuit_map:
