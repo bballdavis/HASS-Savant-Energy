@@ -66,3 +66,8 @@ __pycache__/
 # Home Assistant specific
 home-assistant_v2.db
 .savant-local.env
+
+# Local device snapshots and test tokens - contain real hardware identifiers
+output.json
+jwt.token
+*.token

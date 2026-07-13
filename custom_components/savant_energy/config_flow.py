@@ -13,42 +13,47 @@ from homeassistant.core import callback  # type: ignore
 from homeassistant.helpers import selector  # type: ignore
 
 from .const import (
-    DOMAIN,
+    AUTH_INFLUX_SSH,
+    AUTH_INFLUX_TOKEN,
     CONF_ADDRESS,
+    CONF_CIRCUIT_MAP,
+    CONF_DMX_TESTING_MODE,
     CONF_HOST,
+    CONF_INFLUX_AUTH_METHOD,
+    CONF_INFLUX_ORG,
+    CONF_INFLUX_TOKEN,
+    CONF_INFLUX_URL,
     CONF_MODE,
     CONF_OLA_PORT,
-    CONF_SCAN_INTERVAL,
-    CONF_INFLUX_URL,
-    CONF_INFLUX_TOKEN,
-    CONF_INFLUX_ORG,
-    CONF_SWITCH_COOLDOWN,
     CONF_PENDING_CONFIRM_MULTIPLIER,
-    CONF_DMX_TESTING_MODE,
-    CONF_INFLUX_AUTH_METHOD,
-    DEFAULT_MODE,
-    MODE_LEGACY,
-    MODE_CURRENT,
-    MODE_AUTO,
-    DEFAULT_PORT,
-    DEFAULT_OLA_PORT,
-    DEFAULT_SCAN_INTERVAL,
-    DEFAULT_SWITCH_COOLDOWN,
-    DEFAULT_INFLUX_URL,
-    DEFAULT_INFLUX_ORG,
+    CONF_SCAN_INTERVAL,
+    CONF_SSH_PASSWORD,
+    CONF_SSH_PRIVATE_KEY,
+    CONF_SWITCH_COOLDOWN,
     DEFAULT_DMX_TESTING_MODE,
     DEFAULT_DISABLE_SCENE_BUILDER,
-    DEFAULT_PENDING_CONFIRM_MULTIPLIER,
     DEFAULT_INFLUX_AUTH_METHOD,
-    AUTH_INFLUX_TOKEN,
-    AUTH_INFLUX_SSH,
+    DEFAULT_INFLUX_ORG,
+    DEFAULT_MODE,
+    DEFAULT_OLA_PORT,
+    DEFAULT_PENDING_CONFIRM_MULTIPLIER,
+    DEFAULT_PORT,
+    DEFAULT_SCAN_INTERVAL,
+    DEFAULT_SSH_USERNAME,
+    DEFAULT_SWITCH_COOLDOWN,
+    DOMAIN,
+    MODE_AUTO,
+    MODE_CURRENT,
+    MODE_LEGACY,
     SCAN_INTERVAL_OPTIONS,
 )
+from .influx_client import discover_circuit_metadata_with_backfill
+from .influx_org_resolver import InfluxOrgCandidate, async_discover_influx_org
+from .ssh_helper import InfluxHostMetadata, async_ssh_bootstrap
 from .legacy.snapshot_data import fetch_current_energy_snapshot
 
 _LOGGER = logging.getLogger(__name__)
-
-CONF_SSH_PASSWORD = "ssh_password"
+_CIRCUIT_MAP_WARNING_NOTIFICATION_ID = f"{DOMAIN}_circuit_map_reconfigure_warning"
 
 
 def _auth_method_selector():
@@ -76,59 +81,35 @@ def _mode_selector(include_auto: bool = True):
     )
 
 
-async def _fetch_influx_token_via_ssh(
-    hass, host: str, password: str
-) -> tuple[str | None, str | None]:
-    """Retrieve the InfluxDB read token from a Savant host over SSH.
+def _candidate_options(candidates: dict[str, InfluxOrgCandidate]) -> dict[str, str]:
+    return {org_id: candidate.summary for org_id, candidate in candidates.items()}
 
-    All blocking I/O (including the paramiko import) runs on the executor thread.
-    Returns (token, None) on success or (None, error_key) on failure so callers
-    can surface a specific error message in the config UI.
-    """
-    def _worker() -> tuple[str | None, str | None]:
-        try:
-            import paramiko  # type: ignore  # noqa: PLC0415
-        except Exception as exc:
-            _LOGGER.warning("paramiko unavailable — SSH token fetch not possible: %s", exc)
-            return None, "ssh_unavailable"
 
-        client = None
-        try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(hostname=host, username="RPM", password=password, timeout=10)
-            _stdin, stdout, _stderr = client.exec_command(
-                "cat /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken"
-            )
-            token = stdout.read().decode("utf-8", errors="ignore").strip()
-            if not token:
-                _LOGGER.warning("SSH connected to %s but token file was empty or missing", host)
-                return None, "ssh_token_empty"
-            return token, None
-        except Exception as exc:
-            _LOGGER.warning("SSH token fetch from %s failed: %s", host, exc)
-            return None, "ssh_failed"
-        finally:
-            if client:
-                try:
-                    client.close()
-                except Exception:
-                    pass
+def _format_circuit_map_warning_message(warnings: list[str]) -> str:
+    """Build a user-facing warning for downgraded relay candidates."""
+    intro = (
+        "Savant Energy completed reconfigure, but one or more circuits could not be "
+        "mapped confidently to a Savant relay UID. Those circuits were saved as "
+        "CT/read-only sensors so energy monitoring stays available."
+    )
+    if not warnings:
+        return intro
 
-    return await hass.async_add_executor_job(_worker)
+    listed = "\n".join(f"- {warning}" for warning in warnings[:10])
+    return f"{intro}\n\nDowngraded circuits:\n{listed}"
 
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle the configuration flow for Savant Energy."""
 
-    VERSION = 3
+    VERSION = 4
 
     _pending: dict[str, Any]
 
     def __init__(self) -> None:
         self._pending = {}
-
-    # ── Helpers ──────────────────────────────────────────────────────────────
+        self._pending_org_candidates: dict[str, InfluxOrgCandidate] = {}
+        self._pending_circuit_map_warnings: list[str] = []
 
     def _get_reconfigure_entry(self):
         return self.hass.config_entries.async_get_entry(self.context.get("entry_id"))
@@ -146,24 +127,178 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         }
 
     def _build_current_data(self, base: dict | None = None) -> dict:
-        """Build entry data for current mode, preserving any existing settings."""
+        """Build entry data for current mode, preserving existing non-option values."""
+        current = dict(base or {})
         host_ip = self._pending[CONF_HOST]
+        current_url = current.get(CONF_INFLUX_URL)
+        current_host = current.get(CONF_HOST, "")
+        derived_current_url = _derive_influx_url(current_host) if current_host else ""
+        influx_url = (
+            current_url
+            if current_url and current_url != derived_current_url
+            else _derive_influx_url(host_ip)
+        )
         return {
-            CONF_OLA_PORT: DEFAULT_OLA_PORT,
-            CONF_SCAN_INTERVAL: DEFAULT_SCAN_INTERVAL,
-            CONF_DMX_TESTING_MODE: DEFAULT_DMX_TESTING_MODE,
-            "disable_scene_builder": DEFAULT_DISABLE_SCENE_BUILDER,
-            CONF_INFLUX_ORG: DEFAULT_INFLUX_ORG,
-            **(base or {}),
+            CONF_OLA_PORT: current.get(CONF_OLA_PORT, DEFAULT_OLA_PORT),
+            CONF_SCAN_INTERVAL: current.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+            CONF_DMX_TESTING_MODE: current.get(CONF_DMX_TESTING_MODE, DEFAULT_DMX_TESTING_MODE),
+            "disable_scene_builder": current.get("disable_scene_builder", DEFAULT_DISABLE_SCENE_BUILDER),
+            **current,
             CONF_MODE: MODE_CURRENT,
             CONF_ADDRESS: self._pending[CONF_ADDRESS],
             CONF_HOST: host_ip,
-            CONF_INFLUX_AUTH_METHOD: self._pending[CONF_INFLUX_AUTH_METHOD],
-            CONF_INFLUX_URL: _derive_influx_url(host_ip),
+            CONF_INFLUX_AUTH_METHOD: self._pending.get(
+                CONF_INFLUX_AUTH_METHOD,
+                current.get(CONF_INFLUX_AUTH_METHOD, DEFAULT_INFLUX_AUTH_METHOD),
+            ),
+            CONF_INFLUX_URL: influx_url,
             CONF_INFLUX_TOKEN: self._pending[CONF_INFLUX_TOKEN],
+            CONF_INFLUX_ORG: self._pending.get(
+                CONF_INFLUX_ORG,
+                current.get(CONF_INFLUX_ORG, DEFAULT_INFLUX_ORG),
+            ),
+            CONF_CIRCUIT_MAP: self._pending.get(
+                CONF_CIRCUIT_MAP,
+                current.get(CONF_CIRCUIT_MAP, {}),
+            ),
+            CONF_SSH_PRIVATE_KEY: self._pending.get(
+                CONF_SSH_PRIVATE_KEY,
+                current.get(CONF_SSH_PRIVATE_KEY, ""),
+            ),
         }
 
-    # ── Initial setup ────────────────────────────────────────────────────────
+    def _remember_org_candidates(self, candidates: list[InfluxOrgCandidate]) -> None:
+        self._pending_org_candidates = {candidate.org_id: candidate for candidate in candidates}
+
+    async def _async_discover_pending_org(
+        self,
+        host_metadata: InfluxHostMetadata | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Resolve the best org for the currently pending host/token pair."""
+        _LOGGER.debug(
+            "Discovering pending Influx org for host=%s url=%s metadata=%s",
+            self._pending.get(CONF_HOST, "<unset>"),
+            self._resolve_pending_influx_url(),
+            bool(host_metadata and (host_metadata.org_id or host_metadata.bucket_name)),
+        )
+        result = await async_discover_influx_org(
+            self._resolve_pending_influx_url(),
+            self._pending[CONF_INFLUX_TOKEN],
+            host_metadata,
+        )
+        if result.selected_org_id:
+            _LOGGER.info(
+                "Pending Influx org discovery selected %s from %d candidate(s)",
+                result.selected_org_id,
+                len(result.candidates),
+            )
+            self._pending[CONF_INFLUX_ORG] = result.selected_org_id
+            self._pending_org_candidates = {}
+            return result.selected_org_id, None
+        if result.candidates:
+            _LOGGER.debug(
+                "Pending Influx org discovery returned %d candidate(s): %s",
+                len(result.candidates),
+                "; ".join(candidate.summary for candidate in result.candidates[:5]),
+            )
+            self._remember_org_candidates(result.candidates)
+            return None, "select"
+        _LOGGER.debug(
+            "Pending Influx org discovery failed with %s: %s",
+            result.error_key or "<unset>",
+            result.error_message or "<no message>",
+        )
+        return None, result.error_key or "org_discovery_failed"
+
+    def _resolve_pending_influx_url(self) -> str:
+        """Return the best URL for discovery and persistence."""
+        entry = self._get_reconfigure_entry() if self.context.get("entry_id") else None
+        base = entry.data if entry else {}
+        current = dict(base or {})
+        host_ip = self._pending.get(CONF_HOST, current.get(CONF_HOST, ""))
+        current_url = current.get(CONF_INFLUX_URL)
+        current_host = current.get(CONF_HOST, "")
+        derived_current_url = _derive_influx_url(current_host) if current_host else ""
+        if current_url and current_url != derived_current_url:
+            return current_url
+        return _derive_influx_url(host_ip)
+
+    async def _async_discover_pending_circuit_map(self) -> str | None:
+        """Resolve the persisted circuit map for the pending current-mode config."""
+        self._pending_circuit_map_warnings = []
+        result = await discover_circuit_metadata_with_backfill(
+            self._resolve_pending_influx_url(),
+            self._pending[CONF_INFLUX_TOKEN],
+            self._pending[CONF_INFLUX_ORG],
+            sem_host=self._pending[CONF_ADDRESS],
+        )
+        if result.success and result.circuit_map:
+            self._pending[CONF_CIRCUIT_MAP] = result.circuit_map
+            self._pending_circuit_map_warnings = list(result.warnings or [])
+            return None
+        _LOGGER.warning(
+            "Current-mode circuit discovery failed for %s via %s: %s",
+            self._pending.get(CONF_ADDRESS, "<unset>"),
+            result.query_window or "<unset>",
+            result.error_message or result.error_key or "<no details>",
+        )
+        return result.error_key or "circuit_discovery_failed"
+
+    async def _async_update_circuit_map_warning_notification(self) -> None:
+        """Create or clear the reconfigure warning notification."""
+        warnings = self._pending_circuit_map_warnings
+        if warnings:
+            await self.hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "title": "Savant Energy Reconfigure Completed With Warnings",
+                    "message": _format_circuit_map_warning_message(warnings),
+                    "notification_id": _CIRCUIT_MAP_WARNING_NOTIFICATION_ID,
+                },
+                blocking=True,
+            )
+            return
+
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": _CIRCUIT_MAP_WARNING_NOTIFICATION_ID},
+            blocking=True,
+        )
+
+    async def _async_finish_current_setup(self):
+        """Create the new current-mode entry from pending values."""
+        _LOGGER.debug(
+            "Finishing current setup with org=%s url=%s token=%s ssh_key=%s",
+            self._pending.get(CONF_INFLUX_ORG, "<unset>"),
+            self._resolve_pending_influx_url(),
+            bool(self._pending.get(CONF_INFLUX_TOKEN)),
+            bool(self._pending.get(CONF_SSH_PRIVATE_KEY)),
+        )
+        await self._async_update_circuit_map_warning_notification()
+        return self.async_create_entry(
+            title="Savant Energy",
+            data=self._build_current_data(),
+        )
+
+    async def _async_finish_current_reconfigure(self, config_entry):
+        """Persist current-mode data changes and reload the entry."""
+        _LOGGER.debug(
+            "Finishing reconfigure for entry %s with org=%s url=%s token=%s ssh_key=%s",
+            config_entry.entry_id,
+            self._pending.get(CONF_INFLUX_ORG, config_entry.data.get(CONF_INFLUX_ORG, "<unset>")),
+            self._resolve_pending_influx_url(),
+            bool(self._pending.get(CONF_INFLUX_TOKEN)),
+            bool(self._pending.get(CONF_SSH_PRIVATE_KEY)),
+        )
+        self.hass.config_entries.async_update_entry(
+            config_entry,
+            data=self._build_current_data(config_entry.data),
+        )
+        await self.hass.config_entries.async_reload(config_entry.entry_id)
+        await self._async_update_circuit_map_warning_notification()
+        return self.async_abort(reason="reconfigure_successful")
 
     async def async_step_user(self, user_input=None):
         """Step 1: choose operating mode."""
@@ -199,9 +334,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="legacy_setup",
-            data_schema=vol.Schema(
-                {vol.Required(CONF_ADDRESS, default="192.168.1.14"): str}
-            ),
+            data_schema=vol.Schema({vol.Required(CONF_ADDRESS, default="192.168.1.14"): str}),
             errors=errors,
         )
 
@@ -224,24 +357,15 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="current_setup",
             data_schema=vol.Schema(
                 {
-                    vol.Required(
-                        CONF_ADDRESS,
-                        default=self._pending.get(CONF_ADDRESS, "192.168.1.108"),
-                    ): str,
-                    vol.Required(
-                        CONF_HOST,
-                        default=self._pending.get(CONF_HOST, "192.168.1.14"),
-                    ): str,
+                    vol.Required(CONF_ADDRESS, default=self._pending.get(CONF_ADDRESS, "192.168.1.108")): str,
+                    vol.Required(CONF_HOST, default=self._pending.get(CONF_HOST, "192.168.1.14")): str,
                 }
             ),
             errors=errors,
         )
 
     async def async_step_current_auth(self, user_input=None):
-        """Current mode step 2: choose how to provide the Influx token.
-
-        Shared by both the current_setup path and the auto_probe fallback path.
-        """
+        """Current mode step 2: choose how to provide the Influx token."""
         if user_input is not None:
             auth_method = user_input.get(CONF_INFLUX_AUTH_METHOD, DEFAULT_INFLUX_AUTH_METHOD)
             self._pending[CONF_INFLUX_AUTH_METHOD] = auth_method
@@ -270,43 +394,75 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors[CONF_INFLUX_TOKEN] = "required"
             else:
                 self._pending[CONF_INFLUX_TOKEN] = token
-                return self.async_create_entry(
-                    title="Savant Energy",
-                    data=self._build_current_data(),
-                )
+                _, outcome = await self._async_discover_pending_org()
+                if outcome is None:
+                    circuit_error = await self._async_discover_pending_circuit_map()
+                    if circuit_error is None:
+                        return await self._async_finish_current_setup()
+                    errors["base"] = circuit_error
+                if outcome == "select":
+                    return await self.async_step_current_org_select()
+                elif "base" not in errors:
+                    errors["base"] = outcome
 
         return self.async_show_form(
             step_id="current_token",
-            data_schema=vol.Schema(
-                {vol.Required(CONF_INFLUX_TOKEN, default=""): str}
-            ),
+            data_schema=vol.Schema({vol.Required(CONF_INFLUX_TOKEN, default=""): str}),
             errors=errors,
         )
 
     async def async_step_current_ssh(self, user_input=None):
-        """Current mode step 3b: SSH password to auto-fetch the Influx token."""
+        """Current mode step 3b: SSH password (used once) to install key and fetch token."""
         errors = {}
         if user_input is not None:
             ssh_password = (user_input.get(CONF_SSH_PASSWORD) or "").strip()
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                token, ssh_error = await _fetch_influx_token_via_ssh(
-                    self.hass, self._pending[CONF_HOST], ssh_password
+                private_key, token, metadata, error_key = await async_ssh_bootstrap(
+                    self.hass, self._pending[CONF_HOST], DEFAULT_SSH_USERNAME, ssh_password
                 )
-                if ssh_error:
-                    errors[CONF_SSH_PASSWORD] = ssh_error
+                if error_key:
+                    errors[CONF_SSH_PASSWORD] = error_key
                 else:
                     self._pending[CONF_INFLUX_TOKEN] = token
-                    return self.async_create_entry(
-                        title="Savant Energy",
-                        data=self._build_current_data(),
-                    )
+                    self._pending[CONF_SSH_PRIVATE_KEY] = private_key
+                    _, outcome = await self._async_discover_pending_org(metadata)
+                    if outcome is None:
+                        circuit_error = await self._async_discover_pending_circuit_map()
+                        if circuit_error is None:
+                            return await self._async_finish_current_setup()
+                        errors["base"] = circuit_error
+                    if outcome == "select":
+                        return await self.async_step_current_org_select()
+                    elif "base" not in errors:
+                        errors["base"] = outcome
 
         return self.async_show_form(
             step_id="current_ssh",
+            data_schema=vol.Schema({vol.Required(CONF_SSH_PASSWORD): str}),
+            errors=errors,
+        )
+
+    async def async_step_current_org_select(self, user_input=None):
+        """Select a discovered Influx organization during initial setup."""
+        errors = {}
+        if user_input is not None:
+            org_id = user_input.get(CONF_INFLUX_ORG)
+            if org_id not in self._pending_org_candidates:
+                errors["base"] = "org_selection_required"
+            else:
+                self._pending[CONF_INFLUX_ORG] = org_id
+                self._pending_org_candidates = {}
+                circuit_error = await self._async_discover_pending_circuit_map()
+                if circuit_error is None:
+                    return await self._async_finish_current_setup()
+                errors["base"] = circuit_error
+
+        return self.async_show_form(
+            step_id="current_org_select",
             data_schema=vol.Schema(
-                {vol.Required(CONF_SSH_PASSWORD): str}
+                {vol.Required(CONF_INFLUX_ORG): vol.In(_candidate_options(self._pending_org_candidates))}
             ),
             errors=errors,
         )
@@ -335,18 +491,13 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="auto_probe",
             data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_ADDRESS,
-                        default=self._pending.get(CONF_ADDRESS, "192.168.1.108"),
-                    ): str
-                }
+                {vol.Required(CONF_ADDRESS, default=self._pending.get(CONF_ADDRESS, "192.168.1.108")): str}
             ),
             errors=errors,
         )
 
     async def async_step_auto_current_host(self, user_input=None):
-        """Auto fallback: legacy feed not found — enter Host IP then continue to auth."""
+        """Auto fallback: legacy feed not found, enter Host IP then continue to auth."""
         errors = {}
         if user_input is not None:
             host_ip = (user_input.get(CONF_HOST) or "").strip()
@@ -358,13 +509,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="auto_current_host",
-            data_schema=vol.Schema(
-                {vol.Required(CONF_HOST, default="192.168.1.14"): str}
-            ),
+            data_schema=vol.Schema({vol.Required(CONF_HOST, default="192.168.1.14"): str}),
             errors=errors,
         )
-
-    # ── Reconfigure flow ────────────────────────────────────────────────────
 
     async def async_step_reconfigure(self, user_input=None):
         """Reconfigure step 1: choose mode."""
@@ -468,7 +615,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     vol.Required(
                         CONF_INFLUX_AUTH_METHOD,
                         default=config_entry.data.get(
-                            CONF_INFLUX_AUTH_METHOD, DEFAULT_INFLUX_AUTH_METHOD
+                            CONF_INFLUX_AUTH_METHOD,
+                            DEFAULT_INFLUX_AUTH_METHOD,
                         ),
                     ): _auth_method_selector()
                 }
@@ -485,12 +633,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors[CONF_INFLUX_TOKEN] = "required"
             else:
                 self._pending[CONF_INFLUX_TOKEN] = token
-                self.hass.config_entries.async_update_entry(
-                    config_entry,
-                    data=self._build_current_data(config_entry.data),
-                )
-                await self.hass.config_entries.async_reload(config_entry.entry_id)
-                return self.async_abort(reason="reconfigure_successful")
+                _, outcome = await self._async_discover_pending_org()
+                if outcome is None:
+                    circuit_error = await self._async_discover_pending_circuit_map()
+                    if circuit_error is None:
+                        return await self._async_finish_current_reconfigure(config_entry)
+                    errors["base"] = circuit_error
+                if outcome == "select":
+                    return await self.async_step_reconfigure_org_select()
+                elif "base" not in errors:
+                    errors["base"] = outcome
 
         return self.async_show_form(
             step_id="reconfigure_token",
@@ -506,7 +658,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_reconfigure_ssh(self, user_input=None):
-        """Reconfigure current step 3b: SSH password to auto-fetch the Influx token."""
+        """Reconfigure current step 3b: SSH password (used once) to install key and fetch token."""
         config_entry = self._get_reconfigure_entry()
         errors = {}
         if user_input is not None:
@@ -514,24 +666,51 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                token, ssh_error = await _fetch_influx_token_via_ssh(
-                    self.hass, self._pending[CONF_HOST], ssh_password
+                private_key, token, metadata, error_key = await async_ssh_bootstrap(
+                    self.hass, self._pending[CONF_HOST], DEFAULT_SSH_USERNAME, ssh_password
                 )
-                if ssh_error:
-                    errors[CONF_SSH_PASSWORD] = ssh_error
+                if error_key:
+                    errors[CONF_SSH_PASSWORD] = error_key
                 else:
                     self._pending[CONF_INFLUX_TOKEN] = token
-                    self.hass.config_entries.async_update_entry(
-                        config_entry,
-                        data=self._build_current_data(config_entry.data),
-                    )
-                    await self.hass.config_entries.async_reload(config_entry.entry_id)
-                    return self.async_abort(reason="reconfigure_successful")
+                    self._pending[CONF_SSH_PRIVATE_KEY] = private_key
+                    _, outcome = await self._async_discover_pending_org(metadata)
+                    if outcome is None:
+                        circuit_error = await self._async_discover_pending_circuit_map()
+                        if circuit_error is None:
+                            return await self._async_finish_current_reconfigure(config_entry)
+                        errors["base"] = circuit_error
+                    if outcome == "select":
+                        return await self.async_step_reconfigure_org_select()
+                    elif "base" not in errors:
+                        errors["base"] = outcome
 
         return self.async_show_form(
             step_id="reconfigure_ssh",
+            data_schema=vol.Schema({vol.Required(CONF_SSH_PASSWORD): str}),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure_org_select(self, user_input=None):
+        """Select a discovered Influx organization during reconfigure."""
+        config_entry = self._get_reconfigure_entry()
+        errors = {}
+        if user_input is not None:
+            org_id = user_input.get(CONF_INFLUX_ORG)
+            if org_id not in self._pending_org_candidates:
+                errors["base"] = "org_selection_required"
+            else:
+                self._pending[CONF_INFLUX_ORG] = org_id
+                self._pending_org_candidates = {}
+                circuit_error = await self._async_discover_pending_circuit_map()
+                if circuit_error is None:
+                    return await self._async_finish_current_reconfigure(config_entry)
+                errors["base"] = circuit_error
+
+        return self.async_show_form(
+            step_id="reconfigure_org_select",
             data_schema=vol.Schema(
-                {vol.Required(CONF_SSH_PASSWORD): str}
+                {vol.Required(CONF_INFLUX_ORG): vol.In(_candidate_options(self._pending_org_candidates))}
             ),
             errors=errors,
         )
@@ -547,7 +726,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
-    """Options flow: tunable settings without re-entering credentials."""
+    """Options flow: tunable settings without editing connection credentials."""
 
     async def async_step_init(self, user_input=None):
         errors = {}
@@ -565,27 +744,21 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 errors[CONF_PENDING_CONFIRM_MULTIPLIER] = "invalid_value"
 
             if not errors:
+                reprovision = user_input.pop("reprovision_ssh_key", False)
+                if reprovision:
+                    self._pending_options = user_input
+                    return await self.async_step_reprovision_ssh()
                 return self.async_create_entry(title="", data=user_input)
 
         def _opt(key, default):
-            return self.config_entry.options.get(
-                key, self.config_entry.data.get(key, default)
-            )
+            return self.config_entry.options.get(key, self.config_entry.data.get(key, default))
+
+        has_key = bool(self.config_entry.data.get(CONF_SSH_PRIVATE_KEY, ""))
 
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(
                 {
-                    vol.Required(CONF_ADDRESS, default=_opt(CONF_ADDRESS, "192.168.1.14")): str,
-                    vol.Optional(CONF_HOST, default=_opt(CONF_HOST, "192.168.1.14")): str,
-                    vol.Required(
-                        CONF_MODE,
-                        default=_opt(CONF_MODE, MODE_LEGACY),
-                    ): _mode_selector(include_auto=False),
-                    vol.Required(CONF_INFLUX_URL, default=_opt(CONF_INFLUX_URL, DEFAULT_INFLUX_URL)): str,
-                    vol.Required(CONF_INFLUX_TOKEN, default=_opt(CONF_INFLUX_TOKEN, "")): str,
-                    vol.Required(CONF_INFLUX_ORG, default=_opt(CONF_INFLUX_ORG, DEFAULT_INFLUX_ORG)): str,
-                    vol.Required(CONF_OLA_PORT, default=_opt(CONF_OLA_PORT, DEFAULT_OLA_PORT)): int,
                     vol.Optional(
                         CONF_SCAN_INTERVAL,
                         default=_opt(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
@@ -609,7 +782,66 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         "disable_scene_builder",
                         default=_opt("disable_scene_builder", DEFAULT_DISABLE_SCENE_BUILDER),
                     ): bool,
+                    vol.Optional("reprovision_ssh_key", default=False): bool,
                 }
             ),
+            description_placeholders={
+                "ssh_key_status": "installed" if has_key else "not configured",
+            },
+            errors=errors,
+        )
+
+    async def async_step_reprovision_ssh(self, user_input=None):
+        """Re-bootstrap the SSH key using a fresh password."""
+        errors = {}
+        if user_input is not None:
+            ssh_password = (user_input.get(CONF_SSH_PASSWORD) or "").strip()
+            if not ssh_password:
+                errors[CONF_SSH_PASSWORD] = "required"
+            else:
+                host = self.config_entry.data.get(CONF_HOST, "")
+                if not host:
+                    errors[CONF_SSH_PASSWORD] = "host_not_available"
+                else:
+                    private_key, token, metadata, error_key = await async_ssh_bootstrap(
+                        self.hass, host, DEFAULT_SSH_USERNAME, ssh_password
+                    )
+                    if error_key:
+                        errors[CONF_SSH_PASSWORD] = error_key
+                    else:
+                        result = await async_discover_influx_org(
+                            self.config_entry.data.get(CONF_INFLUX_URL, _derive_influx_url(host)),
+                            token,
+                            metadata,
+                        )
+                        chosen_org = result.selected_org_id
+                        current_org = self.config_entry.data.get(CONF_INFLUX_ORG, "")
+                        if chosen_org is None and result.candidates and current_org:
+                            if any(candidate.org_id == current_org for candidate in result.candidates):
+                                chosen_org = current_org
+
+                        if chosen_org is None:
+                            errors["base"] = (
+                                "org_reconfigure_required"
+                                if result.candidates
+                                else (result.error_key or "org_discovery_failed")
+                            )
+                        else:
+                            data = dict(self.config_entry.data)
+                            data[CONF_INFLUX_TOKEN] = token
+                            data[CONF_SSH_PRIVATE_KEY] = private_key
+                            data[CONF_INFLUX_ORG] = chosen_org
+                            self.hass.config_entries.async_update_entry(
+                                self.config_entry,
+                                data=data,
+                            )
+                            return self.async_create_entry(
+                                title="",
+                                data=getattr(self, "_pending_options", {}),
+                            )
+
+        return self.async_show_form(
+            step_id="reprovision_ssh",
+            data_schema=vol.Schema({vol.Required(CONF_SSH_PASSWORD): str}),
             errors=errors,
         )

@@ -2,6 +2,8 @@
 
 Welcome to the **Savant Energy** integration for Home Assistant! This project brings Savant relay and energy monitoring devices into your smart home, providing real-time power, voltage, relay control, and more, all with a beautiful, open-source touch.
 
+For the current protocol migration and the 2.0.0 release details, see [the current API workflow](docs/current-api-workflow.md) and [the release notes](docs/release-notes-v2.0.0.md).
+
 ## Features
 
 - **Automatic device discovery** from your Savant system
@@ -87,7 +89,9 @@ InfluxDB uses a token-based auth model, and Savant stores a read token on the ho
 
 ### Option A - Let the integration grab it automatically (SSH)
 
-During setup, choose **"Retrieve token via SSH"**. The integration will SSH into the Savant host as the `RPM` user, read the token from its known location, and hand it straight to the integration config. Your SSH password is used only for that single operation and is never stored anywhere - it's held ephemerally in memory just long enough to make the connection, grab the token, and discard it. The stored credential is the InfluxDB token itself, not your password.
+During setup, choose **"Retrieve token via SSH"**. The integration will SSH into the Savant host as the `RPM` user, read the token from its known location, and hand it straight to the integration config. Your SSH password is used only for that bootstrap operation and is never stored anywhere - it's held ephemerally in memory just long enough to make the connection, install the SSH key, grab the token, and discard it. The stored credentials are the generated SSH private key and the InfluxDB token, both managed by Home Assistant's encrypted config storage.
+
+That SSH key is not just for first setup. If InfluxDB later rejects the token with an auth failure, the integration uses the stored key to fetch a fresh token automatically, so normal token rotation or host restarts do not require re-entering the SSH password.
 
 **To find or set your SSH password:**
 - Try the default: **`RPM`**
@@ -98,7 +102,13 @@ During setup, choose **"Retrieve token via SSH"**. The integration will SSH into
 If you'd rather SSH in on your own terms, that's completely fine. Log in as `RPM` and the token can be extracted with:
 
 ```bash
-influx auth list --json 2>/dev/null | python3 -c "import sys,json; auths=json.load(sys.stdin); print(next(a['token'] for a in auths if 'read' in [p['action'] for p in a.get('permissions',[])]))"
+cat /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken
+```
+
+If that file is empty or missing, your host may use a different package layout. As a fallback, try the Influx CLI command below (using `nocorrect` avoids zsh autocorrect prompts on hosts where only `influxd` is present):
+
+```bash
+nocorrect influx auth list --json | python3 -c "import sys,json; auths=json.load(sys.stdin); print(next(a['token'] for a in auths if 'read' in [p['action'] for p in a.get('permissions',[])]))"
 ```
 
 Or use the discovery tool (see below) which automates this and caches the token locally.

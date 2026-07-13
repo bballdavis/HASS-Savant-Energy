@@ -32,7 +32,12 @@ def _device_info(device: dict, dmx_uid: str) -> DeviceInfo:
         name=device["name"],
         serial_number=dmx_uid,
         manufacturer=MANUFACTURER,
-        model=get_device_model(device.get("capacity", 0)),
+        model=get_device_model(
+            device.get("capacity", 0),
+            role=device.get("role"),
+            classification=device.get("classification"),
+            device_type=device.get("type"),
+        ),
     )
 
 
@@ -49,6 +54,8 @@ class EnergyDeviceSensor(CoordinatorEntity, SensorEntity):
         self._attr_unique_id = unique_id
         self._attr_device_info = _device_info(device, dmx_uid)
         self._attr_native_unit_of_measurement = _unit_for(sensor_type)
+        if sensor_type == "current":
+            self._attr_suggested_display_precision = 1
         self._dmx_uid = dmx_uid
         self._slug_name = slugify(device["name"])
 
@@ -141,6 +148,25 @@ class EnergyDeviceSensor(CoordinatorEntity, SensorEntity):
             return _device_info(device, self._dmx_uid)
         return _device_info(self._device, self._dmx_uid)
 
+    @property
+    def extra_state_attributes(self) -> dict[str, float | int | str | None]:
+        device = self._find_device() or self._device
+        return {
+            "energy_scale_divisor": device.get("energy_scale_divisor"),
+            "energy_scale_confidence": device.get("energy_scale_confidence"),
+            "energy_scale_status": device.get("energy_scale_status"),
+            "expected_delta_last_kwh": device.get("expected_delta_last_kwh"),
+            "measured_delta_last_kwh": device.get("measured_delta_last_kwh"),
+            "energy_guard_applied": device.get("energy_guard_applied"),
+            "energy_guard_reason": device.get("energy_guard_reason"),
+            "energy_guard_blocked_samples": device.get("energy_guard_blocked_samples"),
+            "energy_role_source": device.get("energy_role_source"),
+            "ct_parent_uid": device.get("ct_parent_uid"),
+            "ct_leg_index": device.get("ct_leg_index"),
+            "ct_leg_count": device.get("ct_leg_count"),
+            "ct_channels": device.get("ct_channels"),
+        }
+
 
 class IndividualLoadEnergySensor(CoordinatorEntity, SensorEntity):
     """Cumulative energy sensor sourced directly from the SEM hardware counter.
@@ -155,7 +181,7 @@ class IndividualLoadEnergySensor(CoordinatorEntity, SensorEntity):
     _attr_icon = "mdi:lightning-bolt-circle"
     _attr_native_unit_of_measurement = "kWh"
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
-    _attr_suggested_display_precision = 3
+    _attr_suggested_display_precision = 0
 
     def __init__(self, coordinator, device: dict, unique_id: str, dmx_uid: str):
         super().__init__(coordinator)

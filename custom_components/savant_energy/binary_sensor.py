@@ -15,6 +15,14 @@ from .utils import calculate_dmx_uid
 _LOGGER = logging.getLogger(__name__)
 
 
+def _is_relay_device(device: dict) -> bool:
+    """Return True only for devices explicitly classified as relay-backed."""
+    role = str(device.get("role", "")).strip().lower()
+    if role:
+        return role == "relay"
+    return device.get("has_relay") is True
+
+
 async def async_setup_entry(hass, config_entry, async_add_entities):
     """
     Set up Savant Energy binary sensor entities for relay status.
@@ -24,7 +32,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     entities = []
     if snapshot_data and "presentDemands" in snapshot_data:
         for device in snapshot_data["presentDemands"]:
-            if "uid" in device and "percentCommanded" in device and device.get("has_relay", True):
+            if "uid" in device and "percentCommanded" in device and _is_relay_device(device):
                 legacy_uid = device.get("legacy_uid", device["uid"])
                 dmx_uid = calculate_dmx_uid(legacy_uid)
                 entities.append(
@@ -57,7 +65,12 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
             name=self._initial_name,
             serial_number=self._dmx_uid,
             manufacturer=MANUFACTURER,
-            model=get_device_model(self._initial_capacity),
+            model=get_device_model(
+                self._initial_capacity,
+                role=device.get("role"),
+                classification=device.get("classification"),
+                device_type=device.get("type"),
+            ),
         )
         self._attr_extra_state_attributes = {"uid": self._device_uid}
 
@@ -133,6 +146,11 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
         # Start with initial/fallback values
         current_name_val = getattr(self, "_initial_name", None) or f"Savant Device {self._device_uid}"
         current_capacity_val = getattr(self, "_initial_capacity", 0)
+        current_role_val = self._device.get("role") if isinstance(self._device, dict) else None
+        current_classification_val = (
+            self._device.get("classification") if isinstance(self._device, dict) else None
+        )
+        current_type_val = self._device.get("type") if isinstance(self._device, dict) else None
 
         # Prefer latest snapshot data if available
         snapshot_data = self.coordinator.data.get("snapshot_data", {}) if self.coordinator.data else {}
@@ -141,13 +159,18 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
                 if device_in_snapshot.get("uid") == self._device_uid:
                     current_name_val = device_in_snapshot.get("name", current_name_val)
                     current_capacity_val = device_in_snapshot.get("capacity", current_capacity_val)
+                    current_role_val = device_in_snapshot.get("role")
+                    current_classification_val = device_in_snapshot.get("classification")
+                    current_type_val = device_in_snapshot.get("type")
                     break
-
         # If we still don't have a name, try the original device dict if present
         if (not current_name_val or current_name_val.startswith("Savant Device")) and hasattr(self, "_device") and isinstance(self._device, dict):
             try:
                 current_name_val = self._device.get("name", current_name_val)
                 current_capacity_val = self._device.get("capacity", current_capacity_val)
+                current_role_val = self._device.get("role", current_role_val)
+                current_classification_val = self._device.get("classification", current_classification_val)
+                current_type_val = self._device.get("type", current_type_val)
             except Exception as exc:  # pragma: no cover - defensive
                 _LOGGER.debug("Error reading _device dict for device_info: %s", exc)
 
@@ -161,5 +184,10 @@ class EnergyDeviceBinarySensor(CoordinatorEntity, BinarySensorEntity):
             name=current_name_val,
             serial_number=self._dmx_uid,
             manufacturer=MANUFACTURER,
-            model=get_device_model(current_capacity_val),
+            model=get_device_model(
+                current_capacity_val,
+                role=current_role_val,
+                classification=current_classification_val,
+                device_type=current_type_val,
+            ),
         )

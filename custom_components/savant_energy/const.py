@@ -29,6 +29,7 @@ CONF_PENDING_CONFIRM_MULTIPLIER = "pending_confirm_multiplier"
 CONF_INFLUX_URL = "influx_url"    # InfluxDB base URL, e.g. http://192.168.1.14:8086
 CONF_INFLUX_TOKEN = "influx_token"  # InfluxDB read token
 CONF_INFLUX_ORG = "influx_org"    # InfluxDB org ID
+CONF_CIRCUIT_MAP = "circuit_map"  # Persisted circuit classification and relay mapping
 
 # Default values
 DEFAULT_SWITCH_COOLDOWN = 15  # seconds
@@ -37,7 +38,7 @@ DEFAULT_OLA_PORT = 9090       # OLA/DMX API port
 DEFAULT_SEM_COMPANION_PORT = 8644
 DEFAULT_SCAN_INTERVAL = 5     # seconds between InfluxDB polls
 DEFAULT_INFLUX_URL = "http://192.168.1.14:8086"
-DEFAULT_INFLUX_ORG = "912133f25b21b958"
+DEFAULT_INFLUX_ORG = ""
 
 MODE_LEGACY = "legacy"
 MODE_CURRENT = "current"
@@ -52,6 +53,11 @@ DEFAULT_PENDING_CONFIRM_MULTIPLIER = 2
 AUTH_INFLUX_TOKEN = "token"
 AUTH_INFLUX_SSH = "ssh"
 DEFAULT_INFLUX_AUTH_METHOD = AUTH_INFLUX_TOKEN
+
+CONF_SSH_PASSWORD = "ssh_password"
+DEFAULT_SSH_PASSWORD = ""
+CONF_SSH_PRIVATE_KEY = "ssh_private_key"
+DEFAULT_SSH_USERNAME = "RPM"
 
 # Scan interval choices shown in the UI (seconds)
 SCAN_INTERVAL_OPTIONS = [5, 10, 15, 30]
