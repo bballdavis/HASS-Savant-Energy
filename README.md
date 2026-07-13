@@ -2,6 +2,8 @@
 
 Welcome to the **Savant Energy** integration for Home Assistant! This project brings Savant relay and energy monitoring devices into your smart home, providing real-time power, voltage, relay control, and more, all with a beautiful, open-source touch.
 
+For the current protocol migration and the 2.0.0 release details, see [the current API workflow](docs/current-api-workflow.md) and [the release notes](docs/release-notes-v2.0.0.md).
+
 ## Features
 
 - **Automatic device discovery** from your Savant system
