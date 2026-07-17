@@ -397,7 +397,10 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
         circuit_map = dict(discovery.circuit_map or {})
         circuit_map.pop("B2F4BD96-9B57-BF0F-5AF0-1D6C5DB63869::1")
 
-        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux), self.assertNoLogs(
+            module._LOGGER.name,
+            level="WARNING",
+        ):
             snapshot = await module.fetch_influx_snapshot(
                 "http://example",
                 "token",
@@ -412,6 +415,18 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "B2F4BD96-9B57-BF0F-5AF0-1D6C5DB63869::1",
             snapshot.data["circuit_map_status"]["unknown_circuit_keys"],
+        )
+        unknown = snapshot.data["circuit_map_status"]["unknown_circuits"]
+        self.assertEqual(
+            unknown,
+            [
+                {
+                    "circuit_key": "B2F4BD96-9B57-BF0F-5AF0-1D6C5DB63869::1",
+                    "display_name": "Kylos Room",
+                    "channel": "1",
+                    "type": "0074",
+                }
+            ],
         )
 
 

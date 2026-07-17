@@ -202,6 +202,10 @@ class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["type"], "abort")
         self.assertEqual(result["reason"], "reconfigure_successful")
         self.assertIsNotNone(hass.config_entries.updated_entry)
+        self.assertEqual(
+            hass.config_entries.updated_entry.data[module.CONF_CIRCUIT_MAP],
+            discovery_result.circuit_map,
+        )
         self.assertEqual(hass.config_entries.reloads, [entry.entry_id])
         create_calls = [
             call

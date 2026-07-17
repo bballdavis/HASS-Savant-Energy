@@ -967,18 +967,21 @@ async def fetch_influx_snapshot(
 
     present_demands: list[dict[str, Any]] = []
     unknown_circuit_keys: list[str] = []
+    unknown_circuits: list[dict[str, str]] = []
     seen_circuit_keys: set[str] = set()
     for circuit_key, circuit in by_circuit_key.items():
         seen_circuit_keys.add(circuit_key)
         metadata = stored_metadata.get(circuit_key)
         if metadata is None:
             unknown_circuit_keys.append(circuit_key)
-            _LOGGER.warning(
-                "Skipping unmapped Savant circuit %s (%s, channel=%s, type=%s). Run Reconfigure to classify new circuits.",
-                circuit_key,
-                circuit.get("name", "<unnamed>"),
-                circuit.get("channel", "?"),
-                circuit.get("type", "<unknown>"),
+            unknown_circuits.append(
+                {
+                    "circuit_key": circuit_key,
+                    "display_name": str(circuit.get("name", "")).strip()
+                    or f"Circuit {circuit.get('channel', '?')}",
+                    "channel": str(circuit.get("channel", "")).strip(),
+                    "type": str(circuit.get("type", "")).strip(),
+                }
             )
             continue
 
@@ -1144,7 +1147,11 @@ async def fetch_influx_snapshot(
             "pbc_device_id": pbc_device_id,  # PBC SignalR target device ID
             "circuit_map_status": {
                 "reconfigure_required": bool(unknown_circuit_keys or missing_circuit_keys),
-                "unknown_circuit_keys": unknown_circuit_keys,
+                "unknown_circuit_keys": sorted(unknown_circuit_keys),
+                "unknown_circuits": sorted(
+                    unknown_circuits,
+                    key=lambda circuit: circuit["circuit_key"],
+                ),
                 "missing_circuit_keys": missing_circuit_keys,
             },
         },

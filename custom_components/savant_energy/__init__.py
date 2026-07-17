@@ -107,6 +107,8 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.cached_present_demands: list = []
         self.last_fetch_error: dict | None = None
         self._legacy_feed_notification_key: tuple[str | None, str | None] | None = None
+        self._circuit_map_mismatch_fingerprint: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        self._circuit_map_status_initialized = False
         self.energy_scale_state: dict[str, dict] = {}
 
         self.ssh_private_key = entry.data.get(CONF_SSH_PRIVATE_KEY, "")
@@ -205,13 +207,25 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
     ) -> None:
         """Tell the user to reconfigure when Influx no longer matches the stored circuit map."""
         unknown = status.get("unknown_circuit_keys") or []
+        unknown_circuits = status.get("unknown_circuits") or []
         missing = status.get("missing_circuit_keys") or []
         message = (
             "Savant Energy found a circuit inventory mismatch between InfluxDB and the stored "
             "relay/CT map. Run Reconfigure so the integration can rebuild its circuit mapping."
         )
         details: list[str] = []
-        if unknown:
+        if unknown_circuits:
+            formatted_unknown = []
+            for circuit in unknown_circuits[:5]:
+                if not isinstance(circuit, dict):
+                    continue
+                name = str(circuit.get("display_name", "")).strip() or "Unnamed circuit"
+                channel = str(circuit.get("channel", "")).strip() or "?"
+                type_code = str(circuit.get("type", "")).strip() or "unknown"
+                formatted_unknown.append(f"{name} (channel {channel}, type {type_code})")
+            if formatted_unknown:
+                details.append(f"New/unmapped circuits: {', '.join(formatted_unknown)}")
+        elif unknown:
             details.append(f"New/unmapped circuits: {', '.join(unknown[:5])}")
         if missing:
             details.append(f"Missing stored circuits: {', '.join(missing[:5])}")
@@ -237,6 +251,36 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             {"notification_id": CIRCUIT_MAP_NOTIFICATION_ID},
             blocking=True,
         )
+
+    @staticmethod
+    def _circuit_map_status_fingerprint(
+        status: dict[str, Any],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+        """Return a stable identity for a circuit-map inventory mismatch."""
+        unknown = tuple(sorted(str(key) for key in status.get("unknown_circuit_keys") or []))
+        missing = tuple(sorted(str(key) for key in status.get("missing_circuit_keys") or []))
+        return (unknown, missing) if unknown or missing else None
+
+    async def _async_handle_circuit_map_status(self, status: dict[str, Any]) -> None:
+        """Report each distinct circuit-map mismatch once per coordinator lifetime."""
+        fingerprint = self._circuit_map_status_fingerprint(status)
+        if self._circuit_map_status_initialized and fingerprint == self._circuit_map_mismatch_fingerprint:
+            return
+
+        self._circuit_map_status_initialized = True
+        self._circuit_map_mismatch_fingerprint = fingerprint
+        if fingerprint is None:
+            await self._async_dismiss_circuit_map_notification()
+            return
+
+        unknown, missing = fingerprint
+        _LOGGER.warning(
+            "Savant circuit inventory mismatch detected (%d new/unmapped, %d missing stored). "
+            "Run Reconfigure to rebuild the relay/CT map.",
+            len(unknown),
+            len(missing),
+        )
+        await self._async_notify_circuit_map_reconfigure_required(status)
 
     async def _async_resolve_influx_org(
         self,
@@ -547,10 +591,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.last_fetch_error = None
         await self._async_dismiss_influx_org_notification()
         circuit_map_status = snapshot_data.get("circuit_map_status", {})
-        if circuit_map_status.get("reconfigure_required"):
-            await self._async_notify_circuit_map_reconfigure_required(circuit_map_status)
-        else:
-            await self._async_dismiss_circuit_map_notification()
+        await self._async_handle_circuit_map_status(circuit_map_status)
 
         present_demands = snapshot_data.get("presentDemands", [])
         if isinstance(present_demands, list):

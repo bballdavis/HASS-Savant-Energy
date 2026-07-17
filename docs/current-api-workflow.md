@@ -144,7 +144,7 @@ On setup, the integration removes obsolete DMX address entities and stale circui
 
 - A 401 normally means the token expired or rotated. With SSH bootstrap enabled, the stored key should refresh it automatically.
 - An organization selection prompt means more than one candidate matched Savant's expected data shape. Choose the candidate with current circuit data.
-- A circuit mapping warning means a circuit was found but could not be matched safely to a relay UID. The circuit remains visible as read-only until Reconfigure is run.
+- A circuit inventory warning means InfluxDB found a circuit absent from the saved relay/CT map. It is reported once for that inventory change, rather than on every poll. Mapped circuits continue operating; unmatched circuits remain unavailable for control until Reconfigure rebuilds the map.
 - An empty snapshot can be a timing issue on the Savant host. The integration widens its lookback window before reporting failure.
 - Legacy installations should use Reconfigure after upgrading Savant to firmware 11.2 or later.
 
