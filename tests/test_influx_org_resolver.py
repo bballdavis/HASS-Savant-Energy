@@ -155,6 +155,25 @@ class InfluxOrgResolverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.source, "bucket_scan")
         self.assertGreaterEqual(len(result.candidates), 1)
 
+    async def test_discovery_identifies_token_that_cannot_enumerate_buckets(self):
+        resolver = _load_resolver_module()
+
+        def handler(method, url, kwargs):
+            if method == "GET" and url.endswith("/buckets"):
+                return _FakeResponse(401, text="unauthorized")
+            self.fail(f"unexpected call: {method} {url}")
+
+        with mock.patch.object(
+            resolver.aiohttp,
+            "ClientSession",
+            side_effect=lambda: _FakeClientSession(handler),
+        ):
+            result = await resolver.async_discover_influx_org("http://example", "token")
+
+        self.assertEqual(result.error_key, "org_enumeration_denied")
+        self.assertTrue(result.auth_failure)
+        self.assertEqual(result.source, "bucket_scan")
+
     async def test_discovery_prefers_host_metadata_when_it_has_real_rows(self):
         resolver = _load_resolver_module()
         metadata = resolver.InfluxHostMetadata(

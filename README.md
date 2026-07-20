@@ -115,6 +115,10 @@ Or use the discovery tool (see below) which automates this and caches the token 
 
 Once you have the token, paste it into the integration config and you're done. From there the integration pulls live circuit data every 5 seconds directly from the time-series database, and everything should be noticeably more responsive than the old snapshot approach.
 
+If the pasted token cannot list Influx organizations, setup will ask for the **Influx Organization ID** and validate it by querying the Savant data directly. On Savant hosts this is normally available in the same status-file directory, in `.influxtoken` under `org.id`.
+
+Pasted tokens are intentionally SSH-free. If InfluxDB later rejects one because it rotated, was revoked, or lost access, Savant Energy creates a notification asking you to run **Reconfigure** and paste a fresh token. Choose the SSH option during setup only if you want automatic token refresh.
+
 ---
 
 ## How to Use

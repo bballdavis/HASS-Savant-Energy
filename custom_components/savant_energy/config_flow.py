@@ -244,6 +244,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         return result.error_key or "circuit_discovery_failed"
 
+    async def _async_finish_pending_manual_org(self, org_id: str) -> str | None:
+        """Validate an explicitly supplied org ID through the normal circuit query."""
+        self._pending[CONF_INFLUX_ORG] = org_id
+        return await self._async_discover_pending_circuit_map()
+
     async def _async_update_circuit_map_warning_notification(self) -> None:
         """Create or clear the reconfigure warning notification."""
         warnings = self._pending_circuit_map_warnings
@@ -402,6 +407,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     errors["base"] = circuit_error
                 if outcome == "select":
                     return await self.async_step_current_org_select()
+                if outcome == "org_enumeration_denied":
+                    return await self.async_step_current_org_manual()
                 elif "base" not in errors:
                     errors["base"] = outcome
 
@@ -464,6 +471,25 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema(
                 {vol.Required(CONF_INFLUX_ORG): vol.In(_candidate_options(self._pending_org_candidates))}
             ),
+            errors=errors,
+        )
+
+    async def async_step_current_org_manual(self, user_input=None):
+        """Accept an org ID when a pasted token cannot enumerate organizations."""
+        errors = {}
+        if user_input is not None:
+            org_id = (user_input.get(CONF_INFLUX_ORG) or "").strip()
+            if not org_id:
+                errors[CONF_INFLUX_ORG] = "required"
+            else:
+                circuit_error = await self._async_finish_pending_manual_org(org_id)
+                if circuit_error is None:
+                    return await self._async_finish_current_setup()
+                errors["base"] = circuit_error
+
+        return self.async_show_form(
+            step_id="current_org_manual",
+            data_schema=vol.Schema({vol.Required(CONF_INFLUX_ORG, default=""): str}),
             errors=errors,
         )
 
@@ -641,6 +667,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     errors["base"] = circuit_error
                 if outcome == "select":
                     return await self.async_step_reconfigure_org_select()
+                if outcome == "org_enumeration_denied":
+                    return await self.async_step_reconfigure_org_manual()
                 elif "base" not in errors:
                     errors["base"] = outcome
 
@@ -712,6 +740,26 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema(
                 {vol.Required(CONF_INFLUX_ORG): vol.In(_candidate_options(self._pending_org_candidates))}
             ),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure_org_manual(self, user_input=None):
+        """Accept an org ID when a pasted token cannot enumerate organizations."""
+        config_entry = self._get_reconfigure_entry()
+        errors = {}
+        if user_input is not None:
+            org_id = (user_input.get(CONF_INFLUX_ORG) or "").strip()
+            if not org_id:
+                errors[CONF_INFLUX_ORG] = "required"
+            else:
+                circuit_error = await self._async_finish_pending_manual_org(org_id)
+                if circuit_error is None:
+                    return await self._async_finish_current_reconfigure(config_entry)
+                errors["base"] = circuit_error
+
+        return self.async_show_form(
+            step_id="reconfigure_org_manual",
+            data_schema=vol.Schema({vol.Required(CONF_INFLUX_ORG, default=""): str}),
             errors=errors,
         )
 

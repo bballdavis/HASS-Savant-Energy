@@ -40,6 +40,8 @@ Auto mode starts with the PBC IP and probes the legacy activity feed.
 
 If multiple organizations contain plausible Savant data, the flow shows a selection form instead of guessing.
 
+For a manually pasted token, the integration does not use SSH or retain an SSH key. If InfluxDB rejects organization enumeration, setup asks for an explicit organization ID and validates it with a direct Flux query. A later 401 from a saved pasted token is treated as a possible rotation, revocation, or host/access mismatch and prompts the user to Reconfigure with a fresh token.
+
 ### SSH token bootstrap
 
 When the user chooses SSH token retrieval, the integration:

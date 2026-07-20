@@ -419,8 +419,11 @@ async def async_discover_influx_org(
             buckets, bucket_error = await _list_buckets(session, base_url, token)
             if bucket_error == "auth":
                 return InfluxOrgDiscoveryResult(
-                    error_key="org_auth_failed",
-                    error_message="Unauthorized (401) while listing buckets",
+                    error_key="org_enumeration_denied",
+                    error_message=(
+                        "Unauthorized (401) while listing buckets; the token may be "
+                        "invalid, rotated, or restricted from bucket enumeration"
+                    ),
                     auth_failure=True,
                     source="bucket_scan",
                 )
@@ -480,8 +483,11 @@ async def async_discover_influx_org(
                 text = await response.text()
                 if response.status == 401:
                     return InfluxOrgDiscoveryResult(
-                        error_key="org_auth_failed",
-                        error_message="Unauthorized (401) while listing organizations",
+                        error_key="org_enumeration_denied",
+                        error_message=(
+                            "Unauthorized (401) while listing organizations; the token may be "
+                            "invalid, rotated, or restricted from organization enumeration"
+                        ),
                         auth_failure=True,
                         source="org_list",
                     )

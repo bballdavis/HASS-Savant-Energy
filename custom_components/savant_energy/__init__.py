@@ -71,6 +71,7 @@ LOVELACE_CARD_FILENAME = "savant-energy-scenes-card.js"
 LEGACY_FEED_NOTIFICATION_ID = f"{DOMAIN}_legacy_feed_unavailable"
 INFLUX_ORG_NOTIFICATION_ID = f"{DOMAIN}_influx_org_selection_required"
 CIRCUIT_MAP_NOTIFICATION_ID = f"{DOMAIN}_circuit_map_reconfigure_required"
+INFLUX_TOKEN_NOTIFICATION_ID = f"{DOMAIN}_influx_token_reconfigure_required"
 _BACKFILL_WINDOWS = ("-2m", "-15m", "-24h", "-7d")
 _UNSET = object()
 
@@ -109,6 +110,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self._legacy_feed_notification_key: tuple[str | None, str | None] | None = None
         self._circuit_map_mismatch_fingerprint: tuple[tuple[str, ...], tuple[str, ...]] | None = None
         self._circuit_map_status_initialized = False
+        self._influx_token_notification_active = False
         self.energy_scale_state: dict[str, dict] = {}
 
         self.ssh_private_key = entry.data.get(CONF_SSH_PRIVATE_KEY, "")
@@ -251,6 +253,38 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             {"notification_id": CIRCUIT_MAP_NOTIFICATION_ID},
             blocking=True,
         )
+
+    async def _async_notify_influx_token_reconfigure_required(self) -> None:
+        """Tell pasted-token users when Influx rejects their stored token."""
+        if self._influx_token_notification_active:
+            return
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "create",
+            {
+                "title": "Savant Energy Influx Token Needs Updating",
+                "message": (
+                    "InfluxDB rejected the token saved by Savant Energy. It may have rotated, "
+                    "been revoked, or no longer have access to this InfluxDB host. Run the "
+                    "integration Reconfigure flow and paste a fresh read token."
+                ),
+                "notification_id": INFLUX_TOKEN_NOTIFICATION_ID,
+            },
+            blocking=True,
+        )
+        self._influx_token_notification_active = True
+
+    async def _async_dismiss_influx_token_notification(self) -> None:
+        """Dismiss the pasted-token notification after a successful fetch."""
+        if not self._influx_token_notification_active:
+            return
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": INFLUX_TOKEN_NOTIFICATION_ID},
+            blocking=True,
+        )
+        self._influx_token_notification_active = False
 
     @staticmethod
     def _circuit_map_status_fingerprint(
@@ -471,6 +505,10 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 fetch_result.error_type,
                 fetch_result.error_message,
             )
+            if fetch_result.auth_failure and not self.ssh_private_key:
+                self.hass.async_create_task(
+                    self._async_notify_influx_token_reconfigure_required()
+                )
 
             existing = dict(self.data) if isinstance(self.data, dict) else {}
             existing.setdefault("snapshot_data", None)
@@ -590,6 +628,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self._adjust_interval(success=True)
         self.last_fetch_error = None
         await self._async_dismiss_influx_org_notification()
+        await self._async_dismiss_influx_token_notification()
         circuit_map_status = snapshot_data.get("circuit_map_status", {})
         await self._async_handle_circuit_map_status(circuit_map_status)
 
