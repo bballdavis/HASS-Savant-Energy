@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 from dataclasses import dataclass
 
 _LOGGER = logging.getLogger(__name__)
 
 _TOKEN_PATH = (
     "/data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia"
+    "/statusfiles/InfluxDB2/.influxReadtoken"
+)
+_ALT_TOKEN_PATH = (
+    "/data/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia"
     "/statusfiles/InfluxDB2/.influxReadtoken"
 )
 _SETUP_PATH = (
@@ -35,13 +40,33 @@ class InfluxHostMetadata:
 
 
 def _read_remote_text(client, path: str) -> str:
-    stdin, stdout, stderr = client.exec_command(f"cat {path}")
+    stdin, stdout, stderr = client.exec_command(f"cat {shlex.quote(path)}")
     text = stdout.read().decode("utf-8", errors="ignore").strip()
     if text:
         return text
     err = stderr.read().decode("utf-8", errors="ignore").strip()
     if err:
         _LOGGER.debug("SSH read from %s returned no text: %s", path, err)
+    return ""
+
+
+def _resolve_remote_influx_read_token(client) -> str:
+    for path in (_TOKEN_PATH, _ALT_TOKEN_PATH):
+        token = _read_remote_text(client, path)
+        if token:
+            return token
+
+    stdin, stdout, stderr = client.exec_command(
+        f"find / -type f -path {shlex.quote('*/InfluxDB2/.influxReadtoken')} "
+        "-print 2>/dev/null | head -n 1"
+    )
+    candidate = stdout.read().decode("utf-8", errors="ignore").strip().splitlines()
+    if candidate:
+        return _read_remote_text(client, candidate[0])
+
+    err = stderr.read().decode("utf-8", errors="ignore").strip()
+    if err:
+        _LOGGER.debug("SSH find for Influx token path returned no match; stderr: %s", err)
     return ""
 
 
@@ -149,7 +174,7 @@ PYEOF
         _, stdout, _ = client.exec_command(python_cmd)
         stdout.channel.recv_exit_status()
 
-        token = _read_remote_text(client, _TOKEN_PATH)
+        token = _resolve_remote_influx_read_token(client)
         if not token:
             return None, None, "ssh_token_empty"
 
@@ -197,7 +222,7 @@ def _ssh_fetch_influx_bundle_with_key_worker(
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(hostname=host, username=username, pkey=pkey, timeout=10)
 
-        token = _read_remote_text(client, _TOKEN_PATH)
+        token = _resolve_remote_influx_read_token(client)
         if not token:
             return None, None
 
