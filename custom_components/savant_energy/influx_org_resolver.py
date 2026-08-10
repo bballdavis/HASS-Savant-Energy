@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 
 import aiohttp
 
+from .const import DEFAULT_INFLUX_BUCKET
+
 from .ssh_helper import InfluxHostMetadata
 
 _LOGGER = logging.getLogger(__name__)
@@ -20,9 +22,10 @@ _PROBE_WINDOWS = ("-15m", "-24h", "-7d")
 _BUCKET_SCAN_PREFIXES = ("localHub",)
 
 
-def _probe_query(range_start: str) -> str:
+def _probe_query(range_start: str, bucket: str = DEFAULT_INFLUX_BUCKET) -> str:
+    import json
     return f"""\
-from(bucket: "localHub")
+from(bucket: {json.dumps(bucket or DEFAULT_INFLUX_BUCKET)})
   |> range(start: {range_start})
   |> filter(fn: (r) => exists r.savantUUID and r.savantUUID != "")
   |> filter(fn: (r) =>
@@ -47,6 +50,7 @@ class InfluxOrgCandidate:
     source: str = "org_list"
     query_window: str | None = None
     bucket_names: tuple[str, ...] = ()
+    selected_bucket: str | None = None
 
     @property
     def field_count(self) -> int:
@@ -58,6 +62,7 @@ class InfluxOrgDiscoveryResult:
     """Outcome of discovering the best Influx organization."""
 
     selected_org_id: str | None = None
+    selected_bucket: str | None = None
     candidates: list[InfluxOrgCandidate] = field(default_factory=list)
     error_key: str | None = None
     error_message: str | None = None
@@ -120,6 +125,7 @@ def _build_candidate(
     source: str = "org_list",
     query_window: str | None = None,
     bucket_names: tuple[str, ...] = (),
+    selected_bucket: str | None = None,
 ) -> InfluxOrgCandidate:
     uuids = {row.get("savantUUID", "").strip() for row in rows if row.get("savantUUID", "").strip()}
     fields = sorted({row.get("_field", "").strip() for row in rows if row.get("_field", "").strip()})
@@ -179,6 +185,7 @@ def _build_candidate(
         source=source,
         query_window=query_window,
         bucket_names=bucket_names,
+        selected_bucket=selected_bucket or (bucket_names[0] if bucket_names else DEFAULT_INFLUX_BUCKET),
     )
 
 
@@ -191,7 +198,14 @@ def _is_plausible(candidate: InfluxOrgCandidate) -> bool:
 
 
 def _pick_clear_winner(candidates: list[InfluxOrgCandidate]) -> str | None:
-    plausible = [candidate for candidate in candidates if _is_plausible(candidate)]
+    best_by_org: dict[str, InfluxOrgCandidate] = {}
+    for candidate in candidates:
+        if not _is_plausible(candidate):
+            continue
+        current = best_by_org.get(candidate.org_id)
+        if current is None or candidate.score > current.score:
+            best_by_org[candidate.org_id] = candidate
+    plausible = list(best_by_org.values())
     if not plausible:
         return None
 
@@ -227,7 +241,7 @@ async def _probe_org(
                 "Content-Type": "application/vnd.flux",
                 "Accept": "text/csv",
             },
-            data=_probe_query(range_start),
+            data=_probe_query(range_start, bucket_names[0] if bucket_names else DEFAULT_INFLUX_BUCKET),
             timeout=aiohttp.ClientTimeout(total=10),
         ) as response:
             text = await response.text()
@@ -248,6 +262,7 @@ async def _probe_org(
                 source=source,
                 query_window=range_start,
                 bucket_names=bucket_names,
+                selected_bucket=bucket_names[0] if bucket_names else DEFAULT_INFLUX_BUCKET,
             )
     except (aiohttp.ClientError, TimeoutError) as exc:
         _LOGGER.debug(
@@ -339,18 +354,22 @@ async def _probe_orgs_for_candidates(
         )
         candidates = []
         for org_id, org_name, bucket_names in orgs:
-            candidate = await _probe_org(
-                session,
-                base_url,
-                token,
-                org_id,
-                org_name,
-                range_start,
-                source=source,
-                bucket_names=bucket_names,
-            )
-            if candidate is not None:
-                candidates.append(candidate)
+            bucket_choices = bucket_names or (DEFAULT_INFLUX_BUCKET,)
+            org_candidates = []
+            for bucket_name in bucket_choices:
+                candidate = await _probe_org(
+                    session,
+                    base_url,
+                    token,
+                    org_id,
+                    org_name,
+                    range_start,
+                    source=source,
+                    bucket_names=(bucket_name,),
+                )
+                if candidate is not None:
+                    org_candidates.append(candidate)
+            candidates.extend(org_candidates)
         _LOGGER.debug(
             "Influx org discovery at %s from %s produced %d candidate(s)",
             range_start,
@@ -408,6 +427,7 @@ async def async_discover_influx_org(
                         )
                         return InfluxOrgDiscoveryResult(
                             selected_org_id=metadata_candidate.org_id,
+                            selected_bucket=metadata_candidate.selected_bucket,
                             candidates=metadata_candidates,
                             source="ssh_metadata",
                         )
@@ -460,8 +480,13 @@ async def async_discover_influx_org(
                             "Influx org discovery selected %s from bucket scan",
                             winner,
                         )
+                        selected_candidate = max(
+                            (candidate for candidate in bucket_candidates if candidate.org_id == winner),
+                            key=lambda item: item.score,
+                        )
                         return InfluxOrgDiscoveryResult(
                             selected_org_id=winner,
+                            selected_bucket=selected_candidate.selected_bucket,
                             candidates=plausible or sorted(bucket_candidates, key=lambda item: item.score, reverse=True),
                             source="bucket_scan",
                         )
@@ -566,8 +591,13 @@ async def async_discover_influx_org(
             winner,
             len(plausible) or len(org_candidates),
         )
+        selected_candidate = max(
+            (candidate for candidate in org_candidates if candidate.org_id == winner),
+            key=lambda item: item.score,
+        )
         return InfluxOrgDiscoveryResult(
             selected_org_id=winner,
+            selected_bucket=selected_candidate.selected_bucket,
             candidates=plausible or sorted(org_candidates, key=lambda item: item.score, reverse=True),
             source="org_list",
         )

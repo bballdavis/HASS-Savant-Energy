@@ -28,6 +28,53 @@ def _circuit_csv() -> str:
 
 
 class InfluxClientBackfillTests(unittest.IsolatedAsyncioTestCase):
+    def test_query_result_classifies_auth_and_is_legacy_unpackable(self):
+        influx_client = _load_influx_client_module()
+
+        result = influx_client.InfluxQueryResult(
+            False, error_message="Unauthorized (401)", failure_class="unauthorized_401"
+        )
+
+        self.assertEqual(result.status, "unauthorized_401")
+        self.assertTrue(result.auth_failure)
+        self.assertEqual(tuple(result), (False, "", "Unauthorized (401)", True, False))
+
+    def test_query_result_distinguishes_permission_failure(self):
+        influx_client = _load_influx_client_module()
+
+        result = influx_client.InfluxQueryResult(
+            False,
+            error_message="Forbidden (403)",
+            failure_class="forbidden_403",
+            http_status=403,
+        )
+
+        self.assertFalse(result.auth_failure)
+        self.assertTrue(result.permission_failure)
+        self.assertEqual(result.http_status, 403)
+        self.assertEqual(influx_client._query_error_key(result), "influx_permission_denied")
+
+    def test_query_error_keys_are_specific(self):
+        influx_client = _load_influx_client_module()
+
+        expected = {
+            "unauthorized_401": "influx_auth_failed",
+            "forbidden_403": "influx_permission_denied",
+            "invalid_org": "influx_org_invalid",
+            "invalid_bucket": "influx_bucket_invalid",
+            "unreachable": "influx_unreachable",
+            "other_query": "influx_query_failed",
+        }
+        for failure_class, error_key in expected.items():
+            with self.subTest(failure_class=failure_class):
+                result = influx_client.InfluxQueryResult(False, failure_class=failure_class)
+                self.assertEqual(influx_client._query_error_key(result), error_key)
+
+    def test_flux_bucket_is_encoded_as_a_string_literal(self):
+        influx_client = _load_influx_client_module()
+
+        self.assertEqual(influx_client._flux_string('hub"west'), '"hub\\\"west"')
+
     async def test_fetch_influx_snapshot_backfills_to_a_wider_window(self):
         influx_client = _load_influx_client_module()
 

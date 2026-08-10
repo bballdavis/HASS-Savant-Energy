@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import sys
 import shlex
@@ -8,9 +9,9 @@ from unittest import mock
 
 
 class _FakeStream:
-    def __init__(self, payload: str = "") -> None:
+    def __init__(self, payload: str = "", status: int = 0) -> None:
         self._payload = payload.encode("utf-8")
-        self.channel = SimpleNamespace(recv_exit_status=lambda: 0)
+        self.channel = SimpleNamespace(recv_exit_status=lambda: status)
 
     def read(self) -> bytes:
         payload = self._payload
@@ -58,9 +59,11 @@ class _FakeSSHClient:
                 _FakeStream(""),
             )
         if command.startswith("mkdir ") or command.startswith("python3 "):
+            command_type = "mkdir" if command.startswith("mkdir ") else "python3"
+            status = self.command_map.get(("status", command_type), 0)
             return (
                 None,
-                _FakeStream(""),
+                _FakeStream("", status),
                 _FakeStream(""),
             )
         raise AssertionError(f"Unexpected command: {command}")
@@ -69,6 +72,11 @@ class _FakeSSHClient:
 class _FakeEd25519Key:
     def __init__(self, file_obj) -> None:
         self.file_obj = file_obj
+
+
+class _FakeHass:
+    async def async_add_executor_job(self, func, *args):
+        return func(*args)
 
 
 def _load_ssh_helper_module():
@@ -182,6 +190,28 @@ class SshHelperTests(unittest.TestCase):
             "find / -type f -path '*/InfluxDB2/.influxReadtoken' -print 2>/dev/null | head -n 1",
         )
 
+    def test_resolve_details_preserves_home_layout_and_key_path(self):
+        module = _load_ssh_helper_module()
+        fake_client = _FakeSSHClient({
+            ("cat", module._TOKEN_PATH): "",
+            ("cat", module._ALT_TOKEN_PATH): "home-token\n",
+        })
+
+        result = module._resolve_remote_influx_read_token_details(fake_client)
+
+        self.assertEqual(result.token, "home-token")
+        self.assertEqual(result.layout, "/data/home/RPM")
+        self.assertEqual(result.authorized_keys_path, "/data/home/RPM/.ssh/authorized_keys")
+
+    def test_bootstrap_result_exposes_stage_while_unpacking_legacy_shape(self):
+        module = _load_ssh_helper_module()
+        result = module.SSHBootstrapResult(token="t", stage="complete")
+
+        token, metadata, error = result
+
+        self.assertEqual((token, metadata, error), ("t", None, None))
+        self.assertEqual(result.stage, "complete")
+
     def test_ssh_bootstrap_worker_uses_shared_resolver(self):
         module = _load_ssh_helper_module()
         fake_client = _FakeSSHClient({})
@@ -203,6 +233,23 @@ class SshHelperTests(unittest.TestCase):
         self.assertIsNone(error)
         resolver.assert_called_once_with(fake_client)
 
+    def test_ssh_bootstrap_reports_key_install_stage(self):
+        module = _load_ssh_helper_module()
+        fake_client = _FakeSSHClient({("status", "python3"): 1})
+        fake_paramiko = SimpleNamespace(
+            SSHClient=lambda: fake_client,
+            AutoAddPolicy=lambda: None,
+            Ed25519Key=_FakeEd25519Key,
+        )
+
+        with mock.patch.dict("sys.modules", {"paramiko": fake_paramiko}):
+            result = module._ssh_bootstrap_worker(
+                "example.com", "user", "pass", "ssh-rsa key"
+            )
+
+        self.assertEqual(result.error_key, "ssh_key_install_failed")
+        self.assertEqual(result.stage, "authorized_keys")
+
     def test_ssh_fetch_worker_uses_shared_resolver(self):
         module = _load_ssh_helper_module()
         fake_client = _FakeSSHClient({})
@@ -222,6 +269,28 @@ class SshHelperTests(unittest.TestCase):
         self.assertEqual(token, "key-token")
         self.assertIsNone(metadata)
         resolver.assert_called_once_with(fake_client)
+
+    def test_async_bootstrap_rejects_unusable_installed_key(self):
+        module = _load_ssh_helper_module()
+
+        with mock.patch.object(module, "generate_ed25519_keypair", return_value=("private", "public")):
+            with mock.patch.object(
+                module,
+                "_ssh_bootstrap_worker",
+                return_value=module.SSHBootstrapResult(token="password-token"),
+            ):
+                with mock.patch.object(
+                    module,
+                    "_ssh_fetch_influx_bundle_with_key_worker",
+                    return_value=(None, None),
+                ):
+                    result = asyncio.run(
+                        module.async_ssh_bootstrap(
+                            _FakeHass(), "example.com", "user", "pass"
+                        )
+                    )
+
+        self.assertEqual(result, (None, None, None, "ssh_key_verify_failed"))
 
 
 if __name__ == "__main__":

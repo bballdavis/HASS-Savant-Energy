@@ -16,6 +16,11 @@ from typing import Any, Optional
 
 import aiohttp
 
+try:
+    from .const import DEFAULT_INFLUX_BUCKET
+except ImportError:  # direct test-module loading compatibility
+    DEFAULT_INFLUX_BUCKET = "localHub"
+
 _LOGGER = logging.getLogger(__name__)
 
 # InfluxDB stores per-circuit energy in mWh; HASS energy dashboard uses kWh.
@@ -38,7 +43,7 @@ _INVALID_NAME_TOKENS = {"", "false", "true", "name", "override"}
 _BACKFILL_WINDOWS = ("-2m", "-15m", "-24h", "-7d")
 
 _CIRCUIT_QUERY = """\
-from(bucket: "localHub")
+from(bucket: {bucket})
   |> range(start: {range_start})
   |> filter(fn: (r) => exists r.savantUUID and r.savantUUID != "")
   |> filter(fn: (r) =>
@@ -50,12 +55,59 @@ from(bucket: "localHub")
 # Flux query: fetch last power reading for all hub-aggregated channels
 # (totals, groups, battery, solar). type="0000" is always the hub measurement.
 _SYSTEM_QUERY = """\
-from(bucket: "localHub")
+from(bucket: {bucket})
   |> range(start: {range_start})
   |> filter(fn: (r) => r.type == "0000")
   |> filter(fn: (r) => r._field == "power")
   |> last()
 """
+
+
+def _flux_string(value: str) -> str:
+    """Encode a bucket as a Flux string literal."""
+    return json.dumps(str(value or DEFAULT_INFLUX_BUCKET).strip() or DEFAULT_INFLUX_BUCKET)
+
+
+@dataclass(slots=True)
+class InfluxQueryResult:
+    """Structured Flux request outcome with legacy tuple iteration."""
+
+    success: bool
+    body_text: str = ""
+    error_message: str = ""
+    failure_class: str | None = None
+    http_status: int | None = None
+
+    @property
+    def status(self) -> str:
+        return "success" if self.success else (self.failure_class or "other_query")
+
+    @property
+    def classification(self) -> str | None:
+        return self.failure_class
+
+    @property
+    def auth_failure(self) -> bool:
+        return self.failure_class == "unauthorized_401"
+
+    @property
+    def permission_failure(self) -> bool:
+        return self.failure_class == "forbidden_403"
+
+    @property
+    def org_failure(self) -> bool:
+        return self.failure_class == "invalid_org"
+
+    @property
+    def bucket_failure(self) -> bool:
+        return self.failure_class == "invalid_bucket"
+
+    def __iter__(self):
+        yield self.success
+        yield self.body_text
+        yield self.error_message
+        yield self.auth_failure
+        yield self.org_failure
 
 
 @dataclass(slots=True)
@@ -67,7 +119,10 @@ class InfluxFetchResult:
     error_type: Optional[str] = None
     error_message: Optional[str] = None
     auth_failure: bool = False
+    permission_failure: bool = False
     org_failure: bool = False
+    bucket_failure: bool = False
+    failure_class: Optional[str] = None
     query_window: Optional[str] = None
 
 
@@ -79,6 +134,8 @@ class CircuitDiscoveryResult:
     circuit_map: Optional[dict[str, dict[str, Any]]] = None
     error_key: Optional[str] = None
     error_message: Optional[str] = None
+    failure_class: Optional[str] = None
+    http_status: Optional[int] = None
     query_window: Optional[str] = None
     warnings: list[str] = field(default_factory=list)
     downgraded_circuits: list[dict[str, Any]] = field(default_factory=list)
@@ -136,10 +193,10 @@ async def _post_flux(
     token: str,
     org: str,
     query: str,
-) -> tuple[bool, str, str, bool, bool]:
+) -> InfluxQueryResult:
     """POST a Flux query.
 
-    Returns (success, body_text, error_message, auth_failure, org_failure).
+    Returns a structured result; iteration preserves the historical tuple.
     """
     url = f"{base_url.rstrip('/')}/api/v2/query"
     try:
@@ -156,9 +213,9 @@ async def _post_flux(
         ) as resp:
             text = await resp.text()
             if resp.status == 401:
-                return False, "", "Unauthorized (401) - token is invalid or expired", True, False
+                return InfluxQueryResult(False, error_message="Unauthorized (401) - InfluxDB rejected the token", failure_class="unauthorized_401", http_status=401)
             if resp.status == 403:
-                return False, "", "Forbidden (403) - token lacks read permission", True, False
+                return InfluxQueryResult(False, error_message="Forbidden (403) - token lacks permission for this query", failure_class="forbidden_403", http_status=403)
             if resp.status != 200:
                 lowered = text.lower()
                 org_failure = (
@@ -169,12 +226,33 @@ async def _post_flux(
                         or "org not found" in lowered
                     )
                 )
-                return False, "", f"HTTP {resp.status}: {text[:200]}", False, org_failure
-            return True, text, "", False, False
+                bucket_failure = "bucket" in lowered and any(word in lowered for word in ("not found", "does not exist", "invalid"))
+                failure_class = "invalid_org" if org_failure else "invalid_bucket" if bucket_failure else "other_query"
+                return InfluxQueryResult(False, error_message=f"HTTP {resp.status}: {text[:200]}", failure_class=failure_class, http_status=resp.status)
+            return InfluxQueryResult(True, body_text=text, http_status=200)
     except asyncio.TimeoutError:
-        return False, "", "InfluxDB query timed out after 10 s", False, False
+        return InfluxQueryResult(False, error_message="InfluxDB query timed out after 10 s", failure_class="unreachable")
     except aiohttp.ClientError as exc:
-        return False, "", f"Connection error: {exc}", False, False
+        return InfluxQueryResult(False, error_message=f"Connection error: {exc}", failure_class="unreachable")
+
+
+def _coerce_query_result(value) -> InfluxQueryResult:
+    """Accept old test/integration tuple stubs while using structured results."""
+    if isinstance(value, InfluxQueryResult):
+        return value
+    ok, body, error, auth_failure, org_failure = value
+    failure_class = "unauthorized_401" if auth_failure else "invalid_org" if org_failure else None
+    return InfluxQueryResult(ok, body, error, failure_class)
+
+
+def _query_error_key(result: InfluxQueryResult) -> str:
+    return {
+        "unauthorized_401": "influx_auth_failed",
+        "forbidden_403": "influx_permission_denied",
+        "invalid_org": "influx_org_invalid",
+        "invalid_bucket": "influx_bucket_invalid",
+        "unreachable": "influx_unreachable",
+    }.get(result.failure_class or "", "influx_query_failed")
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -917,6 +995,7 @@ async def fetch_influx_snapshot(
     circuit_metadata: dict[str, dict[str, Any]] | None = None,
     sample_seconds: float = 5.0,
     range_start: str = "-2m",
+    influx_bucket: str = DEFAULT_INFLUX_BUCKET,
 ) -> InfluxFetchResult:
     """Fetch the latest circuit and system data from InfluxDB.
 
@@ -926,31 +1005,40 @@ async def fetch_influx_snapshot(
     """
     try:
         async with aiohttp.ClientSession() as session:
-            ok, circuit_text, err, auth_failure, org_failure = await _post_flux(
+            circuit_result = _coerce_query_result(await _post_flux(
                 session,
                 influx_url,
                 influx_token,
                 influx_org,
-                _CIRCUIT_QUERY.format(range_start=range_start),
-            )
+                _CIRCUIT_QUERY.format(range_start=range_start, bucket=_flux_string(influx_bucket)),
+            ))
+            ok = circuit_result.success
+            circuit_text = circuit_result.body_text
+            err = circuit_result.error_message
+            auth_failure = circuit_result.auth_failure
+            org_failure = circuit_result.org_failure
             if not ok:
                 return InfluxFetchResult(
                     success=False,
-                    error_type="circuit_query_failed",
+                    error_type=_query_error_key(circuit_result),
                     error_message=err,
                     auth_failure=auth_failure,
+                    permission_failure=circuit_result.permission_failure,
                     org_failure=org_failure,
+                    bucket_failure=circuit_result.bucket_failure,
+                    failure_class=circuit_result.failure_class,
                     query_window=range_start,
                 )
 
             # System query failure is non-fatal — degrade gracefully.
-            ok_sys, system_text, _, _, _ = await _post_flux(
+            system_result = _coerce_query_result(await _post_flux(
                 session,
                 influx_url,
                 influx_token,
                 influx_org,
-                _SYSTEM_QUERY.format(range_start=range_start),
-            )
+                _SYSTEM_QUERY.format(range_start=range_start, bucket=_flux_string(influx_bucket)),
+            ))
+            ok_sys, system_text = system_result.success, system_result.body_text
     except Exception as exc:  # pragma: no cover
         return InfluxFetchResult(
             success=False,
@@ -1169,6 +1257,7 @@ async def fetch_influx_snapshot_with_backfill(
     circuit_metadata: dict[str, dict[str, Any]] | None = None,
     sample_seconds: float = 5.0,
     backfill_windows: tuple[str, ...] = _BACKFILL_WINDOWS,
+    influx_bucket: str = DEFAULT_INFLUX_BUCKET,
 ) -> InfluxFetchResult:
     """Fetch a snapshot, widening the lookback window before failing."""
     last_empty_result: InfluxFetchResult | None = None
@@ -1188,6 +1277,7 @@ async def fetch_influx_snapshot_with_backfill(
             circuit_metadata=circuit_metadata,
             sample_seconds=sample_seconds,
             range_start=range_start,
+            influx_bucket=influx_bucket,
         )
         if result.success and result.data is not None:
             _LOGGER.debug(
@@ -1236,17 +1326,20 @@ async def discover_circuit_metadata(
     sem_port: int = 8644,
     pbc_websocket_port: int = 8480,
     range_start: str = "-2m",
+    influx_bucket: str = DEFAULT_INFLUX_BUCKET,
 ) -> CircuitDiscoveryResult:
     """Resolve relay/CT identity once during setup or reconfigure."""
     try:
         async with aiohttp.ClientSession() as session:
-            ok, circuit_text, err, auth_failure, org_failure = await _post_flux(
+            circuit_result = _coerce_query_result(await _post_flux(
                 session,
                 influx_url,
                 influx_token,
                 influx_org,
-                _CIRCUIT_QUERY.format(range_start=range_start),
-            )
+                _CIRCUIT_QUERY.format(range_start=range_start, bucket=_flux_string(influx_bucket)),
+            ))
+            ok, circuit_text, err = circuit_result.success, circuit_result.body_text, circuit_result.error_message
+            auth_failure, org_failure = circuit_result.auth_failure, circuit_result.org_failure
     except Exception as exc:  # pragma: no cover
         return CircuitDiscoveryResult(
             success=False,
@@ -1258,14 +1351,10 @@ async def discover_circuit_metadata(
     if not ok:
         return CircuitDiscoveryResult(
             success=False,
-            error_key=(
-                "org_auth_failed"
-                if auth_failure
-                else "org_discovery_failed"
-                if org_failure
-                else "circuit_discovery_failed"
-            ),
+            error_key=_query_error_key(circuit_result),
             error_message=err,
+            failure_class=circuit_result.failure_class,
+            http_status=circuit_result.http_status,
             query_window=range_start,
         )
 
@@ -1496,6 +1585,7 @@ async def discover_circuit_metadata_with_backfill(
     sem_port: int = 8644,
     pbc_websocket_port: int = 8480,
     backfill_windows: tuple[str, ...] = _BACKFILL_WINDOWS,
+    influx_bucket: str = DEFAULT_INFLUX_BUCKET,
 ) -> CircuitDiscoveryResult:
     """Resolve the persisted circuit map, widening the lookback window before failing."""
     last_result: CircuitDiscoveryResult | None = None
@@ -1508,11 +1598,22 @@ async def discover_circuit_metadata_with_backfill(
             sem_port=sem_port,
             pbc_websocket_port=pbc_websocket_port,
             range_start=range_start,
+            influx_bucket=influx_bucket,
         )
         if result.success and result.circuit_map:
             return result
         last_result = result
-        if result.error_key in {"org_auth_failed", "org_discovery_failed", "sem_companion_failed"}:
+        if result.error_key in {
+            "org_auth_failed",
+            "org_discovery_failed",
+            "influx_auth_failed",
+            "influx_permission_denied",
+            "influx_org_invalid",
+            "influx_bucket_invalid",
+            "influx_unreachable",
+            "influx_query_failed",
+            "sem_companion_failed",
+        }:
             return result
     return last_result or CircuitDiscoveryResult(
         success=False,

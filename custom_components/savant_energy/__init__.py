@@ -26,6 +26,7 @@ from .const import (
     CONF_CIRCUIT_MAP,
     CONF_HOST,
     CONF_INFLUX_AUTH_METHOD,
+    CONF_INFLUX_BUCKET,
     CONF_MODE,
     CONF_OLA_PORT,
     CONF_SCAN_INTERVAL,
@@ -42,6 +43,7 @@ from .const import (
     DEFAULT_SEM_COMPANION_PORT,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_INFLUX_ORG,
+    DEFAULT_INFLUX_BUCKET,
 )
 from .current.influx_client import (
     InfluxFetchResult,
@@ -100,6 +102,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.influx_url = entry.data.get(CONF_INFLUX_URL, f"http://{self.host}:8086")
         self.influx_token = entry.data.get(CONF_INFLUX_TOKEN, "")
         self.influx_org = entry.data.get(CONF_INFLUX_ORG, DEFAULT_INFLUX_ORG)
+        self.influx_bucket = entry.data.get(CONF_INFLUX_BUCKET, DEFAULT_INFLUX_BUCKET) or DEFAULT_INFLUX_BUCKET
         self.circuit_map = entry.data.get(CONF_CIRCUIT_MAP, {})
         self.influx_host_metadata: InfluxHostMetadata | None = None
         self.config_entry = entry
@@ -137,6 +140,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         *,
         token=_UNSET,
         org=_UNSET,
+        bucket=_UNSET,
         ssh_private_key=_UNSET,
     ) -> bool:
         """Persist current-mode auth/config values into config-entry data."""
@@ -150,6 +154,10 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         if org is not _UNSET and org != self.influx_org:
             self.influx_org = org
             updated_data[CONF_INFLUX_ORG] = org
+            changed = True
+        if bucket is not _UNSET and bucket != self.influx_bucket:
+            self.influx_bucket = bucket or DEFAULT_INFLUX_BUCKET
+            updated_data[CONF_INFLUX_BUCKET] = self.influx_bucket
             changed = True
         if ssh_private_key is not _UNSET and ssh_private_key != self.ssh_private_key:
             self.ssh_private_key = ssh_private_key
@@ -340,7 +348,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 len(result.candidates),
                 result.source or "unknown",
             )
-            await self._async_persist_connection_state(org=result.selected_org_id)
+            await self._async_persist_connection_state(org=result.selected_org_id, bucket=result.selected_bucket)
             await self._async_dismiss_influx_org_notification()
             return True, False
 
@@ -414,6 +422,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             scale_state=self.energy_scale_state,
             circuit_metadata=self.circuit_map,
             sample_seconds=float(self.update_interval.total_seconds()),
+            influx_bucket=self.influx_bucket,
         )
         if result.success and result.data is not None and result.query_window and result.query_window != _BACKFILL_WINDOWS[0]:
             _LOGGER.info(
@@ -601,12 +610,18 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                     org_failure=True,
                 )
 
-        elif result.org_failure:
+        elif result.org_failure or result.bucket_failure:
             _LOGGER.warning(
-                "InfluxDB org failure (%s) - attempting org rediscovery",
+                "InfluxDB org/bucket failure (%s, class=%s) - attempting connection rediscovery",
                 result.error_type,
+                result.failure_class or "unknown",
             )
-            _LOGGER.debug("Org failure details: window=%s", result.query_window or "<unset>")
+            _LOGGER.debug(
+                "Influx connection failure details: org=%s bucket=%s window=%s",
+                self.influx_org or "<unset>",
+                self.influx_bucket or "<unset>",
+                result.query_window or "<unset>",
+            )
             resolved, ambiguous = await self._async_resolve_influx_org(self.influx_host_metadata)
             if resolved:
                 result = await self._async_fetch_influx_snapshot_with_backfill()

@@ -131,6 +131,60 @@ class InfluxOrgResolverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(winner, "org-1")
 
+    def test_pick_clear_winner_compares_best_bucket_per_org(self):
+        resolver = _load_resolver_module()
+        shared = dict(
+            org_name="Org 1",
+            circuit_count=20,
+            field_names=("power", "energy"),
+            total_power_w=5_000.0,
+            last_seen="2026-06-16T12:00:00+00:00",
+        )
+
+        winner = resolver._pick_clear_winner(
+            [
+                resolver.InfluxOrgCandidate(org_id="org-1", score=300, summary="a", selected_bucket="a", **shared),
+                resolver.InfluxOrgCandidate(org_id="org-1", score=290, summary="b", selected_bucket="b", **shared),
+                resolver.InfluxOrgCandidate(
+                    org_id="org-2",
+                    org_name="Org 2",
+                    circuit_count=1,
+                    field_names=("power",),
+                    total_power_w=100.0,
+                    last_seen="2026-06-16T12:00:00+00:00",
+                    score=150,
+                    summary="c",
+                    selected_bucket="c",
+                ),
+            ]
+        )
+
+        self.assertEqual(winner, "org-1")
+
+    async def test_bucket_scan_keeps_multiple_buckets_for_same_org(self):
+        resolver = _load_resolver_module()
+
+        async def fake_probe(_session, _url, _token, org_id, org_name, _range, **kwargs):
+            bucket = kwargs["bucket_names"][0]
+            return resolver.InfluxOrgCandidate(
+                org_id=org_id,
+                org_name=org_name,
+                circuit_count=1,
+                field_names=("power",),
+                total_power_w=100.0,
+                last_seen="2026-06-16T12:00:00+00:00",
+                score=200 if bucket == "localHub" else 190,
+                summary=bucket,
+                selected_bucket=bucket,
+            )
+
+        with mock.patch.object(resolver, "_probe_org", side_effect=fake_probe):
+            candidates = await resolver._probe_orgs_for_candidates(
+                object(), "http://example", "token", [("org-1", "Org 1", ("localHub", "archive"))], source="bucket_scan"
+            )
+
+        self.assertEqual({candidate.selected_bucket for candidate in candidates}, {"localHub", "archive"})
+
     async def test_discovery_uses_bucket_scan_when_org_list_is_empty(self):
         resolver = _load_resolver_module()
         org_rows = _build_circuit_csv("org-1", 1)

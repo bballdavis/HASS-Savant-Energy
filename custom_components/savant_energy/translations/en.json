@@ -30,8 +30,17 @@
       "ssh_unavailable": "The paramiko library is not installed. SSH token fetch is unavailable — paste the token manually instead.",
       "ssh_token_empty": "SSH connection succeeded but the token file was empty or not found. Verify the host is running rpm-energy ≥11.2.",
       "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password.",
+      "ssh_key_install_failed": "SSH connected, but Savant Energy could not install or verify its refresh key on the host. Check the logs for the failed stage.",
+      "ssh_key_verify_failed": "SSH connected and installed the refresh key, but the host rejected a new connection using that key. Check SSH ownership, permissions, and host policy.",
+      "setup_unexpected": "Setup failed unexpectedly. Check the logs for the sanitized failure trace and try again.",
       "host_not_available": "No host IP is configured. Go back and set a Host IP before re-provisioning.",
       "org_auth_failed": "InfluxDB rejected the token or organization. Verify the token, organization ID, and Host IP, then try again.",
+      "influx_auth_failed": "InfluxDB returned 401 and rejected the token for the data query. Verify that this is the read token from the same host.",
+      "influx_permission_denied": "InfluxDB returned 403. The token is recognized but does not have permission to read the selected bucket.",
+      "influx_org_invalid": "InfluxDB rejected the organization ID. Verify the org ID from .influxtoken or .influxsetup.",
+      "influx_bucket_invalid": "InfluxDB could not read the selected bucket. Verify the bucket name from .influxtoken.",
+      "influx_unreachable": "The InfluxDB host did not respond to the validation query. Verify the Host IP and port 8086.",
+      "influx_query_failed": "InfluxDB rejected the validation query. Check the sanitized integration logs for the HTTP status and response detail.",
       "org_enumeration_denied": "InfluxDB would not allow organization discovery with this token. Enter the organization ID to validate direct data access.",
       "org_discovery_failed": "Could not discover a valid Influx organization from host metadata, buckets, or the org list. Check the host IP and credentials, then try again.",
       "org_discovery_no_orgs": "Influx returned no organizations visible to this token.",
@@ -110,7 +119,8 @@
       "current_org_manual": {
         "title": "Current Setup — Enter Influx Organization ID",
         "data": {
-          "influx_org": "Influx Organization ID"
+          "influx_org": "Influx Organization ID",
+          "influx_bucket": "Influx Bucket (default localHub)"
         },
         "description": "This token cannot list Influx organizations. Enter the organization ID from the Savant host metadata to validate direct data access."
       },
@@ -203,7 +213,8 @@
       "reconfigure_org_manual": {
         "title": "Reconfigure — Enter Influx Organization ID",
         "data": {
-          "influx_org": "Influx Organization ID"
+          "influx_org": "Influx Organization ID",
+          "influx_bucket": "Influx Bucket (default localHub)"
         },
         "description": "This token cannot list Influx organizations. Enter the organization ID from the Savant host metadata to validate direct data access."
       }
@@ -215,7 +226,16 @@
       "ssh_unavailable": "The paramiko library is not installed. SSH token fetch is unavailable — paste the token manually instead.",
       "ssh_token_empty": "SSH connection succeeded but the token file was empty or not found. Verify the host is running rpm-energy ≥11.2.",
       "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password.",
+      "ssh_key_install_failed": "SSH connected, but Savant Energy could not install or verify its refresh key on the host. Check the logs for the failed stage.",
+      "ssh_key_verify_failed": "SSH connected and installed the refresh key, but the host rejected a new connection using that key. Check SSH ownership, permissions, and host policy.",
+      "setup_unexpected": "Setup failed unexpectedly. Check the logs for the sanitized failure trace and try again.",
       "org_auth_failed": "InfluxDB rejected the token or organization. Verify the token, organization ID, and Host IP, then try again.",
+      "influx_auth_failed": "InfluxDB returned 401 and rejected the token for the data query. Verify that this is the read token from the same host.",
+      "influx_permission_denied": "InfluxDB returned 403. The token is recognized but does not have permission to read the selected bucket.",
+      "influx_org_invalid": "InfluxDB rejected the organization ID. Verify the org ID from .influxtoken or .influxsetup.",
+      "influx_bucket_invalid": "InfluxDB could not read the selected bucket. Verify the bucket name from .influxtoken.",
+      "influx_unreachable": "The InfluxDB host did not respond to the validation query. Verify the Host IP and port 8086.",
+      "influx_query_failed": "InfluxDB rejected the validation query. Check the sanitized integration logs for the HTTP status and response detail.",
       "org_enumeration_denied": "InfluxDB would not allow organization discovery with this token. Enter the organization ID to validate direct data access.",
       "org_discovery_failed": "Could not discover a valid Influx organization from host metadata, buckets, or the org list. Check the host IP and credentials, then try again.",
       "org_discovery_no_orgs": "Influx returned no organizations visible to this token.",

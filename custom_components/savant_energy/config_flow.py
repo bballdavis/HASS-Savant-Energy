@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 from typing import Any
 
 import voluptuous as vol  # type: ignore
@@ -20,6 +21,7 @@ from .const import (
     CONF_DMX_TESTING_MODE,
     CONF_HOST,
     CONF_INFLUX_AUTH_METHOD,
+    CONF_INFLUX_BUCKET,
     CONF_INFLUX_ORG,
     CONF_INFLUX_TOKEN,
     CONF_INFLUX_URL,
@@ -33,6 +35,7 @@ from .const import (
     DEFAULT_DMX_TESTING_MODE,
     DEFAULT_DISABLE_SCENE_BUILDER,
     DEFAULT_INFLUX_AUTH_METHOD,
+    DEFAULT_INFLUX_BUCKET,
     DEFAULT_INFLUX_ORG,
     DEFAULT_MODE,
     DEFAULT_OLA_PORT,
@@ -54,6 +57,19 @@ from .legacy.snapshot_data import fetch_current_energy_snapshot
 
 _LOGGER = logging.getLogger(__name__)
 _CIRCUIT_MAP_WARNING_NOTIFICATION_ID = f"{DOMAIN}_circuit_map_reconfigure_warning"
+
+
+async def _async_safe_ssh_bootstrap(hass, host: str, username: str, password: str):
+    """Translate unexpected SSH pipeline errors without exposing credentials."""
+    try:
+        return await async_ssh_bootstrap(hass, host, username, password)
+    except Exception:
+        trace = traceback.format_exc()
+        for secret in (password, host, username):
+            if secret:
+                trace = trace.replace(secret, "[redacted]")
+        _LOGGER.error("SSH setup stage failed unexpectedly (setup_unexpected): %s", trace)
+        return None, None, None, "setup_unexpected"
 
 
 def _auth_method_selector():
@@ -82,7 +98,12 @@ def _mode_selector(include_auto: bool = True):
 
 
 def _candidate_options(candidates: dict[str, InfluxOrgCandidate]) -> dict[str, str]:
-    return {org_id: candidate.summary for org_id, candidate in candidates.items()}
+    return {candidate_key: candidate.summary for candidate_key, candidate in candidates.items()}
+
+
+def _candidate_key(candidate: InfluxOrgCandidate) -> str:
+    """Return a stable selector value that keeps same-org buckets distinct."""
+    return f"{candidate.org_id}::{candidate.selected_bucket or DEFAULT_INFLUX_BUCKET}"
 
 
 def _format_circuit_map_warning_message(warnings: list[str]) -> str:
@@ -157,6 +178,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_INFLUX_ORG,
                 current.get(CONF_INFLUX_ORG, DEFAULT_INFLUX_ORG),
             ),
+            CONF_INFLUX_BUCKET: self._pending.get(
+                CONF_INFLUX_BUCKET,
+                current.get(CONF_INFLUX_BUCKET, DEFAULT_INFLUX_BUCKET),
+            ),
             CONF_CIRCUIT_MAP: self._pending.get(
                 CONF_CIRCUIT_MAP,
                 current.get(CONF_CIRCUIT_MAP, {}),
@@ -168,7 +193,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         }
 
     def _remember_org_candidates(self, candidates: list[InfluxOrgCandidate]) -> None:
-        self._pending_org_candidates = {candidate.org_id: candidate for candidate in candidates}
+        self._pending_org_candidates = {_candidate_key(candidate): candidate for candidate in candidates}
 
     async def _async_discover_pending_org(
         self,
@@ -193,6 +218,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 len(result.candidates),
             )
             self._pending[CONF_INFLUX_ORG] = result.selected_org_id
+            self._pending[CONF_INFLUX_BUCKET] = result.selected_bucket or DEFAULT_INFLUX_BUCKET
             self._pending_org_candidates = {}
             return result.selected_org_id, None
         if result.candidates:
@@ -210,6 +236,19 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         return None, result.error_key or "org_discovery_failed"
 
+    async def _async_safe_discover_pending_org(
+        self, host_metadata: InfluxHostMetadata | None = None
+    ) -> tuple[str | None, str | None]:
+        try:
+            return await self._async_discover_pending_org(host_metadata)
+        except Exception:
+            trace = traceback.format_exc()
+            token = str(self._pending.get(CONF_INFLUX_TOKEN, ""))
+            if token:
+                trace = trace.replace(token, "[redacted]")
+            _LOGGER.error("Influx token setup stage failed unexpectedly (setup_unexpected): %s", trace)
+            return None, "setup_unexpected"
+
     def _resolve_pending_influx_url(self) -> str:
         """Return the best URL for discovery and persistence."""
         entry = self._get_reconfigure_entry() if self.context.get("entry_id") else None
@@ -226,12 +265,21 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def _async_discover_pending_circuit_map(self) -> str | None:
         """Resolve the persisted circuit map for the pending current-mode config."""
         self._pending_circuit_map_warnings = []
-        result = await discover_circuit_metadata_with_backfill(
-            self._resolve_pending_influx_url(),
-            self._pending[CONF_INFLUX_TOKEN],
-            self._pending[CONF_INFLUX_ORG],
-            sem_host=self._pending[CONF_ADDRESS],
-        )
+        try:
+            result = await discover_circuit_metadata_with_backfill(
+                self._resolve_pending_influx_url(),
+                self._pending[CONF_INFLUX_TOKEN],
+                self._pending[CONF_INFLUX_ORG],
+                sem_host=self._pending[CONF_ADDRESS],
+                influx_bucket=self._pending.get(CONF_INFLUX_BUCKET, DEFAULT_INFLUX_BUCKET),
+            )
+        except Exception:
+            trace = traceback.format_exc()
+            token = str(self._pending.get(CONF_INFLUX_TOKEN, ""))
+            if token:
+                trace = trace.replace(token, "[redacted]")
+            _LOGGER.error("Influx circuit setup stage failed unexpectedly (setup_unexpected): %s", trace)
+            return "setup_unexpected"
         if result.success and result.circuit_map:
             self._pending[CONF_CIRCUIT_MAP] = result.circuit_map
             self._pending_circuit_map_warnings = list(result.warnings or [])
@@ -244,9 +292,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         return result.error_key or "circuit_discovery_failed"
 
-    async def _async_finish_pending_manual_org(self, org_id: str) -> str | None:
+    async def _async_finish_pending_manual_org(self, org_id: str, bucket: str = DEFAULT_INFLUX_BUCKET) -> str | None:
         """Validate an explicitly supplied org ID through the normal circuit query."""
         self._pending[CONF_INFLUX_ORG] = org_id
+        self._pending[CONF_INFLUX_BUCKET] = bucket.strip() or DEFAULT_INFLUX_BUCKET
         return await self._async_discover_pending_circuit_map()
 
     async def _async_update_circuit_map_warning_notification(self) -> None:
@@ -399,7 +448,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors[CONF_INFLUX_TOKEN] = "required"
             else:
                 self._pending[CONF_INFLUX_TOKEN] = token
-                _, outcome = await self._async_discover_pending_org()
+                _, outcome = await self._async_safe_discover_pending_org()
                 if outcome is None:
                     circuit_error = await self._async_discover_pending_circuit_map()
                     if circuit_error is None:
@@ -426,7 +475,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                private_key, token, metadata, error_key = await async_ssh_bootstrap(
+                private_key, token, metadata, error_key = await _async_safe_ssh_bootstrap(
                     self.hass, self._pending[CONF_HOST], DEFAULT_SSH_USERNAME, ssh_password
                 )
                 if error_key:
@@ -434,7 +483,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 else:
                     self._pending[CONF_INFLUX_TOKEN] = token
                     self._pending[CONF_SSH_PRIVATE_KEY] = private_key
-                    _, outcome = await self._async_discover_pending_org(metadata)
+                    _, outcome = await self._async_safe_discover_pending_org(metadata)
                     if outcome is None:
                         circuit_error = await self._async_discover_pending_circuit_map()
                         if circuit_error is None:
@@ -455,11 +504,13 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Select a discovered Influx organization during initial setup."""
         errors = {}
         if user_input is not None:
-            org_id = user_input.get(CONF_INFLUX_ORG)
-            if org_id not in self._pending_org_candidates:
+            candidate_key = user_input.get(CONF_INFLUX_ORG)
+            if candidate_key not in self._pending_org_candidates:
                 errors["base"] = "org_selection_required"
             else:
-                self._pending[CONF_INFLUX_ORG] = org_id
+                candidate = self._pending_org_candidates[candidate_key]
+                self._pending[CONF_INFLUX_ORG] = candidate.org_id
+                self._pending[CONF_INFLUX_BUCKET] = candidate.selected_bucket or DEFAULT_INFLUX_BUCKET
                 self._pending_org_candidates = {}
                 circuit_error = await self._async_discover_pending_circuit_map()
                 if circuit_error is None:
@@ -482,14 +533,19 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not org_id:
                 errors[CONF_INFLUX_ORG] = "required"
             else:
-                circuit_error = await self._async_finish_pending_manual_org(org_id)
+                circuit_error = await self._async_finish_pending_manual_org(
+                    org_id, user_input.get(CONF_INFLUX_BUCKET, DEFAULT_INFLUX_BUCKET)
+                )
                 if circuit_error is None:
                     return await self._async_finish_current_setup()
                 errors["base"] = circuit_error
 
         return self.async_show_form(
             step_id="current_org_manual",
-            data_schema=vol.Schema({vol.Required(CONF_INFLUX_ORG, default=""): str}),
+            data_schema=vol.Schema({
+                vol.Required(CONF_INFLUX_ORG, default=""): str,
+                vol.Optional(CONF_INFLUX_BUCKET, default=DEFAULT_INFLUX_BUCKET): str,
+            }),
             errors=errors,
         )
 
@@ -659,7 +715,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors[CONF_INFLUX_TOKEN] = "required"
             else:
                 self._pending[CONF_INFLUX_TOKEN] = token
-                _, outcome = await self._async_discover_pending_org()
+                _, outcome = await self._async_safe_discover_pending_org()
                 if outcome is None:
                     circuit_error = await self._async_discover_pending_circuit_map()
                     if circuit_error is None:
@@ -694,7 +750,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                private_key, token, metadata, error_key = await async_ssh_bootstrap(
+                private_key, token, metadata, error_key = await _async_safe_ssh_bootstrap(
                     self.hass, self._pending[CONF_HOST], DEFAULT_SSH_USERNAME, ssh_password
                 )
                 if error_key:
@@ -702,7 +758,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 else:
                     self._pending[CONF_INFLUX_TOKEN] = token
                     self._pending[CONF_SSH_PRIVATE_KEY] = private_key
-                    _, outcome = await self._async_discover_pending_org(metadata)
+                    _, outcome = await self._async_safe_discover_pending_org(metadata)
                     if outcome is None:
                         circuit_error = await self._async_discover_pending_circuit_map()
                         if circuit_error is None:
@@ -724,11 +780,13 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         config_entry = self._get_reconfigure_entry()
         errors = {}
         if user_input is not None:
-            org_id = user_input.get(CONF_INFLUX_ORG)
-            if org_id not in self._pending_org_candidates:
+            candidate_key = user_input.get(CONF_INFLUX_ORG)
+            if candidate_key not in self._pending_org_candidates:
                 errors["base"] = "org_selection_required"
             else:
-                self._pending[CONF_INFLUX_ORG] = org_id
+                candidate = self._pending_org_candidates[candidate_key]
+                self._pending[CONF_INFLUX_ORG] = candidate.org_id
+                self._pending[CONF_INFLUX_BUCKET] = candidate.selected_bucket or DEFAULT_INFLUX_BUCKET
                 self._pending_org_candidates = {}
                 circuit_error = await self._async_discover_pending_circuit_map()
                 if circuit_error is None:
@@ -752,14 +810,19 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not org_id:
                 errors[CONF_INFLUX_ORG] = "required"
             else:
-                circuit_error = await self._async_finish_pending_manual_org(org_id)
+                circuit_error = await self._async_finish_pending_manual_org(
+                    org_id, user_input.get(CONF_INFLUX_BUCKET, DEFAULT_INFLUX_BUCKET)
+                )
                 if circuit_error is None:
                     return await self._async_finish_current_reconfigure(config_entry)
                 errors["base"] = circuit_error
 
         return self.async_show_form(
             step_id="reconfigure_org_manual",
-            data_schema=vol.Schema({vol.Required(CONF_INFLUX_ORG, default=""): str}),
+            data_schema=vol.Schema({
+                vol.Required(CONF_INFLUX_ORG, default=""): str,
+                vol.Optional(CONF_INFLUX_BUCKET, default=DEFAULT_INFLUX_BUCKET): str,
+            }),
             errors=errors,
         )
 
@@ -851,22 +914,41 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 if not host:
                     errors[CONF_SSH_PASSWORD] = "host_not_available"
                 else:
-                    private_key, token, metadata, error_key = await async_ssh_bootstrap(
+                    private_key, token, metadata, error_key = await _async_safe_ssh_bootstrap(
                         self.hass, host, DEFAULT_SSH_USERNAME, ssh_password
                     )
                     if error_key:
                         errors[CONF_SSH_PASSWORD] = error_key
                     else:
-                        result = await async_discover_influx_org(
-                            self.config_entry.data.get(CONF_INFLUX_URL, _derive_influx_url(host)),
-                            token,
-                            metadata,
-                        )
+                        try:
+                            result = await async_discover_influx_org(
+                                self.config_entry.data.get(CONF_INFLUX_URL, _derive_influx_url(host)),
+                                token,
+                                metadata,
+                            )
+                        except Exception:
+                            trace = traceback.format_exc().replace(str(token), "[redacted]")
+                            _LOGGER.error(
+                                "Influx SSH reprovision discovery failed unexpectedly (setup_unexpected): %s",
+                                trace,
+                            )
+                            errors["base"] = "setup_unexpected"
+                            result = None
+                        if result is None:
+                            return self.async_show_form(
+                                step_id="reprovision_ssh",
+                                data_schema=vol.Schema({vol.Required(CONF_SSH_PASSWORD): str}),
+                                errors=errors,
+                            )
                         chosen_org = result.selected_org_id
+                        chosen_bucket = result.selected_bucket
                         current_org = self.config_entry.data.get(CONF_INFLUX_ORG, "")
                         if chosen_org is None and result.candidates and current_org:
-                            if any(candidate.org_id == current_org for candidate in result.candidates):
+                            matching = [candidate for candidate in result.candidates if candidate.org_id == current_org]
+                            if matching:
+                                candidate = max(matching, key=lambda item: item.score)
                                 chosen_org = current_org
+                                chosen_bucket = candidate.selected_bucket
 
                         if chosen_org is None:
                             errors["base"] = (
@@ -879,6 +961,11 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                             data[CONF_INFLUX_TOKEN] = token
                             data[CONF_SSH_PRIVATE_KEY] = private_key
                             data[CONF_INFLUX_ORG] = chosen_org
+                            data[CONF_INFLUX_BUCKET] = (
+                                chosen_bucket
+                                or data.get(CONF_INFLUX_BUCKET)
+                                or DEFAULT_INFLUX_BUCKET
+                            )
                             self.hass.config_entries.async_update_entry(
                                 self.config_entry,
                                 data=data,
