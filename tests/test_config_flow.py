@@ -147,6 +147,125 @@ class _FakeHass:
 
 
 class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ssh_setup_installs_key_only_after_circuit_validation(self):
+        module = _load_config_flow_module()
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(types.SimpleNamespace(entry_id="unused", data={}))
+        flow.context = {}
+        flow._pending = {
+            module.CONF_ADDRESS: "192.168.1.108",
+            module.CONF_HOST: "192.168.1.14",
+            module.CONF_INFLUX_AUTH_METHOD: module.AUTH_INFLUX_SSH,
+        }
+        order = []
+
+        async def discover_circuit():
+            order.append("circuit")
+            return None
+
+        async def install_key():
+            order.append("install")
+            flow._pending[module.CONF_SSH_PRIVATE_KEY] = "private"
+            return None
+
+        with mock.patch.object(
+            module,
+            "_async_safe_ssh_prepare_bootstrap",
+            new=mock.AsyncMock(return_value=("private", "public", "token", None, None)),
+        ), mock.patch.object(
+            flow,
+            "_async_safe_discover_pending_org",
+            new=mock.AsyncMock(return_value=("org", None)),
+        ), mock.patch.object(
+            flow,
+            "_async_discover_pending_circuit_map",
+            new=discover_circuit,
+        ), mock.patch.object(
+            flow,
+            "_async_install_pending_ssh_key",
+            new=install_key,
+        ):
+            result = await flow.async_step_current_ssh({module.CONF_SSH_PASSWORD: "password"})
+
+        self.assertEqual(result["type"], "create_entry")
+        self.assertEqual(order, ["circuit", "install"])
+        self.assertEqual(result["data"][module.CONF_SSH_PRIVATE_KEY], "private")
+
+    async def test_ssh_setup_does_not_install_key_when_circuit_validation_fails(self):
+        module = _load_config_flow_module()
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(types.SimpleNamespace(entry_id="unused", data={}))
+        flow.context = {}
+        flow._pending = {
+            module.CONF_ADDRESS: "192.168.1.108",
+            module.CONF_HOST: "192.168.1.14",
+            module.CONF_INFLUX_AUTH_METHOD: module.AUTH_INFLUX_SSH,
+        }
+        install_key = mock.AsyncMock(return_value=None)
+
+        with mock.patch.object(
+            module,
+            "_async_safe_ssh_prepare_bootstrap",
+            new=mock.AsyncMock(return_value=("private", "public", "token", None, None)),
+        ), mock.patch.object(
+            flow,
+            "_async_safe_discover_pending_org",
+            new=mock.AsyncMock(return_value=("org", None)),
+        ), mock.patch.object(
+            flow,
+            "_async_discover_pending_circuit_map",
+            new=mock.AsyncMock(return_value="influx_auth_failed"),
+        ), mock.patch.object(
+            flow,
+            "_async_install_pending_ssh_key",
+            new=install_key,
+        ):
+            result = await flow.async_step_current_ssh({module.CONF_SSH_PASSWORD: "password"})
+
+        self.assertEqual(result["type"], "form")
+        self.assertEqual(result["errors"]["base"], "influx_auth_failed")
+        install_key.assert_not_awaited()
+        self.assertNotIn(module.CONF_SSH_PRIVATE_KEY, flow._pending)
+
+    async def test_ssh_org_selection_routes_install_failure_back_to_password(self):
+        module = _load_config_flow_module()
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(types.SimpleNamespace(entry_id="unused", data={}))
+        flow.context = {}
+        flow._pending = {
+            module.CONF_ADDRESS: "192.168.1.108",
+            module.CONF_HOST: "192.168.1.14",
+            module.CONF_INFLUX_TOKEN: "token",
+        }
+        candidate = module.InfluxOrgCandidate(
+            org_id="org",
+            org_name="Org",
+            circuit_count=1,
+            field_names=("power",),
+            total_power_w=100.0,
+            last_seen=None,
+            score=100,
+            summary="Org",
+            selected_bucket="localHub",
+        )
+        flow._pending_org_candidates = {"org::localHub": candidate}
+        flow._remember_ssh_bootstrap("192.168.1.14", "password", "private", "public", "token")
+
+        with mock.patch.object(
+            flow,
+            "_async_discover_pending_circuit_map",
+            new=mock.AsyncMock(return_value=None),
+        ), mock.patch.object(
+            flow,
+            "_async_install_pending_ssh_key",
+            new=mock.AsyncMock(return_value="ssh_key_verify_failed"),
+        ):
+            result = await flow.async_step_current_org_select({module.CONF_INFLUX_ORG: "org::localHub"})
+
+        self.assertEqual(result["type"], "form")
+        self.assertEqual(result["step_id"], "current_ssh")
+        self.assertEqual(result["errors"][module.CONF_SSH_PASSWORD], "ssh_key_verify_failed")
+
     async def test_reconfigure_completes_when_discovery_only_returns_warnings(self):
         module = _load_config_flow_module()
 

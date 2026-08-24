@@ -292,6 +292,108 @@ class SshHelperTests(unittest.TestCase):
 
         self.assertEqual(result, (None, None, None, "ssh_key_verify_failed"))
 
+    def test_async_prepare_bootstrap_reads_before_any_install(self):
+        module = _load_ssh_helper_module()
+        with mock.patch.object(module, "generate_ed25519_keypair", return_value=("private", "public")), mock.patch.object(
+            module,
+            "_ssh_read_influx_bundle_with_password_worker",
+            return_value=("token", None, None),
+        ) as reader, mock.patch.object(module, "_ssh_install_and_verify_key_worker") as installer:
+            result = asyncio.run(
+                module.async_ssh_prepare_bootstrap(_FakeHass(), "example.com", "user", "pass")
+            )
+
+        self.assertEqual(result, ("private", "public", "token", None, None))
+        reader.assert_called_once_with("example.com", "user", "pass")
+        installer.assert_not_called()
+
+    def test_key_verification_failure_rolls_back_only_new_authorized_key(self):
+        module = _load_ssh_helper_module()
+        auth_path = "/data/home/RPM/.ssh/authorized_keys"
+        public_key = "ssh-ed25519 new-key savant_energy_ha"
+
+        class _SftpFile:
+            def __init__(self, storage, path, mode):
+                self.storage = storage
+                self.path = path
+                self.mode = mode
+                self.buffer = storage.get(path, "") if "r" in mode else ""
+
+            def __enter__(self):
+                if "r" in self.mode and self.path not in self.storage:
+                    raise OSError("missing")
+                return self
+
+            def __exit__(self, *_args):
+                if any(flag in self.mode for flag in ("w", "x")):
+                    self.storage[self.path] = self.buffer
+
+            def read(self):
+                return self.buffer
+
+            def write(self, content):
+                self.buffer += content
+
+        class _Sftp:
+            def __init__(self, storage):
+                self.storage = storage
+
+            def open(self, path, mode):
+                return _SftpFile(self.storage, path, mode)
+
+            def chmod(self, _path, _mode):
+                return None
+
+            def rename(self, source, target):
+                self.storage[target] = self.storage.pop(source)
+
+            def remove(self, path):
+                self.storage.pop(path, None)
+
+            def close(self):
+                return None
+
+        class _Client:
+            def __init__(self, storage, verify=False):
+                self.storage = storage
+                self.verify = verify
+
+            def set_missing_host_key_policy(self, *_args, **_kwargs):
+                return None
+
+            def connect(self, **kwargs):
+                if self.verify and kwargs.get("pkey") is not None:
+                    raise RuntimeError("key rejected")
+
+            def exec_command(self, command):
+                if command.startswith("printf "):
+                    return None, _FakeStream("/data/home/RPM"), _FakeStream("")
+                if command.startswith("mkdir "):
+                    return None, _FakeStream(""), _FakeStream("")
+                raise AssertionError(f"Unexpected command: {command}")
+
+            def open_sftp(self):
+                return _Sftp(self.storage)
+
+            def close(self):
+                return None
+
+        storage = {auth_path: "ssh-ed25519 existing-key existing\n"}
+        clients = iter((_Client(storage), _Client(storage, verify=True)))
+        fake_paramiko = SimpleNamespace(
+            SSHClient=lambda: next(clients),
+            AutoAddPolicy=lambda: None,
+            Ed25519Key=_FakeEd25519Key,
+        )
+
+        with mock.patch.dict("sys.modules", {"paramiko": fake_paramiko}):
+            result = module._ssh_install_and_verify_key_worker(
+                "example.com", "user", "pass", "private", public_key, "token"
+            )
+
+        self.assertEqual(result, "ssh_key_verify_failed")
+        self.assertEqual(storage[auth_path], "ssh-ed25519 existing-key existing\n")
+
 
 if __name__ == "__main__":
     unittest.main()
