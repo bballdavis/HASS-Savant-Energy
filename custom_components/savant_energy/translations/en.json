@@ -11,7 +11,7 @@
           "disable_scene_builder": "Disable Scene Builder",
           "reprovision_ssh_key": "Refresh SSH Key And Token"
         },
-        "description": "Configure runtime options here. Use Reconfigure for host, token, and organization changes."
+        "description": "Configure runtime options here. Use Reconfigure to update hosts or run SSH bootstrap again."
       },
       "reprovision_ssh": {
         "title": "Re-provision SSH Key",
@@ -27,7 +27,7 @@
     "error": {
       "required": "This field is required.",
       "keygen_failed": "Failed to generate an SSH key pair. Check that the cryptography library is installed.",
-      "ssh_unavailable": "The paramiko library is not installed. SSH token fetch is unavailable — paste the token manually instead.",
+      "ssh_unavailable": "The paramiko library is not installed. SSH bootstrap is unavailable.",
       "ssh_token_empty": "SSH connection succeeded but the token file was empty or not found. Verify the host is running rpm-energy ≥11.2.",
       "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password.",
       "ssh_password_auth_failed": "SSH password authentication failed. Verify the RPM user password.",
@@ -85,34 +85,34 @@
         "description": "Enter the IP addresses for the PBC and the RPM host."
       },
       "current_auth": {
-        "title": "Current Setup — InfluxDB Authentication",
+        "title": "Current Setup — SSH Bootstrap",
         "data": {
-          "influx_auth_method": "How to obtain the Influx token"
+          "influx_auth_method": "SSH bootstrap"
         },
         "data_description": {
-          "influx_auth_method": "Choose 'Paste Token' if you already have the read token, or 'Fetch via SSH' to have the integration retrieve it automatically using the RPM user credentials."
+          "influx_auth_method": "New setup retrieves and validates the Influx read token through SSH using RPM user credentials."
         },
-        "description": "The integration needs an InfluxDB read token to pull energy data. Choose how you'd like to provide it."
+        "description": "New setup uses SSH to retrieve and validate the InfluxDB read token."
       },
       "current_token": {
-        "title": "Current Setup — Influx Read Token",
+        "title": "Current Setup — Legacy Token Compatibility",
         "data": {
-          "influx_token": "Influx Read Token"
+          "influx_token": "Legacy Influx Read Token"
         },
         "data_description": {
-          "influx_token": "Paste the InfluxDB read token from your Savant host. It is usually at /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken, or /data/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken."
+          "influx_token": "Inactive compatibility step. New setup retrieves the token over SSH."
         },
-        "description": "Paste the InfluxDB read token from your Savant host."
+        "description": "This retained compatibility step is not offered by new setup."
       },
       "current_ssh": {
-        "title": "Current Setup — SSH Auto-Fetch",
+        "title": "Current Setup — SSH Bootstrap",
         "data": {
           "ssh_password": "RPM User Password"
         },
         "data_description": {
-          "ssh_password": "Password for the 'RPM' user account on the Savant host. The integration will SSH in and retrieve the Influx read token automatically."
+          "ssh_password": "Password for the 'RPM' user account on the Savant host. The integration will validate the token candidate, install a refresh key, and retrieve the Influx read token automatically."
         },
-        "description": "Enter the RPM user password. The integration will connect via SSH and fetch the Influx token from the host."
+        "description": "Enter the RPM user password. The integration validates Savant data before saving the token and SSH refresh key."
       },
       "current_org_select": {
         "title": "Current Setup — Choose Influx Organization",
@@ -179,34 +179,34 @@
         "description": "Confirm or update the IP addresses for the PBC and RPM host."
       },
       "reconfigure_auth": {
-        "title": "Reconfigure — InfluxDB Authentication",
+        "title": "Reconfigure — SSH Bootstrap",
         "data": {
-          "influx_auth_method": "How to obtain the Influx token"
+          "influx_auth_method": "SSH bootstrap"
         },
         "data_description": {
-          "influx_auth_method": "Choose 'Paste Token' if you already have the read token, or 'Fetch via SSH' to have the integration retrieve it automatically using the RPM user credentials."
+          "influx_auth_method": "Reconfigure retrieves and validates the Influx read token through SSH using RPM user credentials."
         },
-        "description": "Choose how the integration should authenticate with InfluxDB."
+        "description": "Reconfigure uses SSH bootstrap and retains saved auth data until it succeeds."
       },
       "reconfigure_token": {
-        "title": "Reconfigure — Influx Read Token",
+        "title": "Reconfigure — Legacy Token Compatibility",
         "data": {
-          "influx_token": "Influx Read Token"
+          "influx_token": "Legacy Influx Read Token"
         },
         "data_description": {
-          "influx_token": "Paste the InfluxDB read token from your Savant host. It is usually at /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken, or /data/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken."
+          "influx_token": "Inactive compatibility step. Reconfigure retrieves the token over SSH."
         },
-        "description": "Paste the InfluxDB read token from your Savant host."
+        "description": "This retained compatibility step is not offered by reconfigure."
       },
       "reconfigure_ssh": {
-        "title": "Reconfigure — SSH Auto-Fetch",
+        "title": "Reconfigure — SSH Bootstrap",
         "data": {
           "ssh_password": "RPM User Password"
         },
         "data_description": {
-          "ssh_password": "Password for the 'RPM' user account on the Savant host. The integration will SSH in and retrieve the Influx read token automatically."
+          "ssh_password": "Password for the 'RPM' user account on the Savant host. The integration validates a token candidate and installs a refresh key before changing saved authentication data."
         },
-        "description": "Enter the RPM user password. The integration will connect via SSH and fetch the Influx token from the host."
+        "description": "Enter the RPM user password. Existing saved token/auth data remains unchanged unless validation and key installation succeed."
       },
       "reconfigure_org_select": {
         "title": "Reconfigure — Choose Influx Organization",
@@ -228,7 +228,7 @@
       "invalid_address": "Please enter a valid IP address.",
       "required": "This field is required.",
       "keygen_failed": "Failed to generate an SSH key pair. Check that the cryptography library is installed.",
-      "ssh_unavailable": "The paramiko library is not installed. SSH token fetch is unavailable — paste the token manually instead.",
+      "ssh_unavailable": "The paramiko library is not installed. SSH bootstrap is unavailable.",
       "ssh_token_empty": "SSH connection succeeded but the token file was empty or not found. Verify the host is running rpm-energy ≥11.2.",
       "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password.",
       "ssh_password_auth_failed": "SSH password authentication failed. Verify the RPM user password.",
@@ -270,8 +270,7 @@
     },
     "influx_auth_method": {
       "options": {
-        "token": "Paste Token",
-        "ssh": "Fetch via SSH"
+        "ssh": "SSH Bootstrap"
       }
     }
   }

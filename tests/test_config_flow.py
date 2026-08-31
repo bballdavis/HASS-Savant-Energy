@@ -147,6 +147,186 @@ class _FakeHass:
 
 
 class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_current_token_step_redirects_to_ssh_without_retaining_submitted_token(self):
+        module = _load_config_flow_module()
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(types.SimpleNamespace(entry_id="unused", data={}))
+        flow.context = {}
+        flow._pending = {
+            module.CONF_INFLUX_TOKEN: "stale-token",
+            module.CONF_INFLUX_ORG: "stale-org",
+            module.CONF_CIRCUIT_MAP: {"stale::1": {}},
+        }
+
+        with mock.patch.object(
+            flow,
+            "async_step_current_ssh",
+            new=mock.AsyncMock(return_value={"type": "form", "step_id": "current_ssh"}),
+        ) as ssh_step:
+            result = await flow.async_step_current_token({module.CONF_INFLUX_TOKEN: "submitted-token"})
+
+        self.assertEqual(result["step_id"], "current_ssh")
+        ssh_step.assert_awaited_once()
+        self.assertNotIn(module.CONF_INFLUX_TOKEN, flow._pending)
+        self.assertNotIn(module.CONF_INFLUX_ORG, flow._pending)
+        self.assertNotIn(module.CONF_CIRCUIT_MAP, flow._pending)
+        self.assertEqual(flow._pending[module.CONF_INFLUX_AUTH_METHOD], module.AUTH_INFLUX_SSH)
+
+    async def test_stale_reconfigure_token_step_redirects_to_ssh_without_entry_mutation(self):
+        module = _load_config_flow_module()
+        original_data = {
+            module.CONF_MODE: module.MODE_CURRENT,
+            module.CONF_INFLUX_TOKEN: "legacy-token",
+            module.CONF_INFLUX_ORG: "legacy-org",
+            module.CONF_INFLUX_AUTH_METHOD: "token",
+        }
+        entry = types.SimpleNamespace(entry_id="entry", data=dict(original_data))
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(entry)
+        flow.context = {"entry_id": entry.entry_id}
+        flow._pending = {module.CONF_INFLUX_TOKEN: "stale-token"}
+
+        with mock.patch.object(
+            flow,
+            "async_step_reconfigure_ssh",
+            new=mock.AsyncMock(return_value={"type": "form", "step_id": "reconfigure_ssh"}),
+        ) as ssh_step:
+            result = await flow.async_step_reconfigure_token({module.CONF_INFLUX_TOKEN: "submitted-token"})
+
+        self.assertEqual(result["step_id"], "reconfigure_ssh")
+        ssh_step.assert_awaited_once()
+        self.assertNotIn(module.CONF_INFLUX_TOKEN, flow._pending)
+        self.assertEqual(flow._pending[module.CONF_INFLUX_AUTH_METHOD], module.AUTH_INFLUX_SSH)
+        self.assertIsNone(flow.hass.config_entries.updated_entry)
+        self.assertEqual(entry.data, original_data)
+
+    async def test_stale_current_manual_org_step_discards_input_and_restarts_ssh(self):
+        module = _load_config_flow_module()
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(types.SimpleNamespace(entry_id="unused", data={}))
+        flow.context = {}
+        flow._pending = {
+            module.CONF_INFLUX_TOKEN: "stale-token",
+            module.CONF_INFLUX_ORG: "stale-org",
+            module.CONF_INFLUX_BUCKET: "stale-bucket",
+            module.CONF_CIRCUIT_MAP: {"stale::1": {}},
+        }
+        flow._pending_org_candidates = {"stale": object()}
+        flow._pending_ssh_bootstrap = {"token": "stale-token"}
+
+        with mock.patch.object(
+            flow,
+            "async_step_current_ssh",
+            new=mock.AsyncMock(return_value={"type": "form", "step_id": "current_ssh"}),
+        ) as ssh_step:
+            result = await flow.async_step_current_org_manual(
+                {module.CONF_INFLUX_ORG: "submitted-org", module.CONF_INFLUX_BUCKET: "submitted-bucket"}
+            )
+
+        self.assertEqual(result["step_id"], "current_ssh")
+        ssh_step.assert_awaited_once()
+        for key in (
+            module.CONF_INFLUX_TOKEN,
+            module.CONF_INFLUX_ORG,
+            module.CONF_INFLUX_BUCKET,
+            module.CONF_CIRCUIT_MAP,
+        ):
+            self.assertNotIn(key, flow._pending)
+        self.assertEqual(flow._pending_org_candidates, {})
+        self.assertIsNone(flow._pending_ssh_bootstrap)
+        self.assertEqual(flow._pending[module.CONF_INFLUX_AUTH_METHOD], module.AUTH_INFLUX_SSH)
+
+    async def test_stale_reconfigure_manual_org_step_discards_input_without_entry_mutation(self):
+        module = _load_config_flow_module()
+        original_data = {
+            module.CONF_MODE: module.MODE_CURRENT,
+            module.CONF_INFLUX_TOKEN: "legacy-token",
+            module.CONF_INFLUX_ORG: "legacy-org",
+            module.CONF_INFLUX_AUTH_METHOD: "token",
+        }
+        entry = types.SimpleNamespace(entry_id="entry", data=dict(original_data))
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(entry)
+        flow.context = {"entry_id": entry.entry_id}
+        flow._pending = {
+            module.CONF_INFLUX_TOKEN: "stale-token",
+            module.CONF_INFLUX_ORG: "stale-org",
+            module.CONF_INFLUX_BUCKET: "stale-bucket",
+        }
+        flow._pending_ssh_bootstrap = {"token": "stale-token"}
+
+        with mock.patch.object(
+            flow,
+            "async_step_reconfigure_ssh",
+            new=mock.AsyncMock(return_value={"type": "form", "step_id": "reconfigure_ssh"}),
+        ) as ssh_step:
+            result = await flow.async_step_reconfigure_org_manual(
+                {module.CONF_INFLUX_ORG: "submitted-org", module.CONF_INFLUX_BUCKET: "submitted-bucket"}
+            )
+
+        self.assertEqual(result["step_id"], "reconfigure_ssh")
+        ssh_step.assert_awaited_once()
+        self.assertNotIn(module.CONF_INFLUX_TOKEN, flow._pending)
+        self.assertNotIn(module.CONF_INFLUX_ORG, flow._pending)
+        self.assertNotIn(module.CONF_INFLUX_BUCKET, flow._pending)
+        self.assertIsNone(flow._pending_ssh_bootstrap)
+        self.assertIsNone(flow.hass.config_entries.updated_entry)
+        self.assertEqual(entry.data, original_data)
+
+    async def test_current_setup_routes_directly_to_ssh_without_token_selector(self):
+        module = _load_config_flow_module()
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(types.SimpleNamespace(entry_id="unused", data={}))
+        flow.context = {}
+
+        with mock.patch.object(
+            flow,
+            "async_step_current_ssh",
+            new=mock.AsyncMock(return_value={"type": "form", "step_id": "current_ssh"}),
+        ) as ssh_step:
+            result = await flow.async_step_current_setup(
+                {module.CONF_ADDRESS: "192.168.1.108", module.CONF_HOST: "192.168.1.14"}
+            )
+
+        self.assertEqual(result["step_id"], "current_ssh")
+        ssh_step.assert_awaited_once()
+        self.assertEqual(flow._pending[module.CONF_INFLUX_AUTH_METHOD], module.AUTH_INFLUX_SSH)
+
+    async def test_failed_ssh_reconfigure_retains_legacy_token_entry_data(self):
+        module = _load_config_flow_module()
+        original_data = {
+            module.CONF_MODE: module.MODE_CURRENT,
+            module.CONF_ADDRESS: "192.168.1.108",
+            module.CONF_HOST: "192.168.1.14",
+            module.CONF_INFLUX_TOKEN: "legacy-token",
+            module.CONF_INFLUX_ORG: "legacy-org",
+            module.CONF_INFLUX_AUTH_METHOD: "token",
+            module.CONF_SSH_PRIVATE_KEY: "",
+            module.CONF_CIRCUIT_MAP: {"legacy::1": {"role": "relay"}},
+        }
+        entry = types.SimpleNamespace(entry_id="entry", data=dict(original_data))
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(entry)
+        flow.context = {"entry_id": entry.entry_id}
+
+        routed = await flow.async_step_reconfigure_current_host(
+            {module.CONF_ADDRESS: "192.168.1.108", module.CONF_HOST: "192.168.1.14"}
+        )
+        self.assertEqual(routed["step_id"], "reconfigure_ssh")
+        self.assertIsNone(flow.hass.config_entries.updated_entry)
+
+        with mock.patch.object(
+            module,
+            "_async_safe_ssh_prepare_bootstrap_candidates",
+            new=mock.AsyncMock(return_value=("", "", [], "ssh_password_auth_failed")),
+        ):
+            result = await flow.async_step_reconfigure_ssh({module.CONF_SSH_PASSWORD: "wrong-password"})
+
+        self.assertEqual(result["type"], "form")
+        self.assertEqual(result["errors"][module.CONF_SSH_PASSWORD], "ssh_password_auth_failed")
+        self.assertIsNone(flow.hass.config_entries.updated_entry)
+        self.assertEqual(entry.data, original_data)
+
     async def test_reconfigure_partial_discovery_preserves_complete_stored_circuit_map(self):
         module = _load_config_flow_module()
         existing_map = {"uuid::1": {"circuit_key": "uuid::1"}, "uuid::2": {"circuit_key": "uuid::2"}}

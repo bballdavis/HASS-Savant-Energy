@@ -33,18 +33,18 @@ Auto mode starts with the PBC IP and probes the legacy activity feed.
 
 1. If the legacy feed responds with usable data, the entry stays in legacy mode.
 2. If the legacy feed is unavailable, the flow asks for the Savant host IP and current-mode credentials.
-3. The flow retrieves or accepts an InfluxDB read token.
+3. The flow retrieves and validates an InfluxDB read token through SSH bootstrap.
 4. The flow discovers the correct Influx organization by checking host metadata, buckets, and the organization list.
 5. The flow discovers the circuit map, including relay matches and CT classifications.
-6. The current-mode entry is created with the token, organization, circuit map, and any generated SSH key.
+6. The current-mode entry is created with the validated token, organization, circuit map, and generated SSH key.
 
 If multiple organizations contain plausible Savant data, the flow shows a selection form instead of guessing.
 
-For a manually pasted token, the integration does not use SSH or retain an SSH key. If InfluxDB rejects organization enumeration, setup asks for an explicit organization ID and validates it with a direct Flux query. A later 401 from a saved pasted token is treated as a possible rotation, revocation, or host/access mismatch and prompts the user to Reconfigure with a fresh token.
+Existing token-only entries remain supported at runtime. Reconfigure directs them through SSH bootstrap and does not replace the old token/auth state until a candidate validates against Savant data and the generated key is installed and verified.
 
 ### SSH token bootstrap
 
-When the user chooses SSH token retrieval, the integration:
+During SSH token bootstrap, the integration:
 
 1. Generates an Ed25519 key pair.
 2. Connects to the Savant host as `RPM` with the supplied password.
@@ -109,7 +109,7 @@ The polling interval backs off after failures and returns to the configured inte
 
 ## Energy and CT handling
 
-InfluxDB hardware energy counters are converted to kWh for Home Assistant. Relay circuits use the fixed relay scale. CT circuits resolve their scale from observed power and energy deltas, record confidence and the selected divisor, and guard against implausible jumps.
+InfluxDB hardware energy counters are converted to kWh for Home Assistant. Detailed relay rows use the fixed mWh scale and CT circuits resolve their scale from observed power and energy deltas. Some hosts publish stored relay circuits only through `Energy.Circuit.<name>.Power` and `.Energy` type-`0000` hub channels. Those hub counters are Wh, so the integration records their raw value and uses the explicit `hub_wh_to_kwh` divisor of 1,000. Hub-only rows do not supply relay state or control data.
 
 Multi-leg CT circuits are represented in two ways:
 
@@ -159,7 +159,7 @@ SSH refresh is staged as password connection, home/path resolution, append-and-r
 
 - A 401 normally means the token expired or rotated. With SSH bootstrap enabled, the stored key should refresh it automatically.
 - An organization selection prompt means more than one candidate matched Savant's expected data shape. Choose the candidate with current circuit data.
-- A circuit inventory warning means InfluxDB found a circuit absent from the saved relay/CT map. It is reported once for that inventory change, rather than on every poll. Mapped circuits continue operating; unmatched circuits remain unavailable for control until Reconfigure rebuilds the map.
+- A circuit inventory warning means InfluxDB found a circuit absent from the saved relay/CT map. It is reported once for that inventory change, rather than on every poll. Mapped hub-only circuit measurements count as live measurements, but remain unavailable for relay status or control until detailed state telemetry returns.
 - An empty snapshot can be a timing issue on the Savant host. The integration widens its lookback window before reporting failure.
 - Legacy installations should use Reconfigure after upgrading Savant to firmware 11.2 or later.
 

@@ -429,6 +429,252 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_hub_circuit_measurements_fill_stored_relay_without_inventing_control(self):
+        """Hub-only relay channels stay measurement-only and never beat UUID rows."""
+        module = _load_influx_client_module()
+        tesla_key = f"{_TESLA_UUID}::6"
+        relay_key = "RELAY-UUID::1"
+        circuit_text = _single_circuit_csv(
+            name="Tesla",
+            savant_uuid=_TESLA_UUID,
+            channel="6",
+            classification="Consumption",
+            device_type="007A",
+        )
+        hub_text = "\n".join(
+            [
+                "result,table,_measurement,type,channel,_field,_value",
+                ",_result,hub,0000,Energy.Circuit.Tesla.Power,power,999",
+                ",_result,hub,0000,Energy.Circuit.Tesla.Energy,energy,999999",
+                ",_result,hub,0000,Energy.Circuit.Garage Lights.Power,power,42.5",
+                ",_result,hub,0000,Energy.Circuit.Garage Lights.Energy,energy,1234567",
+            ]
+        )
+        circuit_map = {
+            tesla_key: {
+                "circuit_key": tesla_key,
+                "savant_uuid": _TESLA_UUID,
+                "channel": "6",
+                "type": "007A",
+                "role": "ct_sensor",
+                "display_name": "Tesla",
+                "influx_name": "Tesla",
+                "legacy_uid": f"{_TESLA_UUID}.6",
+                "legacy_base_uid": _TESLA_UUID,
+            },
+            relay_key: {
+                "circuit_key": relay_key,
+                "savant_uuid": "RELAY-UUID",
+                "channel": "1",
+                "type": "0000",
+                "role": "relay",
+                "relay_uid": "001AAE1732B0",
+                "display_name": "Garage Lights",
+                "influx_name": "Garage Ligh",
+                "relay_match_name": "Garage Lights",
+                "legacy_uid": "001AAE1732B0.0",
+                "legacy_base_uid": "001AAE1732B0",
+            },
+        }
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                self.assertIn('r._field == "energy"', query)
+                return True, hub_text, "", False, False
+            return True, circuit_text, "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example",
+                "token",
+                "org-1",
+                circuit_metadata=circuit_map,
+                scale_state={},
+            )
+
+        self.assertTrue(snapshot.success)
+        assert snapshot.data is not None
+        demands = {item["circuit_key"]: item for item in snapshot.data["presentDemands"]}
+        self.assertEqual(demands[tesla_key]["power"], 123.4)
+        relay = demands[relay_key]
+        self.assertEqual(relay["power"], 42.5)
+        self.assertEqual(relay["energy_raw"], 1234567.0)
+        self.assertEqual(relay["energy"], 1234.567)
+        self.assertEqual(relay["energy_scale_divisor"], 1_000)
+        self.assertEqual(relay["energy_scale_status"], "hub_wh_to_kwh")
+        self.assertEqual(relay["hub_match_source"], "hub_exact")
+        self.assertFalse(relay["has_relay"])
+        for unavailable_field in ("current", "voltage", "flags", "percentCommanded", "relay_uid"):
+            self.assertNotIn(unavailable_field, relay)
+        self.assertEqual(snapshot.data["circuit_map_status"]["missing_circuit_keys"], [])
+        self.assertFalse(snapshot.data["circuit_map_status"]["reconfigure_required"])
+
+    async def test_hub_aggregate_never_fills_one_missing_leg_of_an_ambiguous_alias(self):
+        module = _load_influx_client_module()
+        first_leg = f"{_TESLA_UUID}::6"
+        missing_leg = f"{_TESLA_UUID}::7"
+        circuit_text = _single_circuit_csv(
+            name="Tesla",
+            savant_uuid=_TESLA_UUID,
+            channel="6",
+            classification="Consumption",
+            device_type="007A",
+        )
+        hub_text = "\n".join(
+            [
+                "result,table,_measurement,type,channel,_field,_value",
+                ",_result,hub,0000,Energy.Circuit.Tesla.Power,power,999",
+                ",_result,hub,0000,Energy.Circuit.Tesla.Energy,energy,999999",
+            ]
+        )
+        circuit_map = {
+            key: {
+                "circuit_key": key,
+                "savant_uuid": _TESLA_UUID,
+                "channel": channel,
+                "type": "007A",
+                "role": "ct_sensor",
+                "display_name": "Tesla",
+                "influx_name": "Tesla",
+                "legacy_uid": f"{_TESLA_UUID}.{channel}",
+                "legacy_base_uid": _TESLA_UUID,
+            }
+            for key, channel in ((first_leg, "6"), (missing_leg, "7"))
+        }
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                return True, hub_text, "", False, False
+            return True, circuit_text, "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example",
+                "token",
+                "org-1",
+                circuit_metadata=circuit_map,
+                scale_state={},
+            )
+
+        self.assertTrue(snapshot.success)
+        assert snapshot.data is not None
+        demands = {item["circuit_key"]: item for item in snapshot.data["presentDemands"]}
+        self.assertEqual(set(demands), {first_leg})
+        self.assertEqual(demands[first_leg]["power"], 123.4)
+        self.assertNotIn(missing_leg, demands)
+        self.assertEqual(snapshot.data["circuit_map_status"]["missing_circuit_keys"], [missing_leg])
+        self.assertTrue(snapshot.data["circuit_map_status"]["reconfigure_required"])
+
+    async def test_distinct_raw_hub_labels_that_canonicalize_together_stay_ambiguous(self):
+        module = _load_influx_client_module()
+        circuit_key = "ISLAND::1"
+        hub_text = "\n".join(
+            [
+                "result,table,_measurement,type,channel,_field,_value",
+                ",_result,hub,0000,Energy.Circuit.Kitchen / Island.Power,power,42",
+                ",_result,hub,0000,Energy.Circuit.Kitchen - Island.Energy,energy,42000",
+            ]
+        )
+        circuit_map = {
+            circuit_key: {
+                "circuit_key": circuit_key,
+                "savant_uuid": "ISLAND",
+                "channel": "1",
+                "role": "relay",
+                "display_name": "Kitchen Island",
+                "legacy_uid": "relay.0",
+                "legacy_base_uid": "relay",
+            }
+        }
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                return True, hub_text, "", False, False
+            return True, "", "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example",
+                "token",
+                "org-1",
+                circuit_metadata=circuit_map,
+                scale_state={},
+            )
+
+        self.assertTrue(snapshot.success)
+        assert snapshot.data is not None
+        self.assertEqual(snapshot.data["presentDemands"], [])
+        self.assertEqual(snapshot.data["circuit_map_status"]["missing_circuit_keys"], [circuit_key])
+        self.assertTrue(snapshot.data["circuit_map_status"]["reconfigure_required"])
+
+    def test_hub_matcher_recovers_known_label_variants_but_rejects_ambiguous_fuzzy_match(self):
+        module = _load_influx_client_module()
+        known_pairs = [
+            ("Queen Room", "Queen"),
+            ("Smoke Detector", "Smoke Detectors"),
+            ("Yvettes Office", "Yvett's Office"),
+            ("A/C Down Blower", "Downstairs A/C - Blower"),
+            ("A/C Downstairs", "Downstairs A/C"),
+            ("Kylos Room", "Kylo's Room"),
+            ("Patio Kitchen", "Patio - TV / Kitchen"),
+            ("A/C Upstairs", "Upstairs A/C"),
+            ("Kitchen Island", "Kitchen - Island & Left Counter"),
+            ("A/C Up Blower", "Upstairs A/C - Blower"),
+            ("Garg Outlets", "Garage Outlets"),
+        ]
+        stored = {
+            f"stored::{index}": {"display_name": stored_name}
+            for index, (stored_name, _hub_name) in enumerate(known_pairs, start=1)
+        }
+        # Both candidates are high-scoring fuzzy variants for this hub label;
+        # neither has enough separation to justify a match.
+        stored.update(
+            {
+                "ambiguous::1": {"display_name": "Patio Light"},
+                "ambiguous::2": {"display_name": "Patio Lightss"},
+            }
+        )
+        hub_rows = {
+            module._normalize_name(hub_name): {"name": hub_name}
+            for _stored_name, hub_name in known_pairs
+        }
+        hub_rows[module._normalize_name("Patio Lights")] = {"name": "Patio Lights"}
+
+        matches = module._resolve_hub_circuit_matches(hub_rows, stored, set())
+
+        expected = {
+            module._normalize_name(hub_name): f"stored::{index}"
+            for index, (_stored_name, hub_name) in enumerate(known_pairs, start=1)
+        }
+        self.assertEqual({hub_key: key for hub_key, (key, _source) in matches.items()}, expected)
+        self.assertNotIn(module._normalize_name("Patio Lights"), matches)
+        self.assertEqual(matches[module._normalize_name("Yvett's Office")][1], "hub_fuzzy")
+        self.assertEqual(matches[module._normalize_name("Patio - TV / Kitchen")][1], "hub_token_containment")
+
+    def test_higher_tier_hub_match_is_excluded_from_later_containment_candidates(self):
+        module = _load_influx_client_module()
+        stored = {
+            "island::1": {"display_name": "Kitchen Island"},
+            "counter::1": {"display_name": "Kitchen Counter"},
+        }
+        hub_rows = {
+            module._normalize_name("Kitchen - Counter"): {"name": "Kitchen - Counter"},
+            module._normalize_name("Kitchen - Island & Left Counter"): {
+                "name": "Kitchen - Island & Left Counter"
+            },
+        }
+
+        matches = module._resolve_hub_circuit_matches(hub_rows, stored, set())
+
+        self.assertEqual(
+            matches[module._normalize_name("Kitchen - Counter")],
+            ("counter::1", "hub_exact"),
+        )
+        self.assertEqual(
+            matches[module._normalize_name("Kitchen - Island & Left Counter")],
+            ("island::1", "hub_token_containment"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

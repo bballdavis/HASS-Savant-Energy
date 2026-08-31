@@ -12,6 +12,7 @@ import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Any, Optional
 
 import aiohttp
@@ -58,9 +59,16 @@ _SYSTEM_QUERY = """\
 from(bucket: {bucket})
   |> range(start: {range_start})
   |> filter(fn: (r) => r.type == "0000")
-  |> filter(fn: (r) => r._field == "power")
+  |> filter(fn: (r) => r._field == "power" or r._field == "energy")
   |> last()
 """
+
+_HUB_CIRCUIT_CHANNEL_RE = re.compile(
+    r"^Energy\.Circuit\.(?P<name>.+)\.(?P<field>Power|Energy)$",
+    re.IGNORECASE,
+)
+_HUB_FUZZY_MIN_SCORE = 0.90
+_HUB_FUZZY_MIN_MARGIN = 0.08
 
 
 def _flux_string(value: str) -> str:
@@ -457,6 +465,272 @@ def _build_circuit_rows(circuit_text: str) -> tuple[str, dict[str, dict[str, Any
             by_circuit_key[circuit_key][field] = _safe_float(row.get("_value"))
 
     return pbc_device_id, by_circuit_key
+
+
+def _build_hub_circuit_rows(system_text: str) -> dict[str, dict[str, Any]]:
+    """Extract measurement-only circuit rows from type=0000 hub channels.
+
+    Current Savant hosts can emit relay circuit telemetry only as
+    ``Energy.Circuit.<display name>.Power`` and ``.Energy`` hub channels.  The
+    rows have no ``savantUUID`` and, importantly, contain no relay state or
+    control data.
+    """
+    hub_rows: dict[str, dict[str, Any]] = {}
+    for row in _parse_influx_csv(system_text):
+        channel = str(row.get("channel") or "").strip()
+        match = _HUB_CIRCUIT_CHANNEL_RE.match(channel)
+        if not match:
+            continue
+        display_name = match.group("name").strip()
+        if not _is_usable_name(display_name):
+            continue
+        field = match.group("field").lower()
+        hub_row = hub_rows.setdefault(
+            display_name,
+            {
+                "name": display_name,
+                "raw_display_name": display_name,
+                "channels": {},
+            },
+        )
+        hub_row[field] = _safe_float(row.get("_value"))
+        hub_row["channels"][field] = channel
+    return hub_rows
+
+
+def _canonical_hub_match_name(value: str) -> str:
+    """Normalize safe Savant label variants without collapsing distinct loads."""
+    text = str(value or "").lower()
+    # Preserve the base name for ordinary possessives (``Kylo's`` -> ``Kylo``).
+    text = re.sub(r"(?<=[a-z0-9])[\u2019']s\b", "", text)
+    tokens = _normalize_name(text).split()
+    canonical_tokens: list[str] = []
+    index = 0
+    while index < len(tokens):
+        # Savant alternates between A/C and AC in relay and hub labels.
+        if tokens[index:index + 2] == ["a", "c"]:
+            canonical_tokens.append("ac")
+            index += 2
+            continue
+        token = tokens[index]
+        canonical_tokens.append(
+            {
+                "up": "upstairs",
+                "down": "downstairs",
+                "detectors": "detector",
+            }.get(token, token)
+        )
+        index += 1
+    return " ".join(canonical_tokens)
+
+
+def _stored_match_aliases(metadata: dict[str, Any]) -> set[str]:
+    """Return every safe, canonical stored name usable for hub matching."""
+    aliases: set[str] = set()
+    for name_field in ("display_name", "influx_name", "relay_match_name"):
+        name = str(metadata.get(name_field) or "").strip()
+        canonical = _canonical_hub_match_name(name)
+        if _is_usable_name(canonical):
+            aliases.add(canonical)
+    return aliases
+
+
+def _mutually_unique_pairs(edges: dict[str, set[str]]) -> list[tuple[str, str]]:
+    """Return only globally one-to-one candidate edges, in stable order."""
+    reverse: dict[str, set[str]] = defaultdict(set)
+    for hub_name, circuit_keys in edges.items():
+        for circuit_key in circuit_keys:
+            reverse[circuit_key].add(hub_name)
+    return [
+        (hub_name, next(iter(circuit_keys)))
+        for hub_name, circuit_keys in sorted(edges.items())
+        if len(circuit_keys) == 1 and len(reverse[next(iter(circuit_keys))]) == 1
+    ]
+
+
+def _resolve_hub_circuit_matches(
+    hub_rows: dict[str, dict[str, Any]],
+    stored_metadata: dict[str, dict[str, Any]],
+    detailed_circuit_keys: set[str],
+) -> dict[str, tuple[str, str]]:
+    """Resolve hub labels with strict, globally one-to-one matching tiers.
+
+    Every tier considers the complete stored map, including detailed live rows,
+    so a partial detailed multi-leg circuit cannot make a previously ambiguous
+    hub label appear unique. ``detailed_circuit_keys`` are allowed to block a
+    match but are never replaced by aggregate hub telemetry.
+    """
+    aliases_by_key = {
+        circuit_key: _stored_match_aliases(metadata)
+        for circuit_key, metadata in stored_metadata.items()
+    }
+    hub_names = {
+        hub_key: _canonical_hub_match_name(str(hub_row.get("name") or ""))
+        for hub_key, hub_row in hub_rows.items()
+    }
+    unresolved = {hub_key for hub_key, name in hub_names.items() if _is_usable_name(name)}
+    detailed_blockers = set(detailed_circuit_keys)
+    # Hub-resolved keys are lower-confidence than detailed rows and can be
+    # removed from later tiers. Detailed blockers deliberately remain in every
+    # candidate edge so a partial UUID snapshot continues to block a hub
+    # aggregate from filling another leg.
+    hub_resolved_keys: set[str] = set()
+    resolved: dict[str, tuple[str, str]] = {}
+
+    def apply_pairs(edges: dict[str, set[str]], source: str) -> None:
+        for hub_key, circuit_key in _mutually_unique_pairs(edges):
+            unresolved.discard(hub_key)
+            if circuit_key not in detailed_blockers:
+                resolved[hub_key] = (circuit_key, source)
+                hub_resolved_keys.add(circuit_key)
+
+    # Tier 1: exact canonical aliases. This covers harmless punctuation,
+    # possessive, A/C, and up/downstairs variations without approximation.
+    exact_edges = {
+        hub_key: {
+            circuit_key
+            for circuit_key, aliases in aliases_by_key.items()
+            if circuit_key not in hub_resolved_keys
+            if hub_name in aliases
+        }
+        for hub_key, hub_name in hub_names.items()
+        if hub_key in unresolved
+    }
+    apply_pairs(exact_edges, "hub_exact")
+
+    # Tier 2a: token-set equality handles harmless word reordering while
+    # keeping a shorter base label from being confused with its "Blower"
+    # sibling.
+    equal_token_edges: dict[str, set[str]] = {}
+    for hub_key in sorted(unresolved):
+        hub_tokens = set(hub_names[hub_key].split())
+        if not hub_tokens:
+            continue
+        equal_token_edges[hub_key] = {
+            circuit_key
+            for circuit_key, aliases in aliases_by_key.items()
+            if circuit_key not in hub_resolved_keys
+            if any(hub_tokens == set(alias.split()) for alias in aliases)
+        }
+    apply_pairs(equal_token_edges, "hub_token_set")
+
+    # Tier 2b: a whole token set contained in the other label. This accepts
+    # label extensions such as "Patio TV Kitchen" but only under the same
+    # global one-to-one rule.
+    containment_edges: dict[str, set[str]] = {}
+    for hub_key in sorted(unresolved):
+        hub_tokens = set(hub_names[hub_key].split())
+        if not hub_tokens:
+            continue
+        containment_edges[hub_key] = {
+            circuit_key
+            for circuit_key, aliases in aliases_by_key.items()
+            if circuit_key not in hub_resolved_keys
+            if any(
+                hub_tokens < set(alias.split()) or set(alias.split()) < hub_tokens
+                for alias in aliases
+            )
+        }
+    apply_pairs(containment_edges, "hub_token_containment")
+
+    # Tier 3: only high-confidence, mutual fuzzy best matches with a clear
+    # score gap. It recovers harmless spelling/truncation variants while
+    # leaving near matches unavailable instead of guessing.
+    score_matrix: dict[str, dict[str, float]] = {}
+    for hub_key in sorted(unresolved):
+        hub_name = hub_names[hub_key]
+        score_matrix[hub_key] = {
+            circuit_key: max(
+                (SequenceMatcher(None, hub_name, alias).ratio() for alias in aliases),
+                default=0.0,
+            )
+            for circuit_key, aliases in aliases_by_key.items()
+            if circuit_key not in hub_resolved_keys
+        }
+
+    def unique_best(scores: dict[str, float]) -> str | None:
+        ranked = sorted(((score, key) for key, score in scores.items()), reverse=True)
+        if not ranked or ranked[0][0] < _HUB_FUZZY_MIN_SCORE:
+            return None
+        if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < _HUB_FUZZY_MIN_MARGIN:
+            return None
+        return ranked[0][1]
+
+    fuzzy_hub_best = {
+        hub_key: unique_best(scores)
+        for hub_key, scores in score_matrix.items()
+    }
+    fuzzy_circuit_keys = next(iter(score_matrix.values()), {})
+    fuzzy_stored_best = {
+        circuit_key: unique_best(
+            {hub_key: scores[circuit_key] for hub_key, scores in score_matrix.items()}
+        )
+        for circuit_key in fuzzy_circuit_keys
+    }
+    for hub_key, circuit_key in sorted(fuzzy_hub_best.items()):
+        if circuit_key is None or fuzzy_stored_best.get(circuit_key) != hub_key:
+            continue
+        unresolved.discard(hub_key)
+        if circuit_key not in detailed_blockers:
+            resolved[hub_key] = (circuit_key, "hub_fuzzy")
+            hub_resolved_keys.add(circuit_key)
+
+    return resolved
+
+
+def _build_hub_present_demand(
+    circuit_key: str,
+    metadata: dict[str, Any],
+    hub_row: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a stored-circuit live row from measurement-only hub telemetry.
+
+    Live Savant evidence establishes that hub circuit counters are Wh (unlike
+    detailed relay rows, which use mWh), so publish kWh with an explicit
+    divisor while retaining the raw value for diagnostics.
+    """
+    savant_uuid, stored_channel = split_circuit_key(circuit_key)
+    savant_uuid = str(metadata.get("savant_uuid") or savant_uuid).strip()
+    stored_channel = str(metadata.get("channel") or stored_channel).strip()
+    role = str(metadata.get("role") or "ct_sensor").strip().lower()
+    if role not in ("relay", "ct_sensor"):
+        role = "ct_sensor"
+
+    demand: dict[str, Any] = {
+        "uid": circuit_key,
+        "circuit_key": circuit_key,
+        "base_uid": savant_uuid or circuit_key,
+        "name": metadata.get("display_name") or metadata.get("influx_name") or hub_row["name"],
+        "influx_name": metadata.get("influx_name") or hub_row["name"],
+        "channel": stored_channel,
+        "classification": metadata.get("classification", ""),
+        "type": metadata.get("type", ""),
+        "role": role,
+        # Stored relay metadata must not make aggregate telemetry controllable.
+        "has_relay": False,
+        "relay_match_name": metadata.get("relay_match_name"),
+        "relay_match_source": metadata.get("role_source"),
+        "power": hub_row.get("power"),
+        "energy_raw": hub_row.get("energy"),
+        "energy_scale_divisor": 1_000,
+        "energy_scale_confidence": 1.0,
+        "energy_scale_status": "hub_wh_to_kwh",
+        "energy_source": "hub_aggregate",
+        "measurement_source": "hub_channel",
+        "hub_match_source": hub_row.get("match_source"),
+        "hub_channels": dict(hub_row.get("channels") or {}),
+        "legacy_uid": metadata.get("legacy_uid", circuit_key),
+        "legacy_base_uid": metadata.get("legacy_base_uid") or savant_uuid or circuit_key,
+    }
+    # Avoid adding a made-up zero when one of the two hub measurements is
+    # absent. The field is live only when Influx actually returned it.
+    if "power" not in hub_row:
+        demand.pop("power")
+    if "energy" in hub_row:
+        demand["energy"] = _safe_float(hub_row["energy"]) / 1_000.0
+    else:
+        demand.pop("energy_raw")
+    return demand
 
 
 def _build_sem_index(
@@ -1049,6 +1323,16 @@ async def fetch_influx_snapshot(
 
     pbc_device_id, by_circuit_key = _build_circuit_rows(circuit_text)
 
+    # Keep all type=0000 values for existing hub sensors, then additionally
+    # extract the circuit-shaped hub channels that lack a Savant UUID.
+    system_data: dict[str, float] = {}
+    if ok_sys:
+        for row in _parse_influx_csv(system_text):
+            channel = row.get("channel", "").strip()
+            if channel:
+                system_data[channel] = _safe_float(row.get("_value"))
+    hub_circuit_rows = _build_hub_circuit_rows(system_text) if ok_sys else {}
+
     if scale_state is None:
         scale_state = {}
     stored_metadata = circuit_metadata or {}
@@ -1175,7 +1459,22 @@ async def fetch_influx_snapshot(
             }
         )
 
-    if not by_circuit_key:
+    # Detailed savantUUID rows are authoritative. The resolver is globally
+    # one-to-one across each matching tier, so aggregate labels never fill a
+    # missing leg or an ambiguous relay identity.
+    hub_matches = _resolve_hub_circuit_matches(
+        hub_circuit_rows,
+        stored_metadata,
+        seen_circuit_keys,
+    )
+    for hub_key, (circuit_key, match_source) in sorted(hub_matches.items()):
+        metadata = stored_metadata[circuit_key]
+        hub_row = dict(hub_circuit_rows[hub_key])
+        hub_row["match_source"] = match_source
+        present_demands.append(_build_hub_present_demand(circuit_key, metadata, hub_row))
+        seen_circuit_keys.add(circuit_key)
+
+    if not by_circuit_key and not hub_circuit_rows:
         return InfluxFetchResult(
             success=False,
             error_type="empty_response",
@@ -1205,18 +1504,10 @@ async def fetch_influx_snapshot(
         ),
     )
 
-    # --- Build system_data from hub CSV ---
-    # Keys are the InfluxDB channel tag values, e.g. "Energy.Total.Consumption.Power"
-    system_data: dict[str, float] = {}
-    if ok_sys:
-        for row in _parse_influx_csv(system_text):
-            channel = row.get("channel", "").strip()
-            if channel:
-                system_data[channel] = _safe_float(row.get("_value"))
-
     _LOGGER.debug(
-        "InfluxDB fetch: %d circuits, %d system channels",
+        "InfluxDB fetch: %d circuits (%d hub synthesized), %d system channels",
         len(present_demands),
+        sum(1 for demand in present_demands if demand.get("measurement_source") == "hub_channel"),
         len(system_data),
     )
 

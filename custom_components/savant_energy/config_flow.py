@@ -15,7 +15,6 @@ from homeassistant.helpers import selector  # type: ignore
 
 from .const import (
     AUTH_INFLUX_SSH,
-    AUTH_INFLUX_TOKEN,
     CONF_ADDRESS,
     CONF_CIRCUIT_MAP,
     CONF_DMX_TESTING_MODE,
@@ -128,16 +127,6 @@ async def _async_safe_ssh_install_and_verify_key(
                 trace = trace.replace(secret, "[redacted]")
         _LOGGER.error("SSH key installation failed unexpectedly (setup_unexpected): %s", trace)
         return "setup_unexpected"
-
-
-def _auth_method_selector():
-    return selector.SelectSelector(
-        selector.SelectSelectorConfig(
-            options=[AUTH_INFLUX_TOKEN, AUTH_INFLUX_SSH],
-            translation_key="influx_auth_method",
-            mode=selector.SelectSelectorMode.DROPDOWN,
-        )
-    )
 
 
 def _derive_influx_url(host: str) -> str:
@@ -288,6 +277,15 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._pending[CONF_SSH_PRIVATE_KEY] = bootstrap["private_key"]
             self._pending_ssh_bootstrap = None
         return error_key
+
+    def _reset_stale_direct_token_pending(self) -> None:
+        """Discard resumable direct-token flow state before restarting SSH."""
+        for key in (CONF_INFLUX_TOKEN, CONF_INFLUX_ORG, CONF_INFLUX_BUCKET, CONF_CIRCUIT_MAP):
+            self._pending.pop(key, None)
+        self._pending_org_candidates = {}
+        self._pending_ssh_bootstrap = None
+        self._pending_ssh_error = None
+        self._pending[CONF_INFLUX_AUTH_METHOD] = AUTH_INFLUX_SSH
 
     async def _async_discover_pending_org(
         self,
@@ -555,7 +553,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 self._pending[CONF_ADDRESS] = pbc_ip
                 self._pending[CONF_HOST] = host_ip
-                return await self.async_step_current_auth()
+                self._pending[CONF_INFLUX_AUTH_METHOD] = AUTH_INFLUX_SSH
+                return await self.async_step_current_ssh()
 
         return self.async_show_form(
             step_id="current_setup",
@@ -569,53 +568,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_current_auth(self, user_input=None):
-        """Current mode step 2: choose how to provide the Influx token."""
-        if user_input is not None:
-            auth_method = user_input.get(CONF_INFLUX_AUTH_METHOD, DEFAULT_INFLUX_AUTH_METHOD)
-            self._pending[CONF_INFLUX_AUTH_METHOD] = auth_method
-            if auth_method == AUTH_INFLUX_SSH:
-                return await self.async_step_current_ssh()
-            return await self.async_step_current_token()
-
-        return self.async_show_form(
-            step_id="current_auth",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_INFLUX_AUTH_METHOD,
-                        default=DEFAULT_INFLUX_AUTH_METHOD,
-                    ): _auth_method_selector()
-                }
-            ),
-        )
+        """Compatibility route for old flow state; active setup is SSH-only."""
+        self._pending[CONF_INFLUX_AUTH_METHOD] = AUTH_INFLUX_SSH
+        return await self.async_step_current_ssh()
 
     async def async_step_current_token(self, user_input=None):
-        """Current mode step 3a: paste an Influx read token."""
-        errors = {}
-        if user_input is not None:
-            token = (user_input.get(CONF_INFLUX_TOKEN) or "").strip()
-            if not token:
-                errors[CONF_INFLUX_TOKEN] = "required"
-            else:
-                self._pending[CONF_INFLUX_TOKEN] = token
-                _, outcome = await self._async_safe_discover_pending_org()
-                if outcome is None:
-                    circuit_error = await self._async_discover_pending_circuit_map()
-                    if circuit_error is None:
-                        return await self._async_finish_current_setup()
-                    errors["base"] = circuit_error
-                if outcome == "select":
-                    return await self.async_step_current_org_select()
-                if outcome == "org_enumeration_denied":
-                    return await self.async_step_current_org_manual()
-                elif "base" not in errors:
-                    errors["base"] = outcome
-
-        return self.async_show_form(
-            step_id="current_token",
-            data_schema=vol.Schema({vol.Required(CONF_INFLUX_TOKEN, default=""): str}),
-            errors=errors,
-        )
+        """Safely redirect stale pasted-token flow state to SSH bootstrap."""
+        self._reset_stale_direct_token_pending()
+        return await self.async_step_current_ssh()
 
     async def async_step_current_ssh(self, user_input=None):
         """Current mode step 3b: SSH password (used once) to install key and fetch token."""
@@ -696,28 +656,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_current_org_manual(self, user_input=None):
-        """Accept an org ID when a pasted token cannot enumerate organizations."""
-        errors = {}
-        if user_input is not None:
-            org_id = (user_input.get(CONF_INFLUX_ORG) or "").strip()
-            if not org_id:
-                errors[CONF_INFLUX_ORG] = "required"
-            else:
-                circuit_error = await self._async_finish_pending_manual_org(
-                    org_id, user_input.get(CONF_INFLUX_BUCKET, DEFAULT_INFLUX_BUCKET)
-                )
-                if circuit_error is None:
-                    return await self._async_finish_current_setup()
-                errors["base"] = circuit_error
-
-        return self.async_show_form(
-            step_id="current_org_manual",
-            data_schema=vol.Schema({
-                vol.Required(CONF_INFLUX_ORG, default=""): str,
-                vol.Optional(CONF_INFLUX_BUCKET, default=DEFAULT_INFLUX_BUCKET): str,
-            }),
-            errors=errors,
-        )
+        """Safely redirect stale manual-org flow state to SSH bootstrap."""
+        self._reset_stale_direct_token_pending()
+        return await self.async_step_current_ssh()
 
     async def async_step_auto_probe(self, user_input=None):
         """Auto mode: enter PBC IP and probe for legacy activity feed."""
@@ -757,7 +698,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors[CONF_HOST] = "invalid_address"
             else:
                 self._pending[CONF_HOST] = host_ip
-                return await self.async_step_current_auth()
+                self._pending[CONF_INFLUX_AUTH_METHOD] = AUTH_INFLUX_SSH
+                return await self.async_step_current_ssh()
 
         return self.async_show_form(
             step_id="auto_current_host",
@@ -831,7 +773,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 self._pending[CONF_ADDRESS] = pbc_ip
                 self._pending[CONF_HOST] = host_ip
-                return await self.async_step_reconfigure_auth()
+                # Do not mutate the entry here. The existing token/auth state
+                # remains active until SSH candidate validation and key install
+                # have completed successfully.
+                self._pending[CONF_INFLUX_AUTH_METHOD] = AUTH_INFLUX_SSH
+                return await self.async_step_reconfigure_ssh()
 
         return self.async_show_form(
             step_id="reconfigure_current_host",
@@ -851,65 +797,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_reconfigure_auth(self, user_input=None):
-        """Reconfigure current step 2: choose how to provide the Influx token."""
-        config_entry = self._get_reconfigure_entry()
-        if user_input is not None:
-            auth_method = user_input.get(CONF_INFLUX_AUTH_METHOD, DEFAULT_INFLUX_AUTH_METHOD)
-            self._pending[CONF_INFLUX_AUTH_METHOD] = auth_method
-            if auth_method == AUTH_INFLUX_SSH:
-                return await self.async_step_reconfigure_ssh()
-            return await self.async_step_reconfigure_token()
-
-        return self.async_show_form(
-            step_id="reconfigure_auth",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_INFLUX_AUTH_METHOD,
-                        default=config_entry.data.get(
-                            CONF_INFLUX_AUTH_METHOD,
-                            DEFAULT_INFLUX_AUTH_METHOD,
-                        ),
-                    ): _auth_method_selector()
-                }
-            ),
-        )
+        """Compatibility route for old flow state; active reconfigure is SSH-only."""
+        self._pending[CONF_INFLUX_AUTH_METHOD] = AUTH_INFLUX_SSH
+        return await self.async_step_reconfigure_ssh()
 
     async def async_step_reconfigure_token(self, user_input=None):
-        """Reconfigure current step 3a: paste an Influx read token."""
-        config_entry = self._get_reconfigure_entry()
-        errors = {}
-        if user_input is not None:
-            token = (user_input.get(CONF_INFLUX_TOKEN) or "").strip()
-            if not token:
-                errors[CONF_INFLUX_TOKEN] = "required"
-            else:
-                self._pending[CONF_INFLUX_TOKEN] = token
-                _, outcome = await self._async_safe_discover_pending_org()
-                if outcome is None:
-                    circuit_error = await self._async_discover_pending_circuit_map()
-                    if circuit_error is None:
-                        return await self._async_finish_current_reconfigure(config_entry)
-                    errors["base"] = circuit_error
-                if outcome == "select":
-                    return await self.async_step_reconfigure_org_select()
-                if outcome == "org_enumeration_denied":
-                    return await self.async_step_reconfigure_org_manual()
-                elif "base" not in errors:
-                    errors["base"] = outcome
-
-        return self.async_show_form(
-            step_id="reconfigure_token",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_INFLUX_TOKEN,
-                        default=config_entry.data.get(CONF_INFLUX_TOKEN, ""),
-                    ): str
-                }
-            ),
-            errors=errors,
-        )
+        """Safely redirect stale pasted-token reconfigure state to SSH bootstrap."""
+        self._reset_stale_direct_token_pending()
+        return await self.async_step_reconfigure_ssh()
 
     async def async_step_reconfigure_ssh(self, user_input=None):
         """Reconfigure current step 3b: SSH password (used once) to install key and fetch token."""
@@ -992,29 +887,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_reconfigure_org_manual(self, user_input=None):
-        """Accept an org ID when a pasted token cannot enumerate organizations."""
-        config_entry = self._get_reconfigure_entry()
-        errors = {}
-        if user_input is not None:
-            org_id = (user_input.get(CONF_INFLUX_ORG) or "").strip()
-            if not org_id:
-                errors[CONF_INFLUX_ORG] = "required"
-            else:
-                circuit_error = await self._async_finish_pending_manual_org(
-                    org_id, user_input.get(CONF_INFLUX_BUCKET, DEFAULT_INFLUX_BUCKET)
-                )
-                if circuit_error is None:
-                    return await self._async_finish_current_reconfigure(config_entry)
-                errors["base"] = circuit_error
-
-        return self.async_show_form(
-            step_id="reconfigure_org_manual",
-            data_schema=vol.Schema({
-                vol.Required(CONF_INFLUX_ORG, default=""): str,
-                vol.Optional(CONF_INFLUX_BUCKET, default=DEFAULT_INFLUX_BUCKET): str,
-            }),
-            errors=errors,
-        )
+        """Safely redirect stale manual-org reconfigure state to SSH bootstrap."""
+        self._reset_stale_direct_token_pending()
+        return await self.async_step_reconfigure_ssh()
 
     @staticmethod
     def _valid_address(address) -> bool:

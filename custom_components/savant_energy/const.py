@@ -21,7 +21,7 @@ CONF_OLA_PORT = "ola_port"        # Port for OLA/DMX relay control API
 CONF_SCAN_INTERVAL = "scan_interval"  # InfluxDB poll interval (seconds)
 CONF_SWITCH_COOLDOWN = "switch_cooldown"  # Minimum seconds between relay toggles
 CONF_DMX_TESTING_MODE = "dmx_testing_mode"  # Enable advanced DMX testing mode
-CONF_INFLUX_AUTH_METHOD = "influx_auth_method"  # Choose token or SSH-based token fetch
+CONF_INFLUX_AUTH_METHOD = "influx_auth_method"  # Persisted auth provenance for compatibility
 
 CONF_PENDING_CONFIRM_MULTIPLIER = "pending_confirm_multiplier"
 
@@ -54,7 +54,7 @@ DEFAULT_PENDING_CONFIRM_MULTIPLIER = 2
 
 AUTH_INFLUX_TOKEN = "token"
 AUTH_INFLUX_SSH = "ssh"
-DEFAULT_INFLUX_AUTH_METHOD = AUTH_INFLUX_TOKEN
+DEFAULT_INFLUX_AUTH_METHOD = AUTH_INFLUX_SSH
 
 CONF_SSH_PASSWORD = "ssh_password"
 DEFAULT_SSH_PASSWORD = ""
