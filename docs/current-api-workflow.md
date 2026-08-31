@@ -79,6 +79,8 @@ The resolver treats authentication failures, empty organization lists, missing d
 
 Current-mode circuit data is queried from InfluxDB using the Savant UUID and channel. The resulting circuit map is persisted in the config entry so runtime polling does not have to rediscover relay identity on every update.
 
+Named type-`007A` CT rows are also accepted when Savant omits `savantUUID`. Stored Savant UUIDs always remain authoritative and are never replaced by a name or measurement id. A genuinely UUID-less CT keeps `savant_uuid` empty and uses a separate `source_uid` built from the stable Influx measurement id plus channel. Unnamed CT inputs are excluded because a channel number alone is not enough to create a safe, useful user-facing identity.
+
 For relay mapping, the integration combines:
 
 - InfluxDB circuit names, UUIDs, channels, classifications, and device types
@@ -110,6 +112,10 @@ The polling interval backs off after failures and returns to the configured inte
 ## Energy and CT handling
 
 InfluxDB hardware energy counters are converted to kWh for Home Assistant. Detailed relay rows use the fixed mWh scale and CT circuits resolve their scale from observed power and energy deltas. Some hosts publish stored relay circuits only through `Energy.Circuit.<name>.Power` and `.Energy` type-`0000` hub channels. Those hub counters are Wh, so the integration records their raw value and uses the explicit `hub_wh_to_kwh` divisor of 1,000. Hub-only rows do not supply relay state or control data.
+
+Some hosts also publish permanent zero-filled hub circuit placeholders for stored relays that have no measurement source. A hub circuit is promoted to live telemetry only when either its power or energy value provides nonzero evidence. This keeps an unused-but-real circuit available after its accumulated energy becomes nonzero while preventing placeholder `0 W` / `0 kWh` rows from masquerading as working sensors.
+
+Hub-level totals and groups use the same evidence rule. A system channel is unavailable until it first produces a nonzero value during the coordinator lifetime; after that, a later zero is retained as a legitimate measurement. This distinguishes unsupported zero-filled channels from a supported load that has turned off.
 
 Multi-leg CT circuits are represented in two ways:
 
@@ -160,6 +166,7 @@ SSH refresh is staged as password connection, home/path resolution, append-and-r
 - A 401 normally means the token expired or rotated. With SSH bootstrap enabled, the stored key should refresh it automatically.
 - An organization selection prompt means more than one candidate matched Savant's expected data shape. Choose the candidate with current circuit data.
 - A circuit inventory warning means InfluxDB found a circuit absent from the saved relay/CT map. It is reported once for that inventory change, rather than on every poll. Mapped hub-only circuit measurements count as live measurements, but remain unavailable for relay status or control until detailed state telemetry returns.
+- Use `tools/live-savant-influx-diagnostic.py` for direct-host discovery/shaping evidence and `tools/live-ha-mcp-diagnostic.ps1` for installed-version, entity timestamp, and Home Assistant log evidence. The full procedure and release acceptance boundary are in `docs/live-diagnostics.md`.
 - An empty snapshot can be a timing issue on the Savant host. The integration widens its lookback window before reporting failure.
 - Legacy installations should use Reconfigure after upgrading Savant to firmware 11.2 or later.
 

@@ -38,15 +38,18 @@ _KNOWN_CT_DEVICE_TYPES = {"007A"}
 _INVALID_NAME_TOKENS = {"", "false", "true", "name", "override"}
 
 # Flux query: fetch last reading for every circuit — relay-controlled and CT-only.
-# We filter on savantUUID being present rather than a specific type code so that
-# CT-monitored loads (EV chargers, solar inverters, etc.) are included alongside
-# relay-switched circuits regardless of their hardware type tag.
+# Savant normally identifies circuits with savantUUID. Some 007A CT channels
+# (notably Main Feed) omit that tag but retain a stable measurement id and a
+# configured name. Include those named CT rows; unnamed 007A channels are spare
+# inputs/noise and are intentionally excluded.
 _BACKFILL_WINDOWS = ("-2m", "-15m", "-24h", "-7d")
 
 _CIRCUIT_QUERY = """\
 from(bucket: {bucket})
   |> range(start: {range_start})
-  |> filter(fn: (r) => exists r.savantUUID and r.savantUUID != "")
+  |> filter(fn: (r) =>
+      (exists r.savantUUID and r.savantUUID != "") or
+      (exists r.type and r.type == "007A" and exists r.name and r.name != ""))
   |> filter(fn: (r) =>
       r._field == "power" or r._field == "current" or r._field == "voltage" or
       r._field == "energy" or r._field == "percentCommanded" or r._field == "flags")
@@ -403,15 +406,24 @@ def _expand_multi_leg_ct_circuits(
 
 
 def _build_circuit_rows(circuit_text: str) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Collapse Flux CSV rows into one dict per (savantUUID, channel) circuit."""
+    """Collapse Flux CSV rows into one dict per stable source/channel circuit."""
     by_circuit_key: dict[str, dict[str, Any]] = {}
     pbc_device_id = ""
 
     for row in _parse_influx_csv(circuit_text):
         savant_uuid = (row.get("savantUUID") or "").strip()
+        measurement = (row.get("_measurement") or "").strip()
         channel = (row.get("channel") or "").strip()
-        if (
+        circuit_name = (row.get("name") or "").strip()
+        device_type = (row.get("type") or "").strip().upper()
+        uuidless_named_ct = (
             not savant_uuid
+            and bool(measurement)
+            and _is_usable_name(circuit_name)
+            and device_type in _KNOWN_CT_DEVICE_TYPES
+        )
+        if (
+            (not savant_uuid and not uuidless_named_ct)
             or not channel
             or savant_uuid == "savantUUID"
             or channel == "channel"
@@ -419,9 +431,10 @@ def _build_circuit_rows(circuit_text: str) -> tuple[str, dict[str, dict[str, Any
             continue
 
         if not pbc_device_id:
-            pbc_device_id = (row.get("_measurement") or "").strip()
+            pbc_device_id = measurement
 
-        circuit_key = build_circuit_key(savant_uuid, channel)
+        stable_source_id = savant_uuid or measurement
+        circuit_key = build_circuit_key(stable_source_id, channel)
         if circuit_key not in by_circuit_key:
             known_keys = {
                 "savantUUID",
@@ -448,9 +461,14 @@ def _build_circuit_rows(circuit_text: str) -> tuple[str, dict[str, dict[str, Any
 
             by_circuit_key[circuit_key] = {
                 "circuit_key": circuit_key,
+                # Preserve the source schema: an absent Savant UUID remains
+                # absent. UUID-less named CTs use a separate stable source id
+                # derived from the Influx measurement.
                 "savantUUID": savant_uuid,
+                "source_uid": stable_source_id,
+                "identity_source": "savant_uuid" if savant_uuid else "measurement",
                 "channel": channel,
-                "name": (row.get("name") or "").strip(),
+                "name": circuit_name,
                 "classification": (row.get("classification") or "").strip(),
                 "dimmable": _safe_bool(row.get("dimmable", "False")),
                 "group": (row.get("group") or "").strip(),
@@ -495,7 +513,18 @@ def _build_hub_circuit_rows(system_text: str) -> dict[str, dict[str, Any]]:
         )
         hub_row[field] = _safe_float(row.get("_value"))
         hub_row["channels"][field] = channel
-    return hub_rows
+    # Savant also publishes zero-filled Energy.Circuit placeholders for relay
+    # loads that have no telemetry source. Treating those rows as live created
+    # convincing but false 0 W / 0 kWh sensors. A hub circuit becomes a
+    # measurement source only after either counter carries actual evidence.
+    return {
+        name: hub_row
+        for name, hub_row in hub_rows.items()
+        if any(
+            field in hub_row and abs(_safe_float(hub_row.get(field))) > 0.0
+            for field in ("power", "energy")
+        )
+    }
 
 
 def _canonical_hub_match_name(value: str) -> str:
@@ -1076,9 +1105,14 @@ def _assign_legacy_identity(circuit_map: dict[str, dict[str, Any]]) -> None:
         if metadata.get("legacy_uid"):
             continue
         savant_uuid = str(metadata.get("savant_uuid", "")).strip()
+        source_uid = str(metadata.get("source_uid", "")).strip() or savant_uuid
         channel = str(metadata.get("channel", "")).strip()
-        metadata["legacy_uid"] = f"{savant_uuid}.{channel}" if savant_uuid and channel else metadata["circuit_key"]
-        metadata["legacy_base_uid"] = savant_uuid or metadata["circuit_key"]
+        metadata["legacy_uid"] = (
+            f"{source_uid}.{channel}"
+            if source_uid and channel
+            else metadata["circuit_key"]
+        )
+        metadata["legacy_base_uid"] = source_uid or metadata["circuit_key"]
 
 
 async def fetch_sem_devices_from_sem(
@@ -1323,18 +1357,26 @@ async def fetch_influx_snapshot(
 
     pbc_device_id, by_circuit_key = _build_circuit_rows(circuit_text)
 
-    # Keep all type=0000 values for existing hub sensors, then additionally
-    # extract the circuit-shaped hub channels that lack a Savant UUID.
+    if scale_state is None:
+        scale_state = {}
+
+    # Savant emits zero-filled placeholders for unsupported system channels as
+    # well as circuit channels. Publish a system channel after it has produced
+    # nonzero evidence, then retain legitimate zero states for the rest of this
+    # coordinator lifetime once that capability has been established.
+    system_capabilities = scale_state.setdefault("__system_capabilities__", {})
     system_data: dict[str, float] = {}
     if ok_sys:
         for row in _parse_influx_csv(system_text):
             channel = row.get("channel", "").strip()
             if channel:
-                system_data[channel] = _safe_float(row.get("_value"))
+                value = _safe_float(row.get("_value"))
+                if abs(value) > 0.0:
+                    system_capabilities[channel] = True
+                if system_capabilities.get(channel):
+                    system_data[channel] = value
     hub_circuit_rows = _build_hub_circuit_rows(system_text) if ok_sys else {}
 
-    if scale_state is None:
-        scale_state = {}
     stored_metadata = circuit_metadata or {}
 
     present_demands: list[dict[str, Any]] = []
@@ -1355,10 +1397,37 @@ async def fetch_influx_snapshot(
                     "type": str(circuit.get("type", "")).strip(),
                 }
             )
-            continue
+            # A named, known CT type is safe to expose as a read-only sensor
+            # before reconfigure persists it. It can never receive relay
+            # control metadata. Other unknown rows remain excluded.
+            if not _is_known_ct_circuit(
+                circuit.get("classification", ""), circuit.get("type", "")
+            ):
+                continue
+            source_uid = str(circuit.get("source_uid", "")).strip() or str(
+                circuit.get("savantUUID", "")
+            ).strip() or circuit_key
+            channel = str(circuit.get("channel", "")).strip()
+            metadata = {
+                "circuit_key": circuit_key,
+                "savant_uuid": str(circuit.get("savantUUID", "")).strip(),
+                "source_uid": source_uid,
+                "channel": channel,
+                "type": str(circuit.get("type", "")).strip(),
+                "role": "ct_sensor",
+                "relay_uid": "",
+                "display_name": str(circuit.get("name", "")).strip()
+                or f"CT Channel {channel or '?'}",
+                "influx_name": str(circuit.get("name", "")).strip(),
+                "legacy_uid": f"{source_uid}.{channel}" if channel else circuit_key,
+                "legacy_base_uid": source_uid,
+                "role_source": "known_ct_runtime",
+                "resolution_source": "known_ct_runtime",
+            }
 
         savant_uuid = str(circuit.get("savantUUID", "")).strip()
-        base_uid, _ab_side = parse_uid(savant_uuid)
+        source_uid = str(circuit.get("source_uid", "")).strip() or savant_uuid
+        base_uid, _ab_side = parse_uid(source_uid)
         role = str(metadata.get("role", "unknown")).strip().lower()
         if role not in ("relay", "ct_sensor"):
             _LOGGER.warning(
@@ -1417,7 +1486,7 @@ async def fetch_influx_snapshot(
         present_demands.append(
             {
                 # Identity
-                "uid": circuit_key,   # Stable entity key = (savantUUID, channel)
+                "uid": circuit_key,   # Stable entity key = (source identity, channel)
                 "circuit_key": circuit_key,
                 "base_uid": base_uid, # Base UID for HASS device grouping
                 "name": metadata.get("display_name")
@@ -1681,7 +1750,9 @@ def build_measurement_bootstrap_inventory(
         identities[uid] = {
             "uid": uid,
             "circuit_key": uid,
-            "base_uid": str(metadata.get("savant_uuid") or uid),
+            "base_uid": str(
+                metadata.get("source_uid") or metadata.get("savant_uuid") or uid
+            ),
             "name": metadata.get("display_name") or metadata.get("influx_name") or f"Circuit {metadata.get('channel', '?')}",
             "influx_name": metadata.get("influx_name", ""),
             "channel": metadata.get("channel", ""),
@@ -1692,7 +1763,10 @@ def build_measurement_bootstrap_inventory(
             "has_relay": False,  # historical identities never authorize control
             "capacity": metadata.get("capacity", 0),
             "legacy_uid": metadata.get("legacy_uid", uid),
-            "legacy_base_uid": metadata.get("legacy_base_uid") or metadata.get("savant_uuid") or uid,
+            "legacy_base_uid": metadata.get("legacy_base_uid")
+            or metadata.get("source_uid")
+            or metadata.get("savant_uuid")
+            or uid,
         }
     for item in (snapshot_data or {}).get("inventoryDemands") or []:
         if not isinstance(item, dict):
@@ -1789,6 +1863,7 @@ async def discover_circuit_metadata(
         downgraded_from_relay: bool = False,
     ) -> dict[str, Any]:
         savant_uuid = str(circuit.get("savantUUID", "")).strip()
+        source_uid = str(circuit.get("source_uid", "")).strip() or savant_uuid
         relay_uid = matched_device.get("uid", "") if matched_device and role == "relay" else ""
         relay_match_name = None
         if matched_device and role == "relay":
@@ -1804,6 +1879,7 @@ async def discover_circuit_metadata(
         return {
             "circuit_key": circuit_key,
             "savant_uuid": savant_uuid,
+            "source_uid": source_uid,
             "channel": str(circuit.get("channel", "")).strip(),
             "type": str(circuit.get("type", "")).strip(),
             "role": role,
