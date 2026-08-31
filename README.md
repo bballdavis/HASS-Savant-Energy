@@ -270,6 +270,19 @@ This prompts for your SSH password, retrieves and caches the InfluxDB token, the
 
 ## Contributing
 
+### Savant host token locations and recovery
+
+Current SavantOS releases may store the Influx read token under either layout:
+
+```text
+/data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken
+/data/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken
+```
+
+Adjacent `.influxsetup` and `.influxtoken` files contain useful organization and bucket metadata. When diagnosing over SSH, inspect only paths and file sizes, for example `find /data -path '*/InfluxDB2/.influxReadtoken' -print` and `wc -c <path>`; never print token contents. `influxd` is the InfluxDB daemon, not the `influx` command-line client, and it may not be installed. The integration validates candidate tokens with a real query before saving one and retries after token rotation.
+
+SSH refresh appends the integration key to `authorized_keys`, verifies key login and token access, and rolls back only its exact appended byte suffix on failure. If the file changed concurrently, it leaves that content untouched. A historical backfill is identity inventory only: live availability and controls use fresh measurements, and partial inventory never removes existing entities.
+
 We love contributions! Please:
 - Open issues for bugs or feature requests
 - Submit pull requests with clear descriptions

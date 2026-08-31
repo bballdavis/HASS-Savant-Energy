@@ -1235,6 +1235,10 @@ async def fetch_influx_snapshot(
             "pbc_device_id": pbc_device_id,  # PBC SignalR target device ID
             "circuit_map_status": {
                 "reconfigure_required": bool(unknown_circuit_keys or missing_circuit_keys),
+                "inventory_status": "partial" if missing_circuit_keys else "complete",
+                "identity_inventory_status": "partial" if missing_circuit_keys else "complete",
+                "inventory_authority": "live_snapshot",
+                "inventory_authoritative": not bool(missing_circuit_keys),
                 "unknown_circuit_keys": sorted(unknown_circuit_keys),
                 "unknown_circuits": sorted(
                     unknown_circuits,
@@ -1261,6 +1265,19 @@ async def fetch_influx_snapshot_with_backfill(
 ) -> InfluxFetchResult:
     """Fetch a snapshot, widening the lookback window before failing."""
     last_empty_result: InfluxFetchResult | None = None
+    first_live_result: InfluxFetchResult | None = None
+    inventory_union: dict[str, dict[str, Any]] = {}
+
+    def identity_only(demands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Keep only circuit identity when a historical window fills inventory."""
+        identity_keys = {
+            "uid", "circuit_key", "base_uid", "name", "influx_name", "channel",
+            "classification", "type", "role", "relay_uid", "has_relay",
+            "relay_match_name", "relay_match_source", "capacity", "legacy_uid",
+            "legacy_base_uid",
+        }
+        return [{key: value for key, value in item.items() if key in identity_keys}
+                for item in demands if isinstance(item, dict)]
     for range_start in backfill_windows:
         _LOGGER.debug(
             "InfluxDB snapshot attempt for org %s using lookback %s",
@@ -1280,12 +1297,39 @@ async def fetch_influx_snapshot_with_backfill(
             influx_bucket=influx_bucket,
         )
         if result.success and result.data is not None:
-            _LOGGER.debug(
-                "InfluxDB snapshot attempt succeeded for org %s using %s",
-                influx_org or "<unset>",
-                range_start,
-            )
-            return result
+            status = result.data.get("circuit_map_status", {})
+            if first_live_result is None:
+                # The first successful query is the only authority for live
+                # measurements. Wider windows may fill identity inventory,
+                # but must never replace presentDemands values.
+                first_live_result = result
+            for item in result.data.get("presentDemands") or []:
+                if isinstance(item, dict):
+                    key = str(item.get("circuit_key") or item.get("uid") or "")
+                    if key:
+                        inventory_union[key] = identity_only([item])[0]
+            if not status.get("missing_circuit_keys"):
+                _LOGGER.debug(
+                    "InfluxDB snapshot attempt succeeded for org %s using %s",
+                    influx_org or "<unset>",
+                    range_start,
+                )
+                if first_live_result is result:
+                    result.data.setdefault("circuit_map_status", {})["inventory_status"] = "complete"
+                    result.data["circuit_map_status"]["identity_inventory_status"] = "complete"
+                    result.data["circuit_map_status"]["inventory_authority"] = "live_snapshot"
+                    return result
+                first_live_result.data["inventoryDemands"] = list(inventory_union.values())
+                # `inventory_status` describes the live measurement window.
+                # A historical completion is identity-only and must not make a
+                # partial live snapshot appear authoritative to consumers.
+                first_live_result.data["circuit_map_status"]["identity_inventory_status"] = "complete"
+                first_live_result.data["circuit_map_status"]["inventory_authoritative"] = False
+                first_live_result.data["circuit_map_status"]["inventory_authority"] = "historical_identity_only"
+                return first_live_result
+            # Keep searching for a complete identity inventory. The live
+            # result remains the narrow-window result captured above.
+            inventory = result.data.get("presentDemands") or []
         if result.auth_failure or result.org_failure:
             _LOGGER.debug(
                 "InfluxDB snapshot attempt stopped for org %s at %s due to %s",
@@ -1306,6 +1350,14 @@ async def fetch_influx_snapshot_with_backfill(
         influx_org or "<unset>",
         ", ".join(backfill_windows),
     )
+    if first_live_result is not None:
+        status = first_live_result.data.setdefault("circuit_map_status", {})
+        status["inventory_status"] = "partial"
+        status["identity_inventory_status"] = "partial"
+        status["inventory_authoritative"] = False
+        status["inventory_authority"] = "live_snapshot_only"
+        first_live_result.data["inventoryDemands"] = list(inventory_union.values())
+        return first_live_result
     return last_empty_result or InfluxFetchResult(
         success=False,
         error_type="empty_response",
@@ -1316,6 +1368,55 @@ async def fetch_influx_snapshot_with_backfill(
         ),
         query_window=backfill_windows[-1] if backfill_windows else None,
     )
+
+
+def build_measurement_bootstrap_inventory(
+    snapshot_data: dict[str, Any] | None,
+    circuit_map: dict[str, dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Return stable identity shells for measurement entities only.
+
+    Stored circuit-map identities restore entities removed during a transient
+    partial inventory. Historical `inventoryDemands` may supplement them, but
+    no historical value fields are ever copied into live measurements.
+    """
+    identities: dict[str, dict[str, Any]] = {}
+    for circuit_key, metadata in sorted((circuit_map or {}).items()):
+        if not isinstance(metadata, dict):
+            continue
+        uid = str(metadata.get("circuit_key") or circuit_key).strip()
+        if not uid:
+            continue
+        identities[uid] = {
+            "uid": uid,
+            "circuit_key": uid,
+            "base_uid": str(metadata.get("savant_uuid") or uid),
+            "name": metadata.get("display_name") or metadata.get("influx_name") or f"Circuit {metadata.get('channel', '?')}",
+            "influx_name": metadata.get("influx_name", ""),
+            "channel": metadata.get("channel", ""),
+            "classification": metadata.get("classification", ""),
+            "type": metadata.get("type", ""),
+            "role": metadata.get("role", "ct_sensor"),
+            "relay_uid": metadata.get("relay_uid", ""),
+            "has_relay": False,  # historical identities never authorize control
+            "capacity": metadata.get("capacity", 0),
+            "legacy_uid": metadata.get("legacy_uid", uid),
+            "legacy_base_uid": metadata.get("legacy_base_uid") or metadata.get("savant_uuid") or uid,
+        }
+    for item in (snapshot_data or {}).get("inventoryDemands") or []:
+        if not isinstance(item, dict):
+            continue
+        uid = str(item.get("uid") or item.get("circuit_key") or "").strip()
+        if not uid:
+            continue
+        shell = {key: value for key, value in item.items() if key not in {
+            "power", "current", "voltage", "energy", "energy_raw", "percentCommanded", "flags",
+            "energy_scale_divisor", "energy_scale_confidence", "energy_scale_status",
+        }}
+        shell["uid"] = uid
+        shell["has_relay"] = False
+        identities.setdefault(uid, shell)
+    return list(identities.values())
 
 
 async def discover_circuit_metadata(

@@ -66,9 +66,16 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
                 len(snapshot_data["presentDemands"]),
             )
             for device in snapshot_data["presentDemands"]:
-                if not _is_relay_device(device):
+                # Identity shells and historical backfill intentionally never
+                # reach presentDemands. Still require a current relay state
+                # before exposing a control entity on a partial live payload.
+                if (
+                    not _is_relay_device(device)
+                    or "percentCommanded" not in device
+                    or not device.get("legacy_uid", device.get("uid"))
+                ):
                     _LOGGER.debug(
-                        "Skipping switch for CT-monitored device (no relay): %s",
+                        "Skipping switch without current relay prerequisites: %s",
                         device.get("name", device.get("uid")),
                     )
                     continue

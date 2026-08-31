@@ -49,6 +49,7 @@ from .current.influx_client import (
     InfluxFetchResult,
     fetch_influx_snapshot_with_backfill,
 )
+from .influx_client import discover_circuit_metadata_with_backfill
 from .current.relay_control import SavantRelayController
 from .config_storage import normalize_entry_storage
 from .influx_org_resolver import InfluxOrgCandidate, async_discover_influx_org
@@ -147,20 +148,24 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         updated_data = dict(self.config_entry.data)
         changed = False
 
+        next_token = self.influx_token
+        next_org = self.influx_org
+        next_bucket = self.influx_bucket
+        next_ssh_private_key = self.ssh_private_key
         if token is not _UNSET and token != self.influx_token:
-            self.influx_token = token
+            next_token = token
             updated_data[CONF_INFLUX_TOKEN] = token
             changed = True
         if org is not _UNSET and org != self.influx_org:
-            self.influx_org = org
+            next_org = org
             updated_data[CONF_INFLUX_ORG] = org
             changed = True
         if bucket is not _UNSET and bucket != self.influx_bucket:
-            self.influx_bucket = bucket or DEFAULT_INFLUX_BUCKET
-            updated_data[CONF_INFLUX_BUCKET] = self.influx_bucket
+            next_bucket = bucket or DEFAULT_INFLUX_BUCKET
+            updated_data[CONF_INFLUX_BUCKET] = next_bucket
             changed = True
         if ssh_private_key is not _UNSET and ssh_private_key != self.ssh_private_key:
-            self.ssh_private_key = ssh_private_key
+            next_ssh_private_key = ssh_private_key
             updated_data[CONF_SSH_PRIVATE_KEY] = ssh_private_key
             changed = True
 
@@ -175,6 +180,10 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 self.config_entry,
                 data=updated_data,
             )
+            self.influx_token = next_token
+            self.influx_org = next_org
+            self.influx_bucket = next_bucket
+            self.ssh_private_key = next_ssh_private_key
         return changed
 
     async def _async_notify_influx_org_selection_required(
@@ -378,32 +387,40 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
 
         self._token_refresh_in_progress = True
         try:
-            from .ssh_helper import async_ssh_fetch_influx_bundle_with_key
+            from .ssh_helper import async_ssh_fetch_influx_candidates_with_key
 
             host = self.host or self._hub_host_from_influx_url()
-            new_token, metadata = await async_ssh_fetch_influx_bundle_with_key(
+            candidates = await async_ssh_fetch_influx_candidates_with_key(
                 self.hass, host, DEFAULT_SSH_USERNAME, self.ssh_private_key
             )
-            if not new_token:
-                return False, metadata
-
-            if new_token != self.influx_token:
-                _LOGGER.info("Auto-refreshed InfluxDB token via SSH key from %s", host)
-                await self._async_persist_connection_state(token=new_token)
-            else:
-                _LOGGER.debug("SSH token refresh returned the current token unchanged")
-
-            if metadata:
-                _LOGGER.debug(
-                    "SSH token refresh metadata: org_id=%s org_name=%s bucket=%s auth_org_id=%s",
-                    metadata.org_id or "<unset>",
-                    metadata.org_name or "<unset>",
-                    metadata.bucket_name or "<unset>",
-                    metadata.auth_org_id or "<unset>",
+            for candidate in candidates:
+                discovery = await async_discover_influx_org(
+                    self.influx_url, candidate.token, candidate.metadata
                 )
-                self.influx_host_metadata = metadata
-            self._adjust_interval(success=True)
-            return True, metadata
+                if not discovery.selected_org_id:
+                    continue
+                circuit_result = await discover_circuit_metadata_with_backfill(
+                    self.influx_url,
+                    candidate.token,
+                    discovery.selected_org_id,
+                    sem_host=self.sem_host,
+                    influx_bucket=discovery.selected_bucket or DEFAULT_INFLUX_BUCKET,
+                )
+                if not (circuit_result.success and circuit_result.circuit_map):
+                    continue
+                # All three values change together only after the candidate
+                # has passed host metadata, Influx org/bucket, and circuit
+                # discovery. A failed candidate leaves current state intact.
+                await self._async_persist_connection_state(
+                    token=candidate.token,
+                    org=discovery.selected_org_id,
+                    bucket=discovery.selected_bucket or DEFAULT_INFLUX_BUCKET,
+                )
+                self.influx_host_metadata = candidate.metadata
+                self._adjust_interval(success=True)
+                return True, candidate.metadata
+            _LOGGER.warning("No SSH Influx token candidate passed org and circuit validation for %s", host)
+            return False, None
         finally:
             self._token_refresh_in_progress = False
 
@@ -838,7 +855,17 @@ async def _async_remove_stale_circuit_entities(
     from homeassistant.helpers.device_registry import async_get as async_get_dr  # type: ignore
 
     snapshot_data = (coordinator.data or {}).get("snapshot_data") or {}
-    demands = snapshot_data.get("presentDemands", [])
+    circuit_status = snapshot_data.get("circuit_map_status") or {}
+    # A successful but partial Influx response is not evidence that circuits
+    # were removed. Never prune registry state from that transient view.
+    if (
+        circuit_status.get("inventory_status") == "partial"
+        or circuit_status.get("missing_circuit_keys")
+        or circuit_status.get("inventory_authoritative") is False
+    ):
+        _LOGGER.debug("Skipping stale entity/device cleanup — circuit inventory is partial")
+        return
+    demands = snapshot_data.get("inventoryDemands") or snapshot_data.get("presentDemands", [])
     if not demands:
         _LOGGER.debug("Skipping stale entity/device cleanup — snapshot has no circuits yet")
         return

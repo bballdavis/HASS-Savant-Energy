@@ -6,7 +6,6 @@ import json
 import logging
 import posixpath
 import shlex
-import uuid
 from dataclasses import dataclass
 
 _LOGGER = logging.getLogger(__name__)
@@ -63,6 +62,26 @@ class InfluxTokenResolution:
     authorized_keys_path: str | None = None
 
 
+@dataclass(slots=True)
+class InfluxTokenCandidate:
+    """A token candidate with only its adjacent, non-secret metadata."""
+
+    resolution: InfluxTokenResolution
+    metadata: InfluxHostMetadata | None = None
+
+    @property
+    def token(self) -> str:
+        return self.resolution.token
+
+
+@dataclass(slots=True)
+class _AuthorizedKeyAppend:
+    path: str
+    original: bytes
+    existed: bool
+    suffix: bytes
+
+
 class SSHBootstrapStageError(RuntimeError):
     """A classified failure in one remote bootstrap stage."""
 
@@ -111,7 +130,61 @@ def _read_remote_text(client, path: str, *, required: bool = False) -> str:
 
 
 def _resolve_remote_influx_read_token(client) -> str:
-    return _resolve_remote_influx_read_token_details(client).token
+    # Compatibility fast path for callers that only need the established
+    # token; the detailed resolver performs the bounded full scan.
+    for path in (_TOKEN_PATH, _ALT_TOKEN_PATH):
+        token = _read_remote_text(client, path)
+        if token:
+            return token
+    _, stdout, _stderr = client.exec_command(
+        f"find / -type f -path {shlex.quote('*/InfluxDB2/.influxReadtoken')} "
+        "-print 2>/dev/null | sort -u | head -n 8"
+    )
+    stdout.channel.recv_exit_status()
+    found = stdout.read().decode("utf-8", errors="ignore").splitlines()
+    for path in sorted({line.strip() for line in found if line.strip()}):
+        token = _read_remote_text(client, path)
+        if token:
+            return token
+    return ""
+
+
+def _resolve_remote_influx_read_token_candidates(client) -> list[InfluxTokenResolution]:
+    """Return bounded, deterministic token candidates without exposing values."""
+    known: dict[str, InfluxTokenResolution] = {}
+    for path in (_TOKEN_PATH, _ALT_TOKEN_PATH):
+        token = _read_remote_text(client, path)
+        if token:
+            home = _rpm_home_from_token_path(path)
+            known[path] = InfluxTokenResolution(token, path, home, home, f"{home}/.ssh/authorized_keys")
+    _, stdout, stderr = client.exec_command(
+        f"find / -type f -path {shlex.quote('*/InfluxDB2/.influxReadtoken')} "
+        "-print 2>/dev/null | sort -u | head -n 8"
+    )
+    status = stdout.channel.recv_exit_status()
+    found = stdout.read().decode("utf-8", errors="ignore").splitlines()
+    paths = list(known)
+    for path in sorted({line.strip() for line in found if line.strip()}):
+        if path not in paths:
+            paths.append(path)
+    candidates = list(known.values())
+    for path in paths[len(known):]:
+        token = _read_remote_text(client, path)
+        if token:
+            home = _rpm_home_from_token_path(path)
+            candidates.append(InfluxTokenResolution(token, path, home, home, f"{home}/.ssh/authorized_keys" if home else None))
+    if status != 0:
+        _LOGGER.debug("SSH find for Influx token paths returned exit status %s", status)
+    _ = stderr.read().decode("utf-8", errors="ignore")
+    # The same token can be exposed by more than one path. Keep provenance
+    # where it differs, but never probe an exact duplicate twice.
+    deduped: list[InfluxTokenResolution] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate.token not in seen:
+            seen.add(candidate.token)
+            deduped.append(candidate)
+    return deduped
 
 
 def _rpm_home_from_token_path(token_path: str) -> str | None:
@@ -122,34 +195,22 @@ def _rpm_home_from_token_path(token_path: str) -> str | None:
 
 
 def _resolve_remote_influx_read_token_details(client) -> InfluxTokenResolution:
-    for path in (_TOKEN_PATH, _ALT_TOKEN_PATH):
-        token = _read_remote_text(client, path)
-        if token:
-            layout = _rpm_home_from_token_path(path)
-            return InfluxTokenResolution(token, path, layout, layout, f"{layout}/.ssh/authorized_keys")
+    candidates = _resolve_remote_influx_read_token_candidates(client)
+    return candidates[0] if candidates else InfluxTokenResolution("")
 
-    stdin, stdout, stderr = client.exec_command(
-        f"find / -type f -path {shlex.quote('*/InfluxDB2/.influxReadtoken')} "
-        "-print 2>/dev/null | head -n 1"
-    )
-    status = stdout.channel.recv_exit_status()
-    candidate = stdout.read().decode("utf-8", errors="ignore").strip().splitlines()
-    if candidate:
-        token_path = candidate[0]
-        token = _read_remote_text(client, token_path)
-        rpm_home = _rpm_home_from_token_path(token_path)
-        return InfluxTokenResolution(
-            token,
-            token_path,
-            rpm_home,
-            rpm_home,
-            f"{rpm_home}/.ssh/authorized_keys" if rpm_home else None,
+
+def _read_influx_token_candidates(client) -> list[InfluxTokenCandidate]:
+    """Read each candidate's adjacent host metadata without choosing a token."""
+    result: list[InfluxTokenCandidate] = []
+    for resolution in _resolve_remote_influx_read_token_candidates(client):
+        setup_path, bundle_path = _metadata_paths(resolution)
+        metadata = _build_influx_host_metadata(
+            _read_remote_text(client, setup_path), _read_remote_text(client, bundle_path)
         )
-
-    err = stderr.read().decode("utf-8", errors="ignore").strip()
-    if status != 0 or err:
-        _LOGGER.debug("SSH find for Influx token path returned no match (exit status %s)", status)
-    return InfluxTokenResolution("")
+        if metadata:
+            metadata.source_files = (setup_path, bundle_path)
+        result.append(InfluxTokenCandidate(resolution=resolution, metadata=metadata))
+    return result
 
 
 def _metadata_paths(resolution: InfluxTokenResolution) -> tuple[str, str]:
@@ -187,6 +248,10 @@ def _resolve_authorized_keys_path(client, username: str) -> str:
     return f"{shell_home.rstrip('/')}/.ssh/authorized_keys"
 
 
+def _as_bytes(value) -> bytes:
+    return value if isinstance(value, bytes) else str(value).encode("utf-8")
+
+
 def _install_authorized_key(client, username: str, public_key_line: str) -> tuple[str, bool]:
     auth_path = _resolve_authorized_keys_path(client, username)
     auth_dir = posixpath.dirname(auth_path)
@@ -197,58 +262,77 @@ def _install_authorized_key(client, username: str, public_key_line: str) -> tupl
     )
     sftp = client.open_sftp()
     added = False
-    temp_path = f"{auth_path}.savant_energy_{uuid.uuid4().hex}.tmp"
+    append_state: _AuthorizedKeyAppend | None = None
     try:
         try:
-            with sftp.open(auth_path, "r") as remote_file:
+            with sftp.open(auth_path, "rb") as remote_file:
                 content = remote_file.read()
         except OSError:
-            content = ""
-        if isinstance(content, bytes):
-            content = content.decode("utf-8", errors="ignore")
-        if public_key_line in str(content).splitlines():
+            content = b""
+            existed = False
+        else:
+            existed = True
+        original_content = _as_bytes(content)
+        key_bytes = public_key_line.encode("utf-8")
+        if key_bytes in original_content.splitlines():
             try:
                 sftp.chmod(auth_path, 0o600)
             except OSError as exc:
                 raise _SSHInstallError(added, exc) from exc
             return auth_path, False
-        content_text = str(content)
-        if content_text and not content_text.endswith("\n"):
-            content_text += "\n"
-        content_text += public_key_line + "\n"
-        with sftp.open(temp_path, "w") as remote_file:
-            remote_file.write(content_text)
         try:
-            sftp.chmod(temp_path, 0o600)
+            setattr(client, "_savant_energy_authorized_key_append", None)
+        except Exception:
+            pass
+        # Do not replace authorized_keys with an SFTP rename.  OpenSSH/SFTP
+        # servers commonly reject rename-over-existing with a generic
+        # ``Failure`` (the exact error seen on SavantOS).  Append only our
+        # line, preserving every existing byte.
+        suffix = (b"" if not original_content or original_content.endswith(b"\n") else b"\n") + key_bytes + b"\n"
+        append_state = _AuthorizedKeyAppend(auth_path, original_content, existed, suffix)
+        setattr(client, "_savant_energy_authorized_key_append", append_state)
+        added = True
+        with sftp.open(auth_path, "ab") as remote_file:
+            remote_file.write(suffix)
+        try:
+            sftp.chmod(auth_path, 0o600)
         except OSError as exc:
             raise _SSHInstallError(added, exc) from exc
-        sftp.rename(temp_path, auth_path)
-        added = True
+        with sftp.open(auth_path, "rb") as remote_file:
+            verified_content = _as_bytes(remote_file.read())
+        if key_bytes not in verified_content.splitlines():
+            raise _SSHInstallError(added, OSError("authorized key verification failed"))
         return auth_path, True
+    except _SSHInstallError:
+        raise
+    except OSError as exc:
+        raise _SSHInstallError(added, exc) from exc
     finally:
-        if not added:
-            try:
-                sftp.remove(temp_path)
-            except OSError:
-                pass
         try:
             sftp.close()
         except OSError as exc:
             raise _SSHInstallError(added, exc) from exc
 
 
-def _remove_authorized_key(client, auth_path: str, public_key_line: str) -> None:
+def _remove_authorized_key(client, append: _AuthorizedKeyAppend) -> bool:
+    """Remove only an unchanged exact append; never overwrite concurrent edits."""
     sftp = client.open_sftp()
     try:
-        with sftp.open(auth_path, "r") as remote_file:
-            content = remote_file.read()
-        if isinstance(content, bytes):
-            content = content.decode("utf-8", errors="ignore")
-        remaining = [line for line in str(content).splitlines() if line != public_key_line]
-        with sftp.open(auth_path, "w") as remote_file:
-            if remaining:
-                remote_file.write("\n".join(remaining) + "\n")
-        sftp.chmod(auth_path, 0o600)
+        with sftp.open(append.path, "rb") as remote_file:
+            current = _as_bytes(remote_file.read())
+        if not current.endswith(append.suffix):
+            _LOGGER.warning("SSH authorized_keys rollback conflict; leaving concurrent content untouched")
+            return False
+        if append.existed:
+            # Do not rewrite the prefix: a failed write after opening `wb`
+            # would erase unrelated authorized keys. The suffix check above
+            # makes an in-place truncate safe and concurrency-aware.
+            with sftp.open(append.path, "r+b") as remote_file:
+                remote_file.truncate(len(current) - len(append.suffix))
+            sftp.chmod(append.path, 0o600)
+        else:
+            sftp.remove(append.path)
+        return True
     finally:
         sftp.close()
 
@@ -411,14 +495,14 @@ PYEOF
                 pass
 
 
-def _ssh_read_influx_bundle_with_password_worker(
+def _ssh_read_influx_bundle_candidates_with_password_worker(
     host: str, username: str, password: str
-) -> tuple[str | None, InfluxHostMetadata | None, str | None]:
-    """Read and resolve the Influx bundle without modifying the remote host."""
+) -> tuple[list[InfluxTokenCandidate], str | None]:
+    """Read all candidate token bundles without modifying the remote host."""
     try:
         import paramiko  # type: ignore  # noqa: PLC0415
     except Exception:
-        return None, None, "ssh_unavailable"
+        return [], "ssh_unavailable"
     client = None
     try:
         client = paramiko.SSHClient()
@@ -431,25 +515,27 @@ def _ssh_read_influx_bundle_with_password_worker(
             allow_agent=False,
             look_for_keys=False,
         )
-        resolution = _resolve_remote_influx_read_token_details(client)
-        if not resolution.token:
-            return None, None, "ssh_token_empty"
-        setup_path, bundle_path = _metadata_paths(resolution)
-        metadata = _build_influx_host_metadata(
-            _read_remote_text(client, setup_path),
-            _read_remote_text(client, bundle_path),
-        )
-        if metadata:
-            metadata.source_files = (setup_path, bundle_path)
-        return resolution.token, metadata, None
+        candidates = _read_influx_token_candidates(client)
+        return (candidates, None) if candidates else ([], "ssh_token_empty")
     except _SSHOperationError as exc:
-        return None, None, "ssh_token_empty" if exc.operation == "token_read" else "ssh_failed"
+        return [], "ssh_token_empty" if exc.operation == "token_read" else "ssh_failed"
     except Exception as exc:
         _LOGGER.warning("SSH bundle read failed: %s", _safe_ssh_error(exc, password, host, username))
-        return None, None, "ssh_failed"
+        return [], "ssh_failed"
     finally:
         if client:
             client.close()
+
+
+def _ssh_read_influx_bundle_with_password_worker(
+    host: str, username: str, password: str
+) -> tuple[str | None, InfluxHostMetadata | None, str | None]:
+    """Compatibility wrapper returning the first discovered candidate only."""
+    candidates, error_key = _ssh_read_influx_bundle_candidates_with_password_worker(host, username, password)
+    if error_key:
+        return None, None, error_key
+    candidate = candidates[0]
+    return candidate.token, candidate.metadata, None
 
 
 def _ssh_install_and_verify_key_worker(
@@ -474,14 +560,23 @@ def _ssh_install_and_verify_key_worker(
     try:
         password_client = paramiko.SSHClient()
         password_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        password_client.connect(
-            hostname=host,
-            username=username,
-            password=password,
-            timeout=10,
-            allow_agent=False,
-            look_for_keys=False,
-        )
+        try:
+            password_client.connect(
+                hostname=host,
+                username=username,
+                password=password,
+                timeout=10,
+                allow_agent=False,
+                look_for_keys=False,
+            )
+        except Exception as exc:
+            # Keep password/connect failures separate from failures after a
+            # key was installed. Paramiko's AuthenticationException is
+            # intentionally detected by class name to keep test doubles and
+            # optional Paramiko imports compatible.
+            if exc.__class__.__name__ == "AuthenticationException":
+                return "ssh_password_auth_failed"
+            return "ssh_connect_failed"
         auth_path, added = _install_authorized_key(password_client, username, public_key_line)
 
         pkey = paramiko.Ed25519Key(file_obj=io.StringIO(private_key_pem))
@@ -495,9 +590,9 @@ def _ssh_install_and_verify_key_worker(
             allow_agent=False,
             look_for_keys=False,
         )
-        resolution = _resolve_remote_influx_read_token_details(verify_client)
-        if resolution.token != expected_token:
-            raise ValueError("verified token differs from prepared token")
+        candidates = _resolve_remote_influx_read_token_candidates(verify_client)
+        if expected_token not in {candidate.token for candidate in candidates}:
+            return "ssh_token_mismatch"
         verified = True
         return None
     except _SSHInstallError as exc:
@@ -511,25 +606,26 @@ def _ssh_install_and_verify_key_worker(
     finally:
         if verify_client:
             verify_client.close()
-        if added and not verified and password_client and auth_path:
+        append = getattr(password_client, "_savant_energy_authorized_key_append", None)
+        if added and not verified and password_client and append:
             try:
-                _remove_authorized_key(password_client, auth_path, public_key_line)
+                _remove_authorized_key(password_client, append)
             except Exception as exc:
                 _LOGGER.error("Could not roll back managed SSH key: %s", _safe_ssh_error(exc, password))
         if password_client:
             password_client.close()
 
 
-def _ssh_fetch_influx_bundle_with_key_worker(
+def _ssh_fetch_influx_candidates_with_key_worker(
     host: str, username: str, private_key_pem: str
-) -> tuple[str | None, InfluxHostMetadata | None]:
-    """Blocking: connect with Ed25519 key and read the influx token bundle."""
+) -> tuple[list[InfluxTokenCandidate], None]:
+    """Blocking: connect with Ed25519 key and read every token bundle."""
     try:
         import io
         import paramiko  # type: ignore  # noqa: PLC0415
     except Exception as exc:
         _LOGGER.warning("paramiko unavailable: %s", exc)
-        return None, None
+        return [], None
 
     client = None
     try:
@@ -545,35 +641,29 @@ def _ssh_fetch_influx_bundle_with_key_worker(
             look_for_keys=False,
         )
 
-        resolution = _resolve_remote_influx_read_token_details(client)
-        token = resolution.token or _resolve_remote_influx_read_token(client)
-        if not token:
-            return None, None
-
-        setup_path, bundle_path = _metadata_paths(resolution)
-        metadata = _build_influx_host_metadata(_read_remote_text(client, setup_path), _read_remote_text(client, bundle_path))
-        if metadata:
-            metadata.source_files = (setup_path, bundle_path)
-        if metadata:
-            _LOGGER.debug(
-                "SSH key metadata from %s: org_id=%s org_name=%s bucket=%s auth_org_id=%s",
-                host,
-                metadata.org_id or "<unset>",
-                metadata.org_name or "<unset>",
-                metadata.bucket_name or "<unset>",
-                metadata.auth_org_id or "<unset>",
-            )
-        return token, metadata
+        return _read_influx_token_candidates(client), None
 
     except Exception as exc:
         _LOGGER.warning("SSH key-based token fetch from %s failed: %s", host, _safe_ssh_error(exc, private_key_pem))
-        return None, None
+        return [], None
     finally:
         if client:
             try:
                 client.close()
             except Exception:
                 pass
+
+
+def _ssh_fetch_influx_bundle_with_key_worker(
+    host: str, username: str, private_key_pem: str
+) -> tuple[str | None, InfluxHostMetadata | None]:
+    """Compatibility wrapper returning the first discovered candidate only."""
+    candidates, _error = _ssh_fetch_influx_candidates_with_key_worker(host, username, private_key_pem)
+    if not candidates:
+        # Legacy callers/tests use this compatibility API and only expect a
+        # best-effort read, not selection or persistence.
+        return None, None
+    return candidates[0].token, candidates[0].metadata
 
 
 async def async_ssh_bootstrap(
@@ -620,6 +710,20 @@ async def async_ssh_prepare_bootstrap(
     return private_pem, public_openssh, token, metadata, None
 
 
+async def async_ssh_prepare_bootstrap_candidates(
+    hass, host: str, username: str, password: str
+) -> tuple[str | None, str | None, list[InfluxTokenCandidate], str | None]:
+    """Prepare a key and enumerate, but do not select or persist, SSH tokens."""
+    try:
+        private_pem, public_openssh = generate_ed25519_keypair()
+    except Exception:
+        return None, None, [], "keygen_failed"
+    candidates, error_key = await hass.async_add_executor_job(
+        _ssh_read_influx_bundle_candidates_with_password_worker, host, username, password
+    )
+    return private_pem, public_openssh, candidates, error_key
+
+
 async def async_ssh_install_and_verify_key(
     hass,
     host: str,
@@ -658,3 +762,13 @@ async def async_ssh_fetch_influx_bundle_with_key(
     return await hass.async_add_executor_job(
         _ssh_fetch_influx_bundle_with_key_worker, host, username, private_key_pem
     )
+
+
+async def async_ssh_fetch_influx_candidates_with_key(
+    hass, host: str, username: str, private_key_pem: str
+) -> list[InfluxTokenCandidate]:
+    """Return all key-authenticated candidates for end-to-end validation."""
+    candidates, _error = await hass.async_add_executor_job(
+        _ssh_fetch_influx_candidates_with_key_worker, host, username, private_key_pem
+    )
+    return candidates

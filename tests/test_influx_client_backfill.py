@@ -28,6 +28,35 @@ def _circuit_csv() -> str:
 
 
 class InfluxClientBackfillTests(unittest.IsolatedAsyncioTestCase):
+    def test_bootstrap_inventory_uses_identity_only_and_never_measurements(self):
+        influx_client = _load_influx_client_module()
+        shells = influx_client.build_measurement_bootstrap_inventory(
+            {"inventoryDemands": [{"uid": "historical::1", "name": "Historical", "power": 999, "energy": 42}]},
+            {"stored::1": {"circuit_key": "stored::1", "display_name": "Stored", "legacy_uid": "relay.0"}},
+        )
+        self.assertEqual({item["uid"] for item in shells}, {"stored::1", "historical::1"})
+        self.assertFalse(any("power" in item or "energy" in item for item in shells))
+        self.assertTrue(all(item["has_relay"] is False for item in shells))
+
+    async def test_historical_complete_inventory_does_not_make_partial_live_authoritative(self):
+        influx_client = _load_influx_client_module()
+        partial = influx_client.InfluxFetchResult(
+            success=True,
+            data={"presentDemands": [{"uid": "live::1", "power": 1}], "circuit_map_status": {"missing_circuit_keys": ["lost::2"], "inventory_status": "partial", "inventory_authoritative": False}},
+            query_window="-2m",
+        )
+        historical = influx_client.InfluxFetchResult(
+            success=True,
+            data={"presentDemands": [{"uid": "live::1", "power": 999}, {"uid": "lost::2", "power": 888}], "circuit_map_status": {"missing_circuit_keys": [], "inventory_status": "complete", "inventory_authoritative": True}},
+            query_window="-15m",
+        )
+        with mock.patch.object(influx_client, "fetch_influx_snapshot", new=mock.AsyncMock(side_effect=[partial, historical])):
+            result = await influx_client.fetch_influx_snapshot_with_backfill("url", "token", "org", backfill_windows=("-2m", "-15m"))
+        self.assertEqual(result.data["presentDemands"], partial.data["presentDemands"])
+        self.assertEqual(result.data["circuit_map_status"]["inventory_status"], "partial")
+        self.assertEqual(result.data["circuit_map_status"]["identity_inventory_status"], "complete")
+        self.assertFalse(result.data["circuit_map_status"]["inventory_authoritative"])
+
     def test_query_result_classifies_auth_and_is_legacy_unpackable(self):
         influx_client = _load_influx_client_module()
 

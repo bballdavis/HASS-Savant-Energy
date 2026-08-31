@@ -54,9 +54,11 @@ from .influx_client import discover_circuit_metadata_with_backfill
 from .influx_org_resolver import InfluxOrgCandidate, async_discover_influx_org
 from .ssh_helper import (
     InfluxHostMetadata,
+    InfluxTokenCandidate,
     async_ssh_bootstrap,
     async_ssh_install_and_verify_key,
     async_ssh_prepare_bootstrap,
+    async_ssh_prepare_bootstrap_candidates,
 )
 from .legacy.snapshot_data import fetch_current_energy_snapshot
 
@@ -88,6 +90,15 @@ async def _async_safe_ssh_prepare_bootstrap(hass, host: str, username: str, pass
                 trace = trace.replace(secret, "[redacted]")
         _LOGGER.error("SSH preparation failed unexpectedly (setup_unexpected): %s", trace)
         return None, None, None, None, "setup_unexpected"
+
+
+async def _async_safe_ssh_prepare_bootstrap_candidates(hass, host: str, username: str, password: str):
+    """Enumerate SSH token candidates without selecting one by path order."""
+    try:
+        return await async_ssh_prepare_bootstrap_candidates(hass, host, username, password)
+    except Exception:
+        _LOGGER.exception("SSH candidate enumeration failed (setup_unexpected)")
+        return None, None, [], "setup_unexpected"
 
 
 async def _async_safe_ssh_install_and_verify_key(
@@ -332,6 +343,43 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             _LOGGER.error("Influx token setup stage failed unexpectedly (setup_unexpected): %s", trace)
             return None, "setup_unexpected"
 
+    async def _async_select_ssh_token_candidate(
+        self, candidates: list[InfluxTokenCandidate]
+    ) -> tuple[InfluxTokenCandidate | None, str | None]:
+        """Validate candidates end-to-end before allowing one into pending state.
+
+        Org discovery itself performs host-metadata/direct bucket queries when
+        `/api/v2/orgs` is empty; the circuit query makes the final selection a
+        real Savant data validation rather than a path-order preference.
+        """
+        original = {
+            key: self._pending.get(key)
+            for key in (CONF_INFLUX_TOKEN, CONF_INFLUX_ORG, CONF_INFLUX_BUCKET, CONF_CIRCUIT_MAP)
+        }
+        last_error = "ssh_token_empty"
+        for candidate in candidates:
+            self._pending[CONF_INFLUX_TOKEN] = candidate.token
+            for key in (CONF_INFLUX_ORG, CONF_INFLUX_BUCKET, CONF_CIRCUIT_MAP):
+                self._pending.pop(key, None)
+            _org, outcome = await self._async_safe_discover_pending_org(candidate.metadata)
+            if outcome == "select":
+                # The candidate has a real data discovery result but needs a
+                # user org choice. Retain it for the existing selection step.
+                return candidate, outcome
+            if outcome is None:
+                circuit_error = await self._async_discover_pending_circuit_map()
+                if circuit_error is None:
+                    return candidate, None
+                last_error = circuit_error
+            else:
+                last_error = outcome
+        for key, value in original.items():
+            if value is None:
+                self._pending.pop(key, None)
+            else:
+                self._pending[key] = value
+        return None, last_error
+
     def _resolve_pending_influx_url(self) -> str:
         """Return the best URL for discovery and persistence."""
         entry = self._get_reconfigure_entry() if self.context.get("entry_id") else None
@@ -364,8 +412,27 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             _LOGGER.error("Influx circuit setup stage failed unexpectedly (setup_unexpected): %s", trace)
             return "setup_unexpected"
         if result.success and result.circuit_map:
-            self._pending[CONF_CIRCUIT_MAP] = result.circuit_map
-            self._pending_circuit_map_warnings = list(result.warnings or [])
+            warnings = list(result.warnings or [])
+            entry = self._get_reconfigure_entry() if self.context.get("entry_id") else None
+            existing_map = dict((entry.data if entry else {}).get(CONF_CIRCUIT_MAP, {}) or {})
+            discovered_keys = set(result.circuit_map)
+            missing_existing_keys = sorted(set(existing_map) - discovered_keys)
+            if missing_existing_keys:
+                # A partial reconfigure response cannot prove that an already
+                # mapped circuit was removed. Preserve the complete stored
+                # identity map instead of replacing it with a smaller map.
+                self._pending[CONF_CIRCUIT_MAP] = existing_map
+                warnings.append(
+                    "Circuit inventory was incomplete; preserved the existing circuit map "
+                    f"({len(missing_existing_keys)} stored circuit(s) were absent from discovery)."
+                )
+                _LOGGER.warning(
+                    "Reconfigure discovery omitted %d stored circuit(s); preserving existing map",
+                    len(missing_existing_keys),
+                )
+            else:
+                self._pending[CONF_CIRCUIT_MAP] = result.circuit_map
+            self._pending_circuit_map_warnings = warnings
             return None
         _LOGGER.warning(
             "Current-mode circuit discovery failed for %s via %s: %s",
@@ -561,37 +628,32 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                private_key, public_key, token, metadata, error_key = await _async_safe_ssh_prepare_bootstrap(
+                private_key, public_key, candidates, error_key = await _async_safe_ssh_prepare_bootstrap_candidates(
                     self.hass, self._pending[CONF_HOST], DEFAULT_SSH_USERNAME, ssh_password
                 )
                 if error_key:
                     errors[CONF_SSH_PASSWORD] = error_key
                 else:
-                    self._pending[CONF_INFLUX_TOKEN] = token
-                    _, outcome = await self._async_safe_discover_pending_org(metadata)
-                    if outcome is None:
-                        circuit_error = await self._async_discover_pending_circuit_map()
-                        if circuit_error is None:
-                            self._remember_ssh_bootstrap(
-                                self._pending[CONF_HOST],
-                                ssh_password,
-                                private_key,
-                                public_key,
-                                token,
-                            )
-                            install_error = await self._async_install_pending_ssh_key()
-                            if install_error is None:
-                                return await self._async_finish_current_setup()
-                            errors[CONF_SSH_PASSWORD] = install_error
-                        else:
-                            errors["base"] = circuit_error
-                    elif outcome == "select":
+                    selected, outcome = await self._async_select_ssh_token_candidate(candidates)
+                    if selected and outcome is None:
                         self._remember_ssh_bootstrap(
                             self._pending[CONF_HOST],
                             ssh_password,
                             private_key,
                             public_key,
-                            token,
+                            selected.token,
+                        )
+                        install_error = await self._async_install_pending_ssh_key()
+                        if install_error is None:
+                            return await self._async_finish_current_setup()
+                        errors[CONF_SSH_PASSWORD] = install_error
+                    elif selected and outcome == "select":
+                        self._remember_ssh_bootstrap(
+                            self._pending[CONF_HOST],
+                            ssh_password,
+                            private_key,
+                            public_key,
+                            selected.token,
                         )
                         return await self.async_step_current_org_select()
                     elif "base" not in errors:
@@ -861,37 +923,32 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                private_key, public_key, token, metadata, error_key = await _async_safe_ssh_prepare_bootstrap(
+                private_key, public_key, candidates, error_key = await _async_safe_ssh_prepare_bootstrap_candidates(
                     self.hass, self._pending[CONF_HOST], DEFAULT_SSH_USERNAME, ssh_password
                 )
                 if error_key:
                     errors[CONF_SSH_PASSWORD] = error_key
                 else:
-                    self._pending[CONF_INFLUX_TOKEN] = token
-                    _, outcome = await self._async_safe_discover_pending_org(metadata)
-                    if outcome is None:
-                        circuit_error = await self._async_discover_pending_circuit_map()
-                        if circuit_error is None:
-                            self._remember_ssh_bootstrap(
-                                self._pending[CONF_HOST],
-                                ssh_password,
-                                private_key,
-                                public_key,
-                                token,
-                            )
-                            install_error = await self._async_install_pending_ssh_key()
-                            if install_error is None:
-                                return await self._async_finish_current_reconfigure(config_entry)
-                            errors[CONF_SSH_PASSWORD] = install_error
-                        else:
-                            errors["base"] = circuit_error
-                    elif outcome == "select":
+                    selected, outcome = await self._async_select_ssh_token_candidate(candidates)
+                    if selected and outcome is None:
                         self._remember_ssh_bootstrap(
                             self._pending[CONF_HOST],
                             ssh_password,
                             private_key,
                             public_key,
-                            token,
+                            selected.token,
+                        )
+                        install_error = await self._async_install_pending_ssh_key()
+                        if install_error is None:
+                            return await self._async_finish_current_reconfigure(config_entry)
+                        errors[CONF_SSH_PASSWORD] = install_error
+                    elif selected and outcome == "select":
+                        self._remember_ssh_bootstrap(
+                            self._pending[CONF_HOST],
+                            ssh_password,
+                            private_key,
+                            public_key,
+                            selected.token,
                         )
                         return await self.async_step_reconfigure_org_select()
                     elif "base" not in errors:
@@ -1047,48 +1104,45 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 if not host:
                     errors[CONF_SSH_PASSWORD] = "host_not_available"
                 else:
-                    private_key, public_key, token, metadata, error_key = await _async_safe_ssh_prepare_bootstrap(
+                    private_key, public_key, token_candidates, error_key = await _async_safe_ssh_prepare_bootstrap_candidates(
                         self.hass, host, DEFAULT_SSH_USERNAME, ssh_password
                     )
                     if error_key:
                         errors[CONF_SSH_PASSWORD] = error_key
                     else:
-                        try:
-                            result = await async_discover_influx_org(
-                                self.config_entry.data.get(CONF_INFLUX_URL, _derive_influx_url(host)),
-                                token,
-                                metadata,
-                            )
-                        except Exception:
-                            trace = traceback.format_exc().replace(str(token), "[redacted]")
-                            _LOGGER.error(
-                                "Influx SSH reprovision discovery failed unexpectedly (setup_unexpected): %s",
-                                trace,
-                            )
-                            errors["base"] = "setup_unexpected"
-                            result = None
-                        if result is None:
-                            return self.async_show_form(
-                                step_id="reprovision_ssh",
-                                data_schema=vol.Schema({vol.Required(CONF_SSH_PASSWORD): str}),
-                                errors=errors,
-                            )
-                        chosen_org = result.selected_org_id
-                        chosen_bucket = result.selected_bucket
+                        selected = None
+                        chosen_org = None
+                        chosen_bucket = None
+                        last_error = "org_discovery_failed"
+                        url = self.config_entry.data.get(CONF_INFLUX_URL, _derive_influx_url(host))
                         current_org = self.config_entry.data.get(CONF_INFLUX_ORG, "")
-                        if chosen_org is None and result.candidates and current_org:
-                            matching = [candidate for candidate in result.candidates if candidate.org_id == current_org]
-                            if matching:
-                                candidate = max(matching, key=lambda item: item.score)
-                                chosen_org = current_org
-                                chosen_bucket = candidate.selected_bucket
-
-                        if chosen_org is None:
-                            errors["base"] = (
-                                "org_reconfigure_required"
-                                if result.candidates
-                                else (result.error_key or "org_discovery_failed")
+                        for candidate_token in token_candidates:
+                            try:
+                                result = await async_discover_influx_org(url, candidate_token.token, candidate_token.metadata)
+                            except Exception:
+                                last_error = "setup_unexpected"
+                                continue
+                            candidate_org = result.selected_org_id
+                            candidate_bucket = result.selected_bucket
+                            if candidate_org is None and result.candidates and current_org:
+                                matching = [candidate for candidate in result.candidates if candidate.org_id == current_org]
+                                if matching:
+                                    match = max(matching, key=lambda item: item.score)
+                                    candidate_org, candidate_bucket = current_org, match.selected_bucket
+                            if not candidate_org:
+                                last_error = "org_reconfigure_required" if result.candidates else (result.error_key or last_error)
+                                continue
+                            circuit_result = await discover_circuit_metadata_with_backfill(
+                                url, candidate_token.token, candidate_org,
+                                sem_host=self.config_entry.data.get(CONF_ADDRESS, ""),
+                                influx_bucket=candidate_bucket or DEFAULT_INFLUX_BUCKET,
                             )
+                            if circuit_result.success and circuit_result.circuit_map:
+                                selected, chosen_org, chosen_bucket = candidate_token, candidate_org, candidate_bucket
+                                break
+                            last_error = circuit_result.error_key or "circuit_discovery_failed"
+                        if selected is None:
+                            errors["base"] = last_error
                         else:
                             install_error = await _async_safe_ssh_install_and_verify_key(
                                 self.hass,
@@ -1097,7 +1151,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                                 ssh_password,
                                 private_key,
                                 public_key,
-                                token,
+                                selected.token,
                             )
                             if install_error:
                                 errors[CONF_SSH_PASSWORD] = install_error
@@ -1107,7 +1161,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                                     errors=errors,
                                 )
                             data = dict(self.config_entry.data)
-                            data[CONF_INFLUX_TOKEN] = token
+                            data[CONF_INFLUX_TOKEN] = selected.token
                             data[CONF_SSH_PRIVATE_KEY] = private_key
                             data[CONF_INFLUX_ORG] = chosen_org
                             data[CONF_INFLUX_BUCKET] = (

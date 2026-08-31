@@ -30,8 +30,11 @@
       "ssh_unavailable": "The paramiko library is not installed. SSH token fetch is unavailable — paste the token manually instead.",
       "ssh_token_empty": "SSH connection succeeded but the token file was empty or not found. Verify the host is running rpm-energy ≥11.2.",
       "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password.",
+      "ssh_password_auth_failed": "SSH password authentication failed. Verify the RPM user password.",
+      "ssh_connect_failed": "Could not establish an SSH connection to the Savant host.",
       "ssh_key_install_failed": "SSH connected, but Savant Energy could not install or verify its refresh key on the host. Check the logs for the failed stage.",
       "ssh_key_verify_failed": "SSH connected and installed the refresh key, but the host rejected a new connection using that key. Check SSH ownership, permissions, and host policy.",
+      "ssh_token_mismatch": "The token changed while Savant Energy was verifying its SSH refresh key. Try the setup again.",
       "setup_unexpected": "Setup failed unexpectedly. Check the logs for the sanitized failure trace and try again.",
       "host_not_available": "No host IP is configured. Go back and set a Host IP before re-provisioning.",
       "org_auth_failed": "InfluxDB rejected the token or organization. Verify the token, organization ID, and Host IP, then try again.",
@@ -45,7 +48,9 @@
       "org_discovery_failed": "Could not discover a valid Influx organization from host metadata, buckets, or the org list. Check the host IP and credentials, then try again.",
       "org_discovery_no_orgs": "Influx returned no organizations visible to this token.",
       "org_discovery_no_data": "Influx organizations were found, but none matched the expected Savant energy data shape.",
-      "org_reconfigure_required": "Multiple plausible organizations were found. Run Reconfigure to choose the correct one."
+      "org_reconfigure_required": "Multiple plausible organizations were found. Run Reconfigure to choose the correct one.",
+      "invalid_value": "Enter a valid number.",
+      "out_of_range": "Enter a value within the allowed range."
     }
   },
   "config": {
@@ -95,7 +100,7 @@
           "influx_token": "Influx Read Token"
         },
         "data_description": {
-          "influx_token": "Paste the InfluxDB read token from your Savant host. You can find it at: /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken"
+          "influx_token": "Paste the InfluxDB read token from your Savant host. It is usually at /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken, or /data/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken."
         },
         "description": "Paste the InfluxDB read token from your Savant host."
       },
@@ -189,7 +194,7 @@
           "influx_token": "Influx Read Token"
         },
         "data_description": {
-          "influx_token": "Paste the InfluxDB read token from your Savant host. Found at: /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken"
+          "influx_token": "Paste the InfluxDB read token from your Savant host. It is usually at /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken, or /data/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken."
         },
         "description": "Paste the InfluxDB read token from your Savant host."
       },
@@ -226,8 +231,11 @@
       "ssh_unavailable": "The paramiko library is not installed. SSH token fetch is unavailable — paste the token manually instead.",
       "ssh_token_empty": "SSH connection succeeded but the token file was empty or not found. Verify the host is running rpm-energy ≥11.2.",
       "ssh_failed": "Could not connect via SSH. Check the Host IP address and the RPM user password.",
+      "ssh_password_auth_failed": "SSH password authentication failed. Verify the RPM user password.",
+      "ssh_connect_failed": "Could not establish an SSH connection to the Savant host.",
       "ssh_key_install_failed": "SSH connected, but Savant Energy could not install or verify its refresh key on the host. Check the logs for the failed stage.",
       "ssh_key_verify_failed": "SSH connected and installed the refresh key, but the host rejected a new connection using that key. Check SSH ownership, permissions, and host policy.",
+      "ssh_token_mismatch": "The token changed while Savant Energy was verifying its SSH refresh key. Try the setup again.",
       "setup_unexpected": "Setup failed unexpectedly. Check the logs for the sanitized failure trace and try again.",
       "org_auth_failed": "InfluxDB rejected the token or organization. Verify the token, organization ID, and Host IP, then try again.",
       "influx_auth_failed": "InfluxDB returned 401 and rejected the token for the data query. Verify that this is the read token from the same host.",
@@ -243,6 +251,9 @@
       "org_selection_required": "Multiple plausible organizations were found. Choose the correct one to continue.",
       "sem_companion_failed": "Could not reach the Savant SEM companion status API on the configured PBC IP address.",
       "circuit_discovery_failed": "Could not discover Savant circuit data from InfluxDB.",
+      "circuit_inventory_incomplete": "Circuit discovery was incomplete, so the existing circuit map was preserved.",
+      "invalid_value": "Enter a valid number.",
+      "out_of_range": "Enter a value within the allowed range.",
       "circuit_relay_mapping_failed": "One or more relay circuits could not be mapped to Savant relay UIDs. Verify the PBC IP and run Reconfigure again."
     },
     "abort": {

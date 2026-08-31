@@ -3,6 +3,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 def _install_homeassistant_stubs() -> None:
@@ -91,6 +92,55 @@ class _FakeServices:
 
 
 class CircuitMapNotificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_state_is_unchanged_when_persist_raises(self):
+        module = _load_integration_module()
+        coordinator = object.__new__(module.SavantEnergyCoordinator)
+        coordinator.influx_token = "old-token"
+        coordinator.influx_org = "old-org"
+        coordinator.influx_bucket = "old-bucket"
+        coordinator.ssh_private_key = "old-key"
+        coordinator.config_entry = types.SimpleNamespace(data={"influx_token": "old-token"})
+        def fail_update(*_args, **_kwargs):
+            raise RuntimeError("storage unavailable")
+        coordinator.hass = types.SimpleNamespace(config_entries=types.SimpleNamespace(async_update_entry=fail_update))
+        with self.assertRaisesRegex(RuntimeError, "storage unavailable"):
+            await coordinator._async_persist_connection_state(
+                token="new-token", org="new-org", bucket="new-bucket", ssh_private_key="new-key"
+            )
+        self.assertEqual(
+            (coordinator.influx_token, coordinator.influx_org, coordinator.influx_bucket, coordinator.ssh_private_key),
+            ("old-token", "old-org", "old-bucket", "old-key"),
+        )
+
+    async def test_runtime_candidate_failure_preserves_existing_connection_state(self):
+        module = _load_integration_module()
+        coordinator = object.__new__(module.SavantEnergyCoordinator)
+        updates = []
+        class _Hass:
+            config_entries = types.SimpleNamespace(async_update_entry=lambda entry, data: updates.append(data))
+            async def async_add_executor_job(self, _func, *_args):
+                return [failed], None
+        failed = types.SimpleNamespace(token="stale-token", metadata=None)
+        coordinator.hass = _Hass()
+        coordinator.host = "host"
+        coordinator.influx_url = "http://host:8086"
+        coordinator.ssh_private_key = "private"
+        coordinator.sem_host = "sem"
+        coordinator.influx_token = "current-token"
+        coordinator.influx_org = "current-org"
+        coordinator.influx_bucket = "current-bucket"
+        coordinator.config_entry = types.SimpleNamespace(data={"influx_token": "current-token", "influx_org": "current-org", "influx_bucket": "current-bucket"})
+        coordinator._token_refresh_in_progress = False
+        coordinator._adjust_interval = lambda success: None
+        with mock.patch.object(
+            module, "async_discover_influx_org", new=mock.AsyncMock(return_value=types.SimpleNamespace(selected_org_id=None))
+        ):
+            refreshed, metadata = await coordinator._async_refresh_influx_token_and_metadata()
+        self.assertFalse(refreshed)
+        self.assertIsNone(metadata)
+        self.assertEqual((coordinator.influx_token, coordinator.influx_org, coordinator.influx_bucket), ("current-token", "current-org", "current-bucket"))
+        self.assertEqual(updates, [])
+
     async def test_reports_each_mismatch_once_and_clears_when_healthy(self):
         module = _load_integration_module()
         coordinator = object.__new__(module.SavantEnergyCoordinator)

@@ -147,6 +147,44 @@ class _FakeHass:
 
 
 class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reconfigure_partial_discovery_preserves_complete_stored_circuit_map(self):
+        module = _load_config_flow_module()
+        existing_map = {"uuid::1": {"circuit_key": "uuid::1"}, "uuid::2": {"circuit_key": "uuid::2"}}
+        entry = types.SimpleNamespace(entry_id="entry", data={module.CONF_CIRCUIT_MAP: existing_map})
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(entry)
+        flow.context = {"entry_id": "entry"}
+        flow._pending = {module.CONF_ADDRESS: "pbc", module.CONF_INFLUX_TOKEN: "token", module.CONF_INFLUX_ORG: "org"}
+        flow._pending_circuit_map_warnings = []
+        discovered = types.SimpleNamespace(success=True, circuit_map={"uuid::1": {"circuit_key": "uuid::1"}}, warnings=[])
+        with mock.patch.object(module, "discover_circuit_metadata_with_backfill", new=mock.AsyncMock(return_value=discovered)):
+            error = await flow._async_discover_pending_circuit_map()
+        self.assertIsNone(error)
+        self.assertEqual(flow._pending[module.CONF_CIRCUIT_MAP], existing_map)
+        self.assertTrue(any("incomplete" in warning.lower() for warning in flow._pending_circuit_map_warnings))
+
+    async def test_ssh_candidate_selection_skips_stale_primary_for_valid_alternate(self):
+        module = _load_config_flow_module()
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(types.SimpleNamespace(entry_id="unused", data={}))
+        flow.context = {}
+        flow._pending = {module.CONF_ADDRESS: "192.168.1.108", module.CONF_HOST: "192.168.1.14"}
+        stale = types.SimpleNamespace(token="stale", metadata=None)
+        valid = types.SimpleNamespace(token="valid", metadata=None)
+
+        async def discover_org(metadata=None):
+            return ("org", None) if flow._pending[module.CONF_INFLUX_TOKEN] == "valid" else (None, "influx_auth_failed")
+
+        with mock.patch.object(flow, "_async_safe_discover_pending_org", new=mock.AsyncMock(side_effect=discover_org)), mock.patch.object(
+            flow, "_async_discover_pending_circuit_map", new=mock.AsyncMock(return_value=None)
+        ) as discover_circuit:
+            selected, outcome = await flow._async_select_ssh_token_candidate([stale, valid])
+
+        self.assertIs(selected, valid)
+        self.assertIsNone(outcome)
+        self.assertEqual(flow._pending[module.CONF_INFLUX_TOKEN], "valid")
+        discover_circuit.assert_awaited_once()
+
     async def test_ssh_setup_installs_key_only_after_circuit_validation(self):
         module = _load_config_flow_module()
         flow = module.ConfigFlow()
@@ -170,8 +208,8 @@ class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(
             module,
-            "_async_safe_ssh_prepare_bootstrap",
-            new=mock.AsyncMock(return_value=("private", "public", "token", None, None)),
+            "_async_safe_ssh_prepare_bootstrap_candidates",
+            new=mock.AsyncMock(return_value=("private", "public", [types.SimpleNamespace(token="token", metadata=None)], None)),
         ), mock.patch.object(
             flow,
             "_async_safe_discover_pending_org",
@@ -205,8 +243,8 @@ class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch.object(
             module,
-            "_async_safe_ssh_prepare_bootstrap",
-            new=mock.AsyncMock(return_value=("private", "public", "token", None, None)),
+            "_async_safe_ssh_prepare_bootstrap_candidates",
+            new=mock.AsyncMock(return_value=("private", "public", [types.SimpleNamespace(token="token", metadata=None)], None)),
         ), mock.patch.object(
             flow,
             "_async_safe_discover_pending_org",

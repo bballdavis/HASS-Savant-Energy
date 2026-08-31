@@ -61,7 +61,7 @@ The primary token path is:
 /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken
 ```
 
-The integration also checks the host metadata files used by the Savant InfluxDB package. If the token path is empty or unavailable, users can paste a token manually or use the CLI fallback documented in the README.
+The integration also checks the alternate `/data/home/RPM/...` layout and bounded discovery results. It reads adjacent host metadata for every candidate, then validates candidates in deterministic order with organization/bucket discovery and a real circuit query. It only persists a candidate that completes that chain; an empty organization list can still succeed through metadata and direct bucket queries.
 
 ### Organization discovery
 
@@ -100,7 +100,7 @@ The coordinator records the window that produced the data and exposes snapshot s
 Recovery behavior is layered:
 
 - A 401 triggers an SSH key-based token refresh when a stored key is available.
-- A refreshed token causes organization discovery and snapshot retrieval to run again.
+- A refreshed token is persisted only after organization, bucket, and circuit discovery succeed; failed candidates leave the current token, organization, and bucket untouched.
 - An invalid or missing organization triggers organization rediscovery.
 - A snapshot with unknown or missing circuits keeps the data visible and requests reconfiguration.
 - Temporary failures retain the last usable snapshot and report the next retry interval.
@@ -140,9 +140,22 @@ Existing entries remain in legacy mode after upgrade unless the user reconfigure
 
 Configuration normalization moves current-mode connection values out of stale options storage and into the config entry data. This prevents old options from overriding freshly entered host, token, URL, or organization values.
 
-On setup, the integration removes obsolete DMX address entities and stale circuit entities left by earlier identity schemes. Active relay devices retain their stable legacy identity where possible, while CT-only devices use their Influx identity.
+On setup, the integration removes obsolete DMX address entities and stale circuit entities left by earlier identity schemes. Stored circuit-map identity shells and historical identity inventory can recreate measurement entities after a partial snapshot, but those entities remain unavailable until a fresh `presentDemands` row returns. Relay control entities are created only from current live relay data.
 
 ## Troubleshooting
+
+### Savant host token layouts
+
+The token may be in either of these locations, depending on SavantOS packaging:
+
+```text
+/data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken
+/data/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken
+```
+
+Check both layouts and bounded `find` results by path and size only. The adjacent `.influxsetup` and `.influxtoken` files can identify the organization and bucket. Do not print token contents. `influxd` is the server daemon, not the optional `influx` CLI, so an `influxd` invocation or missing CLI does not validate a token. Candidate tokens are validated end-to-end against Savant data before setup or reconfigure persists one.
+
+SSH refresh is staged as password connection, home/path resolution, append-and-reread of the managed `authorized_keys` suffix, public-key authentication, and token validation. On failure, rollback removes only the exact appended byte suffix when it is still at the end of the file. A concurrent change is left untouched and reported as a rollback conflict. A wider historical query supplies identity inventory only; it is never used as a live measurement source. Partial inventory must not replace the stored map or trigger entity/device cleanup.
 
 - A 401 normally means the token expired or rotated. With SSH bootstrap enabled, the stored key should refresh it automatically.
 - An organization selection prompt means more than one candidate matched Savant's expected data shape. Choose the candidate with current circuit data.
