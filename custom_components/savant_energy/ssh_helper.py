@@ -6,6 +6,7 @@ import json
 import logging
 import posixpath
 import shlex
+import uuid
 from dataclasses import dataclass
 
 _LOGGER = logging.getLogger(__name__)
@@ -26,6 +27,21 @@ _TOKEN_BUNDLE_PATH = (
     "/data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia"
     "/statusfiles/InfluxDB2/.influxtoken"
 )
+_RPM_HOME = "/data/RPM"
+_AUTH_KEYS_PATH = f"{_RPM_HOME}/.ssh/authorized_keys"
+
+
+class _SSHOperationError(RuntimeError):
+    def __init__(self, operation: str, exit_status: int) -> None:
+        super().__init__(operation)
+        self.operation = operation
+        self.exit_status = exit_status
+
+
+class _SSHInstallError(OSError):
+    def __init__(self, added: bool, cause: OSError) -> None:
+        super().__init__(str(cause))
+        self.added = added
 
 
 def _safe_ssh_error(exc: Exception, *secrets: str) -> str:
@@ -82,19 +98,16 @@ class InfluxHostMetadata:
     source_files: tuple[str, ...] = ()
 
 
-def _read_remote_text(client, path: str) -> str:
-    stdin, stdout, stderr = client.exec_command(f"cat {shlex.quote(path)}")
+def _read_remote_text(client, path: str, *, required: bool = False) -> str:
+    _, stdout, stderr = client.exec_command(f"cat {shlex.quote(path)}")
     status = stdout.channel.recv_exit_status()
     text = stdout.read().decode("utf-8", errors="ignore").strip()
-    err = stderr.read().decode("utf-8", errors="ignore").strip()
+    _ = stderr.read().decode("utf-8", errors="ignore").strip()
     if status != 0:
-        _LOGGER.debug("SSH read stage failed for %s with exit status %s", path, status)
+        if required:
+            raise _SSHOperationError("token_read", status)
         return ""
-    if text:
-        return text
-    if err:
-        _LOGGER.debug("SSH read from %s returned no text", path)
-    return ""
+    return text
 
 
 def _resolve_remote_influx_read_token(client) -> str:
@@ -146,6 +159,98 @@ def _metadata_paths(resolution: InfluxTokenResolution) -> tuple[str, str]:
         else posixpath.dirname(_TOKEN_PATH)
     )
     return f"{root}/.influxsetup", f"{root}/.influxtoken"
+
+
+def _remote_command_output(client, command: str, operation: str) -> str:
+    _, stdout, stderr = client.exec_command(command)
+    status = stdout.channel.recv_exit_status()
+    output = stdout.read().decode("utf-8", errors="ignore").strip()
+    _ = stderr.read().decode("utf-8", errors="ignore").strip()
+    if status != 0:
+        _LOGGER.warning("SSH operation %s failed with exit status %s", operation, status)
+        raise _SSHOperationError(operation, status)
+    return output
+
+
+def _resolve_authorized_keys_path(client, username: str) -> str:
+    shell_home = _remote_command_output(client, "printf '%s' \"$HOME\"", "home_resolution")
+    if not shell_home.startswith("/"):
+        passwd_line = _remote_command_output(
+            client,
+            f"getent passwd {shlex.quote(username)}",
+            "home_resolution",
+        )
+        fields = passwd_line.split(":")
+        shell_home = fields[5] if len(fields) >= 6 else ""
+    if not shell_home.startswith("/"):
+        raise _SSHOperationError("home_resolution", 1)
+    return f"{shell_home.rstrip('/')}/.ssh/authorized_keys"
+
+
+def _install_authorized_key(client, username: str, public_key_line: str) -> tuple[str, bool]:
+    auth_path = _resolve_authorized_keys_path(client, username)
+    auth_dir = posixpath.dirname(auth_path)
+    _remote_command_output(
+        client,
+        f"mkdir -p {shlex.quote(auth_dir)} && chmod 700 {shlex.quote(auth_dir)}",
+        "ssh_directory",
+    )
+    sftp = client.open_sftp()
+    added = False
+    temp_path = f"{auth_path}.savant_energy_{uuid.uuid4().hex}.tmp"
+    try:
+        try:
+            with sftp.open(auth_path, "r") as remote_file:
+                content = remote_file.read()
+        except OSError:
+            content = ""
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="ignore")
+        if public_key_line in str(content).splitlines():
+            try:
+                sftp.chmod(auth_path, 0o600)
+            except OSError as exc:
+                raise _SSHInstallError(added, exc) from exc
+            return auth_path, False
+        content_text = str(content)
+        if content_text and not content_text.endswith("\n"):
+            content_text += "\n"
+        content_text += public_key_line + "\n"
+        with sftp.open(temp_path, "w") as remote_file:
+            remote_file.write(content_text)
+        try:
+            sftp.chmod(temp_path, 0o600)
+        except OSError as exc:
+            raise _SSHInstallError(added, exc) from exc
+        sftp.rename(temp_path, auth_path)
+        added = True
+        return auth_path, True
+    finally:
+        if not added:
+            try:
+                sftp.remove(temp_path)
+            except OSError:
+                pass
+        try:
+            sftp.close()
+        except OSError as exc:
+            raise _SSHInstallError(added, exc) from exc
+
+
+def _remove_authorized_key(client, auth_path: str, public_key_line: str) -> None:
+    sftp = client.open_sftp()
+    try:
+        with sftp.open(auth_path, "r") as remote_file:
+            content = remote_file.read()
+        if isinstance(content, bytes):
+            content = content.decode("utf-8", errors="ignore")
+        remaining = [line for line in str(content).splitlines() if line != public_key_line]
+        with sftp.open(auth_path, "w") as remote_file:
+            if remaining:
+                remote_file.write("\n".join(remaining) + "\n")
+        sftp.chmod(auth_path, 0o600)
+    finally:
+        sftp.close()
 
 
 def _safe_load_json(text: str) -> dict:
@@ -306,6 +411,115 @@ PYEOF
                 pass
 
 
+def _ssh_read_influx_bundle_with_password_worker(
+    host: str, username: str, password: str
+) -> tuple[str | None, InfluxHostMetadata | None, str | None]:
+    """Read and resolve the Influx bundle without modifying the remote host."""
+    try:
+        import paramiko  # type: ignore  # noqa: PLC0415
+    except Exception:
+        return None, None, "ssh_unavailable"
+    client = None
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            hostname=host,
+            username=username,
+            password=password,
+            timeout=10,
+            allow_agent=False,
+            look_for_keys=False,
+        )
+        resolution = _resolve_remote_influx_read_token_details(client)
+        if not resolution.token:
+            return None, None, "ssh_token_empty"
+        setup_path, bundle_path = _metadata_paths(resolution)
+        metadata = _build_influx_host_metadata(
+            _read_remote_text(client, setup_path),
+            _read_remote_text(client, bundle_path),
+        )
+        if metadata:
+            metadata.source_files = (setup_path, bundle_path)
+        return resolution.token, metadata, None
+    except _SSHOperationError as exc:
+        return None, None, "ssh_token_empty" if exc.operation == "token_read" else "ssh_failed"
+    except Exception as exc:
+        _LOGGER.warning("SSH bundle read failed: %s", _safe_ssh_error(exc, password, host, username))
+        return None, None, "ssh_failed"
+    finally:
+        if client:
+            client.close()
+
+
+def _ssh_install_and_verify_key_worker(
+    host: str,
+    username: str,
+    password: str,
+    private_key_pem: str,
+    public_key_line: str,
+    expected_token: str,
+) -> str | None:
+    """Install after validation, verify key login, and roll back on failure."""
+    try:
+        import io
+        import paramiko  # type: ignore  # noqa: PLC0415
+    except Exception:
+        return "ssh_unavailable"
+    password_client = None
+    verify_client = None
+    auth_path = None
+    added = False
+    verified = False
+    try:
+        password_client = paramiko.SSHClient()
+        password_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        password_client.connect(
+            hostname=host,
+            username=username,
+            password=password,
+            timeout=10,
+            allow_agent=False,
+            look_for_keys=False,
+        )
+        auth_path, added = _install_authorized_key(password_client, username, public_key_line)
+
+        pkey = paramiko.Ed25519Key(file_obj=io.StringIO(private_key_pem))
+        verify_client = paramiko.SSHClient()
+        verify_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        verify_client.connect(
+            hostname=host,
+            username=username,
+            pkey=pkey,
+            timeout=10,
+            allow_agent=False,
+            look_for_keys=False,
+        )
+        resolution = _resolve_remote_influx_read_token_details(verify_client)
+        if resolution.token != expected_token:
+            raise ValueError("verified token differs from prepared token")
+        verified = True
+        return None
+    except _SSHInstallError as exc:
+        added = exc.added
+        return "ssh_key_install_failed"
+    except _SSHOperationError as exc:
+        return "ssh_key_install_failed" if exc.operation in {"home_resolution", "ssh_directory"} else "ssh_key_verify_failed"
+    except Exception as exc:
+        _LOGGER.warning("SSH key verification failed: %s", _safe_ssh_error(exc, password, private_key_pem, expected_token))
+        return "ssh_key_verify_failed"
+    finally:
+        if verify_client:
+            verify_client.close()
+        if added and not verified and password_client and auth_path:
+            try:
+                _remove_authorized_key(password_client, auth_path, public_key_line)
+            except Exception as exc:
+                _LOGGER.error("Could not roll back managed SSH key: %s", _safe_ssh_error(exc, password))
+        if password_client:
+            password_client.close()
+
+
 def _ssh_fetch_influx_bundle_with_key_worker(
     host: str, username: str, private_key_pem: str
 ) -> tuple[str | None, InfluxHostMetadata | None]:
@@ -322,7 +536,14 @@ def _ssh_fetch_influx_bundle_with_key_worker(
         pkey = paramiko.Ed25519Key(file_obj=io.StringIO(private_key_pem))
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=host, username=username, pkey=pkey, timeout=10)
+        client.connect(
+            hostname=host,
+            username=username,
+            pkey=pkey,
+            timeout=10,
+            allow_agent=False,
+            look_for_keys=False,
+        )
 
         resolution = _resolve_remote_influx_read_token_details(client)
         token = resolution.token or _resolve_remote_influx_read_token(client)
@@ -377,6 +598,47 @@ async def async_ssh_bootstrap(
         _LOGGER.warning("SSH key verification failed for %s after key installation", host)
         return None, None, None, "ssh_key_verify_failed"
     return private_pem, verified_token, verified_metadata or metadata, None
+
+
+async def async_ssh_prepare_bootstrap(
+    hass, host: str, username: str, password: str
+) -> tuple[str | None, str | None, str | None, InfluxHostMetadata | None, str | None]:
+    """Generate key material and read the token without mutating the Savant host."""
+    try:
+        private_pem, public_openssh = generate_ed25519_keypair()
+    except Exception as exc:
+        _LOGGER.error("Failed to generate Ed25519 key pair: %s", exc)
+        return None, None, None, None, "keygen_failed"
+    token, metadata, error_key = await hass.async_add_executor_job(
+        _ssh_read_influx_bundle_with_password_worker,
+        host,
+        username,
+        password,
+    )
+    if error_key:
+        return None, None, None, None, error_key
+    return private_pem, public_openssh, token, metadata, None
+
+
+async def async_ssh_install_and_verify_key(
+    hass,
+    host: str,
+    username: str,
+    password: str,
+    private_key_pem: str,
+    public_key_line: str,
+    expected_token: str,
+) -> str | None:
+    """Install and verify a prepared key after token/org validation succeeds."""
+    return await hass.async_add_executor_job(
+        _ssh_install_and_verify_key_worker,
+        host,
+        username,
+        password,
+        private_key_pem,
+        public_key_line,
+        expected_token,
+    )
 
 
 async def async_ssh_fetch_token_with_key(

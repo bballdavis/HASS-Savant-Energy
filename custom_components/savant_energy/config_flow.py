@@ -52,7 +52,12 @@ from .const import (
 )
 from .influx_client import discover_circuit_metadata_with_backfill
 from .influx_org_resolver import InfluxOrgCandidate, async_discover_influx_org
-from .ssh_helper import InfluxHostMetadata, async_ssh_bootstrap
+from .ssh_helper import (
+    InfluxHostMetadata,
+    async_ssh_bootstrap,
+    async_ssh_install_and_verify_key,
+    async_ssh_prepare_bootstrap,
+)
 from .legacy.snapshot_data import fetch_current_energy_snapshot
 
 _LOGGER = logging.getLogger(__name__)
@@ -70,6 +75,48 @@ async def _async_safe_ssh_bootstrap(hass, host: str, username: str, password: st
                 trace = trace.replace(secret, "[redacted]")
         _LOGGER.error("SSH setup stage failed unexpectedly (setup_unexpected): %s", trace)
         return None, None, None, "setup_unexpected"
+
+
+async def _async_safe_ssh_prepare_bootstrap(hass, host: str, username: str, password: str):
+    """Read and prepare SSH credentials without mutating the host."""
+    try:
+        return await async_ssh_prepare_bootstrap(hass, host, username, password)
+    except Exception:
+        trace = traceback.format_exc()
+        for secret in (password, host, username):
+            if secret:
+                trace = trace.replace(secret, "[redacted]")
+        _LOGGER.error("SSH preparation failed unexpectedly (setup_unexpected): %s", trace)
+        return None, None, None, None, "setup_unexpected"
+
+
+async def _async_safe_ssh_install_and_verify_key(
+    hass,
+    host: str,
+    username: str,
+    password: str,
+    private_key: str,
+    public_key: str,
+    token: str,
+) -> str | None:
+    """Translate unexpected key-install errors without exposing credentials."""
+    try:
+        return await async_ssh_install_and_verify_key(
+            hass,
+            host,
+            username,
+            password,
+            private_key,
+            public_key,
+            token,
+        )
+    except Exception:
+        trace = traceback.format_exc()
+        for secret in (password, host, username, private_key, public_key, token):
+            if secret:
+                trace = trace.replace(secret, "[redacted]")
+        _LOGGER.error("SSH key installation failed unexpectedly (setup_unexpected): %s", trace)
+        return "setup_unexpected"
 
 
 def _auth_method_selector():
@@ -131,6 +178,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._pending = {}
         self._pending_org_candidates: dict[str, InfluxOrgCandidate] = {}
         self._pending_circuit_map_warnings: list[str] = []
+        self._pending_ssh_bootstrap: dict[str, str] | None = None
+        self._pending_ssh_error: str | None = None
 
     def _get_reconfigure_entry(self):
         return self.hass.config_entries.async_get_entry(self.context.get("entry_id"))
@@ -194,6 +243,40 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     def _remember_org_candidates(self, candidates: list[InfluxOrgCandidate]) -> None:
         self._pending_org_candidates = {_candidate_key(candidate): candidate for candidate in candidates}
+
+    def _remember_ssh_bootstrap(
+        self,
+        host: str,
+        password: str,
+        private_key: str,
+        public_key: str,
+        token: str,
+    ) -> None:
+        self._pending_ssh_bootstrap = {
+            "host": host,
+            "password": password,
+            "private_key": private_key,
+            "public_key": public_key,
+            "token": token,
+        }
+
+    async def _async_install_pending_ssh_key(self) -> str | None:
+        bootstrap = self._pending_ssh_bootstrap
+        if not bootstrap:
+            return None
+        error_key = await _async_safe_ssh_install_and_verify_key(
+            self.hass,
+            bootstrap["host"],
+            DEFAULT_SSH_USERNAME,
+            bootstrap["password"],
+            bootstrap["private_key"],
+            bootstrap["public_key"],
+            bootstrap["token"],
+        )
+        if error_key is None:
+            self._pending[CONF_SSH_PRIVATE_KEY] = bootstrap["private_key"]
+            self._pending_ssh_bootstrap = None
+        return error_key
 
     async def _async_discover_pending_org(
         self,
@@ -470,26 +553,46 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_current_ssh(self, user_input=None):
         """Current mode step 3b: SSH password (used once) to install key and fetch token."""
         errors = {}
+        if self._pending_ssh_error:
+            errors[CONF_SSH_PASSWORD] = self._pending_ssh_error
+            self._pending_ssh_error = None
         if user_input is not None:
             ssh_password = (user_input.get(CONF_SSH_PASSWORD) or "").strip()
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                private_key, token, metadata, error_key = await _async_safe_ssh_bootstrap(
+                private_key, public_key, token, metadata, error_key = await _async_safe_ssh_prepare_bootstrap(
                     self.hass, self._pending[CONF_HOST], DEFAULT_SSH_USERNAME, ssh_password
                 )
                 if error_key:
                     errors[CONF_SSH_PASSWORD] = error_key
                 else:
                     self._pending[CONF_INFLUX_TOKEN] = token
-                    self._pending[CONF_SSH_PRIVATE_KEY] = private_key
                     _, outcome = await self._async_safe_discover_pending_org(metadata)
                     if outcome is None:
                         circuit_error = await self._async_discover_pending_circuit_map()
                         if circuit_error is None:
-                            return await self._async_finish_current_setup()
-                        errors["base"] = circuit_error
-                    if outcome == "select":
+                            self._remember_ssh_bootstrap(
+                                self._pending[CONF_HOST],
+                                ssh_password,
+                                private_key,
+                                public_key,
+                                token,
+                            )
+                            install_error = await self._async_install_pending_ssh_key()
+                            if install_error is None:
+                                return await self._async_finish_current_setup()
+                            errors[CONF_SSH_PASSWORD] = install_error
+                        else:
+                            errors["base"] = circuit_error
+                    elif outcome == "select":
+                        self._remember_ssh_bootstrap(
+                            self._pending[CONF_HOST],
+                            ssh_password,
+                            private_key,
+                            public_key,
+                            token,
+                        )
                         return await self.async_step_current_org_select()
                     elif "base" not in errors:
                         errors["base"] = outcome
@@ -511,11 +614,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 candidate = self._pending_org_candidates[candidate_key]
                 self._pending[CONF_INFLUX_ORG] = candidate.org_id
                 self._pending[CONF_INFLUX_BUCKET] = candidate.selected_bucket or DEFAULT_INFLUX_BUCKET
-                self._pending_org_candidates = {}
                 circuit_error = await self._async_discover_pending_circuit_map()
                 if circuit_error is None:
-                    return await self._async_finish_current_setup()
-                errors["base"] = circuit_error
+                    install_error = await self._async_install_pending_ssh_key()
+                    if install_error is None:
+                        self._pending_org_candidates = {}
+                        return await self._async_finish_current_setup()
+                    self._pending_ssh_error = install_error
+                    return await self.async_step_current_ssh()
+                else:
+                    errors["base"] = circuit_error
 
         return self.async_show_form(
             step_id="current_org_select",
@@ -745,26 +853,46 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Reconfigure current step 3b: SSH password (used once) to install key and fetch token."""
         config_entry = self._get_reconfigure_entry()
         errors = {}
+        if self._pending_ssh_error:
+            errors[CONF_SSH_PASSWORD] = self._pending_ssh_error
+            self._pending_ssh_error = None
         if user_input is not None:
             ssh_password = (user_input.get(CONF_SSH_PASSWORD) or "").strip()
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
-                private_key, token, metadata, error_key = await _async_safe_ssh_bootstrap(
+                private_key, public_key, token, metadata, error_key = await _async_safe_ssh_prepare_bootstrap(
                     self.hass, self._pending[CONF_HOST], DEFAULT_SSH_USERNAME, ssh_password
                 )
                 if error_key:
                     errors[CONF_SSH_PASSWORD] = error_key
                 else:
                     self._pending[CONF_INFLUX_TOKEN] = token
-                    self._pending[CONF_SSH_PRIVATE_KEY] = private_key
                     _, outcome = await self._async_safe_discover_pending_org(metadata)
                     if outcome is None:
                         circuit_error = await self._async_discover_pending_circuit_map()
                         if circuit_error is None:
-                            return await self._async_finish_current_reconfigure(config_entry)
-                        errors["base"] = circuit_error
-                    if outcome == "select":
+                            self._remember_ssh_bootstrap(
+                                self._pending[CONF_HOST],
+                                ssh_password,
+                                private_key,
+                                public_key,
+                                token,
+                            )
+                            install_error = await self._async_install_pending_ssh_key()
+                            if install_error is None:
+                                return await self._async_finish_current_reconfigure(config_entry)
+                            errors[CONF_SSH_PASSWORD] = install_error
+                        else:
+                            errors["base"] = circuit_error
+                    elif outcome == "select":
+                        self._remember_ssh_bootstrap(
+                            self._pending[CONF_HOST],
+                            ssh_password,
+                            private_key,
+                            public_key,
+                            token,
+                        )
                         return await self.async_step_reconfigure_org_select()
                     elif "base" not in errors:
                         errors["base"] = outcome
@@ -787,11 +915,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 candidate = self._pending_org_candidates[candidate_key]
                 self._pending[CONF_INFLUX_ORG] = candidate.org_id
                 self._pending[CONF_INFLUX_BUCKET] = candidate.selected_bucket or DEFAULT_INFLUX_BUCKET
-                self._pending_org_candidates = {}
                 circuit_error = await self._async_discover_pending_circuit_map()
                 if circuit_error is None:
-                    return await self._async_finish_current_reconfigure(config_entry)
-                errors["base"] = circuit_error
+                    install_error = await self._async_install_pending_ssh_key()
+                    if install_error is None:
+                        self._pending_org_candidates = {}
+                        return await self._async_finish_current_reconfigure(config_entry)
+                    self._pending_ssh_error = install_error
+                    return await self.async_step_reconfigure_ssh()
+                else:
+                    errors["base"] = circuit_error
 
         return self.async_show_form(
             step_id="reconfigure_org_select",
@@ -914,7 +1047,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 if not host:
                     errors[CONF_SSH_PASSWORD] = "host_not_available"
                 else:
-                    private_key, token, metadata, error_key = await _async_safe_ssh_bootstrap(
+                    private_key, public_key, token, metadata, error_key = await _async_safe_ssh_prepare_bootstrap(
                         self.hass, host, DEFAULT_SSH_USERNAME, ssh_password
                     )
                     if error_key:
@@ -957,6 +1090,22 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                                 else (result.error_key or "org_discovery_failed")
                             )
                         else:
+                            install_error = await _async_safe_ssh_install_and_verify_key(
+                                self.hass,
+                                host,
+                                DEFAULT_SSH_USERNAME,
+                                ssh_password,
+                                private_key,
+                                public_key,
+                                token,
+                            )
+                            if install_error:
+                                errors[CONF_SSH_PASSWORD] = install_error
+                                return self.async_show_form(
+                                    step_id="reprovision_ssh",
+                                    data_schema=vol.Schema({vol.Required(CONF_SSH_PASSWORD): str}),
+                                    errors=errors,
+                                )
                             data = dict(self.config_entry.data)
                             data[CONF_INFLUX_TOKEN] = token
                             data[CONF_SSH_PRIVATE_KEY] = private_key
