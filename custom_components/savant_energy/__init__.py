@@ -405,6 +405,9 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                     discovery.selected_org_id,
                     sem_host=self.sem_host,
                     influx_bucket=discovery.selected_bucket or DEFAULT_INFLUX_BUCKET,
+                    host_load_identifiers=(
+                        candidate.metadata.load_identifiers if candidate.metadata else ()
+                    ),
                 )
                 if not (circuit_result.success and circuit_result.circuit_map):
                     continue

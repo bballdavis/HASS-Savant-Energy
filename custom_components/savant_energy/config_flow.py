@@ -148,6 +148,57 @@ def _candidate_options(candidates: dict[str, InfluxOrgCandidate]) -> dict[str, s
     return {candidate_key: candidate.summary for candidate_key, candidate in candidates.items()}
 
 
+def _merge_circuit_maps_by_stable_identity(
+    existing_map: dict[str, dict[str, Any]],
+    discovered_map: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Merge refreshed metadata without replacing stable persisted identities."""
+    merged = {key: dict(value) for key, value in existing_map.items()}
+    existing_keys_by_uuid: dict[str, list[str]] = {}
+    for key, metadata in existing_map.items():
+        savant_uuid = str(metadata.get("savant_uuid") or "").strip()
+        if savant_uuid:
+            existing_keys_by_uuid.setdefault(savant_uuid, []).append(key)
+    discovered_counts_by_uuid: dict[str, int] = {}
+    for metadata in discovered_map.values():
+        savant_uuid = str(metadata.get("savant_uuid") or "").strip()
+        if savant_uuid:
+            discovered_counts_by_uuid[savant_uuid] = discovered_counts_by_uuid.get(savant_uuid, 0) + 1
+    equivalent_uuids = {
+        savant_uuid
+        for savant_uuid, keys in existing_keys_by_uuid.items()
+        if len(keys) == 1 and discovered_counts_by_uuid.get(savant_uuid) == 1
+    }
+    discovered_keys: set[str] = set()
+
+    for discovered_key, discovered in discovered_map.items():
+        refreshed = dict(discovered)
+        savant_uuid = str(refreshed.get("savant_uuid") or "").strip()
+        discovered_keys.add(discovered_key)
+        target_key = discovered_key
+        if target_key not in merged and savant_uuid in equivalent_uuids:
+            target_key = existing_keys_by_uuid[savant_uuid][0]
+        previous = merged.get(target_key, {})
+        merged[target_key] = {**previous, **refreshed}
+        if "circuit_key" in previous or "circuit_key" in refreshed:
+            merged[target_key]["circuit_key"] = target_key
+        # Internal channel/key shape can differ between a historical detailed
+        # Influx row and host state channel. Preserve the established entity
+        # identity fields whenever the UUID proves these are the same circuit.
+        if previous and target_key != discovered_key:
+            for field in ("channel", "legacy_uid", "legacy_base_uid"):
+                if previous.get(field) not in (None, ""):
+                    merged[target_key][field] = previous[field]
+
+    missing_existing = [
+        key
+        for key, metadata in existing_map.items()
+        if key not in discovered_keys
+        and str(metadata.get("savant_uuid") or "").strip() not in equivalent_uuids
+    ]
+    return merged, sorted(missing_existing)
+
+
 def _candidate_key(candidate: InfluxOrgCandidate) -> str:
     """Return a stable selector value that keeps same-org buckets distinct."""
     return f"{candidate.org_id}::{candidate.selected_bucket or DEFAULT_INFLUX_BUCKET}"
@@ -180,6 +231,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._pending_circuit_map_warnings: list[str] = []
         self._pending_ssh_bootstrap: dict[str, str] | None = None
         self._pending_ssh_error: str | None = None
+        self._pending_host_metadata: InfluxHostMetadata | None = None
 
     def _get_reconfigure_entry(self):
         return self.hass.config_entries.async_get_entry(self.context.get("entry_id"))
@@ -251,6 +303,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         private_key: str,
         public_key: str,
         token: str,
+        host_metadata: InfluxHostMetadata | None = None,
     ) -> None:
         self._pending_ssh_bootstrap = {
             "host": host,
@@ -259,6 +312,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             "public_key": public_key,
             "token": token,
         }
+        self._pending_host_metadata = host_metadata
 
     async def _async_install_pending_ssh_key(self) -> str | None:
         bootstrap = self._pending_ssh_bootstrap
@@ -285,6 +339,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._pending_org_candidates = {}
         self._pending_ssh_bootstrap = None
         self._pending_ssh_error = None
+        self._pending_host_metadata = None
         self._pending[CONF_INFLUX_AUTH_METHOD] = AUTH_INFLUX_SSH
 
     async def _async_discover_pending_org(
@@ -354,8 +409,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             key: self._pending.get(key)
             for key in (CONF_INFLUX_TOKEN, CONF_INFLUX_ORG, CONF_INFLUX_BUCKET, CONF_CIRCUIT_MAP)
         }
+        original_host_metadata = self._pending_host_metadata
         last_error = "ssh_token_empty"
         for candidate in candidates:
+            self._pending_host_metadata = candidate.metadata
             self._pending[CONF_INFLUX_TOKEN] = candidate.token
             for key in (CONF_INFLUX_ORG, CONF_INFLUX_BUCKET, CONF_CIRCUIT_MAP):
                 self._pending.pop(key, None)
@@ -376,6 +433,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._pending.pop(key, None)
             else:
                 self._pending[key] = value
+        self._pending_host_metadata = original_host_metadata
         return None, last_error
 
     def _resolve_pending_influx_url(self) -> str:
@@ -391,7 +449,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return current_url
         return _derive_influx_url(host_ip)
 
-    async def _async_discover_pending_circuit_map(self) -> str | None:
+    async def _async_discover_pending_circuit_map(
+        self, host_metadata: InfluxHostMetadata | None = None
+    ) -> str | None:
         """Resolve the persisted circuit map for the pending current-mode config."""
         self._pending_circuit_map_warnings = []
         try:
@@ -401,6 +461,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 self._pending[CONF_INFLUX_ORG],
                 sem_host=self._pending[CONF_ADDRESS],
                 influx_bucket=self._pending.get(CONF_INFLUX_BUCKET, DEFAULT_INFLUX_BUCKET),
+                host_load_identifiers=(
+                    host_metadata or self._pending_host_metadata or InfluxHostMetadata()
+                ).load_identifiers,
             )
         except Exception:
             trace = traceback.format_exc()
@@ -413,23 +476,22 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             warnings = list(result.warnings or [])
             entry = self._get_reconfigure_entry() if self.context.get("entry_id") else None
             existing_map = dict((entry.data if entry else {}).get(CONF_CIRCUIT_MAP, {}) or {})
-            discovered_keys = set(result.circuit_map)
-            missing_existing_keys = sorted(set(existing_map) - discovered_keys)
+            merged_map, missing_existing_keys = _merge_circuit_maps_by_stable_identity(
+                existing_map, result.circuit_map
+            )
+            self._pending[CONF_CIRCUIT_MAP] = merged_map
             if missing_existing_keys:
                 # A partial reconfigure response cannot prove that an already
-                # mapped circuit was removed. Preserve the complete stored
-                # identity map instead of replacing it with a smaller map.
-                self._pending[CONF_CIRCUIT_MAP] = existing_map
+                # mapped circuit was removed. Preserve it while still accepting
+                # newly discovered stable identities and refreshed metadata.
                 warnings.append(
-                    "Circuit inventory was incomplete; preserved the existing circuit map "
+                    "Circuit inventory was incomplete; preserved existing stable identities "
                     f"({len(missing_existing_keys)} stored circuit(s) were absent from discovery)."
                 )
                 _LOGGER.warning(
                     "Reconfigure discovery omitted %d stored circuit(s); preserving existing map",
                     len(missing_existing_keys),
                 )
-            else:
-                self._pending[CONF_CIRCUIT_MAP] = result.circuit_map
             self._pending_circuit_map_warnings = warnings
             return None
         _LOGGER.warning(
@@ -602,6 +664,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             private_key,
                             public_key,
                             selected.token,
+                            selected.metadata,
                         )
                         install_error = await self._async_install_pending_ssh_key()
                         if install_error is None:
@@ -614,6 +677,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             private_key,
                             public_key,
                             selected.token,
+                            selected.metadata,
                         )
                         return await self.async_step_current_org_select()
                     elif "base" not in errors:
@@ -832,6 +896,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             private_key,
                             public_key,
                             selected.token,
+                            selected.metadata,
                         )
                         install_error = await self._async_install_pending_ssh_key()
                         if install_error is None:
@@ -844,6 +909,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             private_key,
                             public_key,
                             selected.token,
+                            selected.metadata,
                         )
                         return await self.async_step_reconfigure_org_select()
                     elif "base" not in errors:
@@ -1011,6 +1077,11 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                                 url, candidate_token.token, candidate_org,
                                 sem_host=self.config_entry.data.get(CONF_ADDRESS, ""),
                                 influx_bucket=candidate_bucket or DEFAULT_INFLUX_BUCKET,
+                                host_load_identifiers=(
+                                    candidate_token.metadata.load_identifiers
+                                    if candidate_token.metadata
+                                    else ()
+                                ),
                             )
                             if circuit_result.success and circuit_result.circuit_map:
                                 selected, chosen_org, chosen_bucket = candidate_token, candidate_org, candidate_bucket

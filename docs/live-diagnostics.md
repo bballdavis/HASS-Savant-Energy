@@ -12,6 +12,8 @@ python .\tools\live-savant-influx-diagnostic.py
 
 The probe retrieves the current Influx read token over SSH without printing it, queries the configured bucket over several windows, inventories all recent power series, and runs the integration's actual discovery and snapshot shaping code against the response.
 
+Identity diagnostics also read `loadIdentifiers.json` from the host. A healthy relay inventory has unique Savant UUIDs and unique SEM/BLE UIDs; display names are not counted as identity.
+
 Review these report sections:
 
 - `integration_discovery`: named circuits the current query can identify and persist.
@@ -47,3 +49,5 @@ A release is live-verified only when all of the following are true:
 6. Missing source fields such as current or voltage remain unavailable; they are not synthesized as zero.
 
 Relay identity and relay telemetry are separate capabilities. Preserving a stored relay map keeps controls and entity identity safe, but it cannot create measurement data that the current Savant firmware no longer publishes.
+
+When the raw `localHub` bucket has short retention, use the host's downsample buckets to locate historical telemetry cutoffs. A simultaneous last-nonzero timestamp across many independent circuits is source-side evidence, not a Home Assistant name/UUID mapping failure.

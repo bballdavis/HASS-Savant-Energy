@@ -301,6 +301,53 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.circuit_map["50338B0B8E28007A::0"]["source_uid"], "50338B0B8E28007A")
         self.assertEqual(result.circuit_map["50338B0B8E28007A::0"]["legacy_base_uid"], "50338B0B8E28007A")
 
+    async def test_discovery_seeds_stable_relay_identity_from_host_inventory(self):
+        module = _load_influx_client_module()
+        circuit_text = _named_uuidless_ct_csv()
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            return True, circuit_text, "", False, False
+
+        host_identifiers = (
+            {
+                "name": "Dining Room",
+                "savant_uuid": "UUID-DINING",
+                "relay_uid": "001AAE173FBA",
+                "state_channel": "16",
+            },
+        )
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux), mock.patch.object(
+            module,
+            "fetch_sem_devices_from_sem",
+            new=mock.AsyncMock(
+                return_value=(
+                    True,
+                    [
+                        {
+                            "uid": "001AAE173FBA",
+                            "device_label": "Dining Room",
+                            "load_name": "Dining Room",
+                        }
+                    ],
+                )
+            ),
+        ):
+            result = await module.discover_circuit_metadata(
+                "http://example",
+                "token",
+                "org-1",
+                sem_host="sem-host",
+                host_load_identifiers=host_identifiers,
+            )
+
+        self.assertTrue(result.success)
+        assert result.circuit_map is not None
+        relay = result.circuit_map["UUID-DINING::16"]
+        self.assertEqual(relay["savant_uuid"], "UUID-DINING")
+        self.assertEqual(relay["relay_uid"], "001AAE173FBA")
+        self.assertEqual(relay["legacy_uid"], "001AAE173FBA.0")
+        self.assertEqual(relay["role_source"], "host_load_identifier")
+
     async def test_discover_circuit_metadata_uses_alias_match_for_relays(self):
         module = _load_influx_client_module()
         circuit_text = _single_circuit_csv(name="Patio Kitchen")

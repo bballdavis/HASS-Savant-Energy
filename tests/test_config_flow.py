@@ -343,6 +343,52 @@ class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(flow._pending[module.CONF_CIRCUIT_MAP], existing_map)
         self.assertTrue(any("incomplete" in warning.lower() for warning in flow._pending_circuit_map_warnings))
 
+    def test_circuit_map_merge_reconciles_alternate_key_by_savant_uuid(self):
+        module = _load_config_flow_module()
+        existing = {
+            "UUID-DINING::7": {
+                "circuit_key": "UUID-DINING::7",
+                "savant_uuid": "UUID-DINING",
+                "channel": "7",
+                "legacy_uid": "001AAE173FBA.0",
+                "legacy_base_uid": "001AAE173FBA",
+                "display_name": "Old Dining",
+            }
+        }
+        discovered = {
+            "UUID-DINING::16": {
+                "circuit_key": "UUID-DINING::16",
+                "savant_uuid": "UUID-DINING",
+                "channel": "16",
+                "legacy_uid": "001AAE173FBA.0",
+                "legacy_base_uid": "001AAE173FBA",
+                "display_name": "Dining Room",
+            },
+            "MEASUREMENT::0": {"circuit_key": "MEASUREMENT::0", "source_uid": "MEASUREMENT"},
+        }
+
+        merged, missing = module._merge_circuit_maps_by_stable_identity(existing, discovered)
+
+        self.assertEqual(missing, [])
+        self.assertEqual(set(merged), {"UUID-DINING::7", "MEASUREMENT::0"})
+        self.assertEqual(merged["UUID-DINING::7"]["display_name"], "Dining Room")
+        self.assertEqual(merged["UUID-DINING::7"]["channel"], "7")
+
+    def test_circuit_map_merge_does_not_collapse_multi_leg_uuid(self):
+        module = _load_config_flow_module()
+        existing = {
+            "UUID-CT::1": {"circuit_key": "UUID-CT::1", "savant_uuid": "UUID-CT"},
+            "UUID-CT::2": {"circuit_key": "UUID-CT::2", "savant_uuid": "UUID-CT"},
+        }
+        discovered = {
+            "UUID-CT::3": {"circuit_key": "UUID-CT::3", "savant_uuid": "UUID-CT"},
+        }
+
+        merged, missing = module._merge_circuit_maps_by_stable_identity(existing, discovered)
+
+        self.assertEqual(set(merged), {"UUID-CT::1", "UUID-CT::2", "UUID-CT::3"})
+        self.assertEqual(missing, ["UUID-CT::1", "UUID-CT::2"])
+
     async def test_ssh_candidate_selection_skips_stale_primary_for_valid_alternate(self):
         module = _load_config_flow_module()
         flow = module.ConfigFlow()

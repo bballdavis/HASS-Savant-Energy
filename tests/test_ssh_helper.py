@@ -136,6 +136,33 @@ def _load_ssh_helper_module():
 
 
 class SshHelperTests(unittest.TestCase):
+    def test_parse_load_identifiers_recovers_known_empty_channels_field(self):
+        module = _load_ssh_helper_module()
+        text = """[
+          {"name":"Dining Room","stateName":"House.CurrentDimmerLevel_16_001","bleAddress":"001AAE173FBA","uuid":"UUID-DINING"},
+          {"name":"Tesla","channels": ,"uuid":"UUID-TESLA"}
+        ]"""
+
+        records = module._parse_load_identifiers(text)
+
+        self.assertEqual(
+            records,
+            (
+                {
+                    "name": "Dining Room",
+                    "savant_uuid": "UUID-DINING",
+                    "relay_uid": "001AAE173FBA",
+                    "state_channel": "16",
+                },
+                {
+                    "name": "Tesla",
+                    "savant_uuid": "UUID-TESLA",
+                    "relay_uid": "",
+                    "state_channel": "",
+                },
+            ),
+        )
+
     def test_build_influx_host_metadata_parses_real_host_shape(self):
         module = _load_ssh_helper_module()
 

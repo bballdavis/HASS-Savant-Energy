@@ -35,7 +35,7 @@ Auto mode starts with the PBC IP and probes the legacy activity feed.
 2. If the legacy feed is unavailable, the flow asks for the Savant host IP and current-mode credentials.
 3. The flow retrieves and validates an InfluxDB read token through SSH bootstrap.
 4. The flow discovers the correct Influx organization by checking host metadata, buckets, and the organization list.
-5. The flow discovers the circuit map, including relay matches and CT classifications.
+5. The flow reads Savant's host identity inventory and discovers the circuit map, including relay matches and CT classifications.
 6. The current-mode entry is created with the validated token, organization, circuit map, and generated SSH key.
 
 If multiple organizations contain plausible Savant data, the flow shows a selection form instead of guessing.
@@ -50,7 +50,7 @@ During SSH token bootstrap, the integration:
 2. Connects to the Savant host as `RPM` with the supplied password.
 3. Adds the public key to the host's authorized keys file idempotently.
 4. Reads the InfluxDB token from the current Savant status file.
-5. Reads available organization and bucket metadata from the host.
+5. Reads available organization, bucket, and stable load-identity metadata from the host.
 6. Stores the private key and token in the Home Assistant config entry.
 
 The password is used only for bootstrap and is not persisted. The stored private key can later refresh the token after a 401 response without asking for the password again.
@@ -77,17 +77,25 @@ The resolver treats authentication failures, empty organization lists, missing d
 
 ## Circuit discovery and identity
 
-Current-mode circuit data is queried from InfluxDB using the Savant UUID and channel. The resulting circuit map is persisted in the config entry so runtime polling does not have to rediscover relay identity on every update.
+Current-mode identity is read from the Savant host's `loadIdentifiers.json`, which directly binds each Savant UUID to its SEM/BLE UID and state channel. `energyUUIDs.plist` provides a secondary name-to-UUID inventory. Current-mode telemetry is queried from InfluxDB. The resulting circuit map is persisted in the config entry so runtime polling does not have to rediscover relay identity on every update.
+
+The identity hierarchy is deliberate:
+
+1. Savant UUID is the persistent circuit identity.
+2. SEM/BLE UID is the persistent physical relay/control identity and preserves Home Assistant entity continuity.
+3. `Energy.Circuit.<label>` is only a telemetry routing alias when the aggregate Influx row omits UUID tags.
+4. Load and display names are presentation/correlation metadata, never entity keys.
 
 Named type-`007A` CT rows are also accepted when Savant omits `savantUUID`. Stored Savant UUIDs always remain authoritative and are never replaced by a name or measurement id. A genuinely UUID-less CT keeps `savant_uuid` empty and uses a separate `source_uid` built from the stable Influx measurement id plus channel. Unnamed CT inputs are excluded because a channel number alone is not enough to create a safe, useful user-facing identity.
 
 For relay mapping, the integration combines:
 
+- the direct UUID-to-SEM UID records in `loadIdentifiers.json`
 - InfluxDB circuit names, UUIDs, channels, classifications, and device types
 - SEM companion device labels, load names, and legacy UIDs
 - PBC inventory data when the companion response is incomplete
 
-Relay matches are case-insensitive and preserve the legacy UID needed by the command path. A circuit that cannot be matched confidently is kept as a read-only CT sensor and a reconfigure warning is surfaced instead of assigning an unsafe relay target.
+Direct host UUID-to-SEM UID records take precedence over name matching. Name matching remains a bounded telemetry-alias fallback and preserves the legacy UID needed by the command path. A circuit that cannot be matched confidently is kept as a read-only CT sensor and a reconfigure warning is surfaced instead of assigning an unsafe relay target.
 
 ## Runtime polling and recovery
 
@@ -160,6 +168,16 @@ The token may be in either of these locations, depending on SavantOS packaging:
 ```
 
 Check both layouts and bounded `find` results by path and size only. The adjacent `.influxsetup` and `.influxtoken` files can identify the organization and bucket. Do not print token contents. `influxd` is the server daemon, not the optional `influx` CLI, so an `influxd` invocation or missing CLI does not validate a token. Candidate tokens are validated end-to-end against Savant data before setup or reconfigure persists one.
+
+Stable load identity is stored beside the Influx status directory:
+
+```text
+/data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/loadIdentifiers.json
+/data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/energyUUIDs.plist
+/data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/energyLoadSnapshots.json
+```
+
+`loadIdentifiers.json` is authoritative for UUID-to-SEM/BLE UID correlation. Some hosts emit a malformed empty optional `channels` value for a CT-only load; the parser repairs only that known empty value and otherwise rejects malformed data. `energyUUIDs.plist` validates the label-to-UUID inventory, while `energyLoadSnapshots.json` demonstrates that Savant state records reference UUIDs directly.
 
 SSH refresh is staged as password connection, home/path resolution, append-and-reread of the managed `authorized_keys` suffix, public-key authentication, and token validation. On failure, rollback removes only the exact appended byte suffix when it is still at the end of the file. A concurrent change is left untouched and reported as a rollback conflict. A wider historical query supplies identity inventory only; it is never used as a live measurement source. Partial inventory must not replace the stored map or trigger entity/device cleanup.
 

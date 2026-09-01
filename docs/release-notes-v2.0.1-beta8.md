@@ -13,6 +13,8 @@ The same host also publishes named type-`007A` CT rows without `savantUUID`. The
 ## Changes
 
 - Preserve every stored/source Savant UUID as authoritative; names are matching aliases only and never entity identity.
+- Read Savant's `loadIdentifiers.json` during SSH discovery to recover the direct UUID-to-SEM/BLE UID mapping even when detailed Influx relay rows are absent.
+- Merge reconfigure results by stable Savant UUID, preserving established entity/channel identity while accepting refreshed metadata and newly discovered CTs.
 - Include named type-`007A` CT rows that genuinely omit `savantUUID`, keeping `savant_uuid` empty and using a separate stable measurement-derived `source_uid` plus channel.
 - Ignore unnamed CT inputs instead of inventing user-facing identities for spare/noisy channels.
 - Publish newly discovered known CT rows as read-only measurements immediately while still requesting reconfigure so the identity can be persisted.
@@ -26,7 +28,9 @@ The same host also publishes named type-`007A` CT rows without `savantUUID`. The
 - Direct SSH token retrieval and Influx queries succeeded without printing credentials.
 - Direct discovery found both legs of each named CT load, including the UUID-less Main Feed rows.
 - The production shaping function returned the expected aggregate and leg entities and excluded the zero-filled relay placeholders.
-- The complete automated suite passed: 77 tests.
+- Live read-only discovery reconstructed all 28 relays with both their original Savant UUID and SEM UID, with no duplicate identities or warnings.
+- Historical downsample data showed 28 relay/load series stopped producing nonzero values simultaneously at 2026-08-23 05:30 UTC; current raw Influx data already contains the zero placeholders before Home Assistant reads it.
+- The complete automated suite passed: 81 tests.
 - Python compilation and `git diff --check` passed.
 
 ## Installed verification required

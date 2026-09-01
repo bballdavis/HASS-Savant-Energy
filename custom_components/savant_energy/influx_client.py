@@ -1793,6 +1793,7 @@ async def discover_circuit_metadata(
     pbc_websocket_port: int = 8480,
     range_start: str = "-2m",
     influx_bucket: str = DEFAULT_INFLUX_BUCKET,
+    host_load_identifiers: tuple[dict[str, str], ...] = (),
 ) -> CircuitDiscoveryResult:
     """Resolve relay/CT identity once during setup or reconfigure."""
     try:
@@ -1984,6 +1985,51 @@ async def discover_circuit_metadata(
             }
         )
 
+    # The raw localHub bucket retains only seven days and may temporarily stop
+    # publishing detailed relay rows. Savant's loadIdentifiers.json is the
+    # authoritative identity bridge: UUID -> BLE/SEM UID -> state channel.
+    # Seed omitted relays without synthesizing a UUID from a mutable name.
+    sem_by_uid = {str(device.get("uid") or "").strip(): device for device in sem_devices}
+    mapped_savant_uuids = {
+        str(metadata.get("savant_uuid") or "").strip()
+        for metadata in circuit_map.values()
+        if metadata.get("savant_uuid")
+    }
+    for identifier in host_load_identifiers:
+        savant_uuid = str(identifier.get("savant_uuid") or "").strip()
+        relay_uid = str(identifier.get("relay_uid") or "").strip()
+        channel = str(identifier.get("state_channel") or "").strip()
+        if not savant_uuid or not relay_uid or savant_uuid in mapped_savant_uuids:
+            continue
+        matched_device = sem_by_uid.get(relay_uid)
+        if matched_device is None:
+            warnings.append(
+                f"Host identity {savant_uuid} references relay {relay_uid}, which is absent from current SEM inventory."
+            )
+            continue
+        circuit_key = build_circuit_key(savant_uuid, channel or "0")
+        circuit = {
+            "savantUUID": savant_uuid,
+            "source_uid": savant_uuid,
+            "channel": channel or "0",
+            "name": str(identifier.get("name") or "").strip(),
+            "classification": "consumer",
+            "type": "host_load_identifier",
+        }
+        circuit_map[circuit_key] = _build_circuit_metadata_entry(
+            circuit_key=circuit_key,
+            circuit=circuit,
+            role="relay",
+            role_source="host_load_identifier",
+            matched_device=matched_device,
+            match_source="uid",
+        )
+        # The host label is a telemetry alias only. Identity stays on UUID/UID.
+        circuit_map[circuit_key]["influx_name"] = circuit["name"]
+        circuit_map[circuit_key]["relay_match_name"] = circuit["name"]
+        resolution_sources[circuit_key] = "host_load_identifier"
+        mapped_savant_uuids.add(savant_uuid)
+
     websocket_devices: list[dict[str, Any]] = []
     if unresolved_relay_candidates:
         ws_ok, websocket_devices = await fetch_pbc_websocket_devices(
@@ -2054,6 +2100,7 @@ async def discover_circuit_metadata_with_backfill(
     pbc_websocket_port: int = 8480,
     backfill_windows: tuple[str, ...] = _BACKFILL_WINDOWS,
     influx_bucket: str = DEFAULT_INFLUX_BUCKET,
+    host_load_identifiers: tuple[dict[str, str], ...] = (),
 ) -> CircuitDiscoveryResult:
     """Resolve the persisted circuit map, widening the lookback window before failing."""
     last_result: CircuitDiscoveryResult | None = None
@@ -2067,6 +2114,7 @@ async def discover_circuit_metadata_with_backfill(
             pbc_websocket_port=pbc_websocket_port,
             range_start=range_start,
             influx_bucket=influx_bucket,
+            host_load_identifiers=host_load_identifiers,
         )
         if result.success and result.circuit_map:
             return result

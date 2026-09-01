@@ -126,7 +126,7 @@ def _load_env(path: Path) -> dict[str, str]:
     return values
 
 
-def _read_host_credentials(env: dict[str, str]) -> tuple[str, list[object]]:
+def _read_host_credentials(env: dict[str, str]) -> tuple[str, list[object], str]:
     host = env["SAVANT_HOST"]
     user = env.get("SAVANT_SSH_USER", "RPM")
     password = env["SAVANT_SSH_PASSWORD"]
@@ -138,6 +138,7 @@ def _read_host_credentials(env: dict[str, str]) -> tuple[str, list[object]]:
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     ssh.connect(host, username=user, password=password, timeout=10, look_for_keys=False, allow_agent=False)
     metadata: list[object] = []
+    load_identifiers_text = ""
     try:
         sftp = ssh.open_sftp()
         with sftp.open(token_path, "r") as stream:
@@ -149,7 +150,13 @@ def _read_host_credentials(env: dict[str, str]) -> tuple[str, list[object]]:
                     metadata.append(json.loads(stream.read().decode("utf-8")))
             except (OSError, ValueError, TypeError):
                 continue
-        return token, metadata
+        try:
+            statusfiles_root = parent.rsplit("/", 1)[0]
+            with sftp.open(f"{statusfiles_root}/loadIdentifiers.json", "r") as stream:
+                load_identifiers_text = stream.read().decode("utf-8")
+        except OSError:
+            pass
+        return token, metadata, load_identifiers_text
     finally:
         ssh.close()
 
@@ -180,8 +187,10 @@ def _find_org(metadata: list[object]) -> str:
 
 def main() -> int:
     client = _load_module("savant_influx_client", ROOT / "custom_components" / "savant_energy" / "influx_client.py")
+    ssh_helper = _load_module("savant_ssh_helper", ROOT / "custom_components" / "savant_energy" / "ssh_helper.py")
     env = _load_env(ROOT / ".savant-local.env")
-    token, metadata = _read_host_credentials(env)
+    token, metadata, load_identifiers_text = _read_host_credentials(env)
+    load_identifiers = ssh_helper._parse_load_identifiers(load_identifiers_text)
     if not token:
         raise RuntimeError("Could not retrieve a usable Influx token.")
 
@@ -370,12 +379,14 @@ def main() -> int:
             sem_host=env.get("SAVANT_SEM_HOST", "192.168.1.108"),
             range_start="-2m",
             influx_bucket=bucket,
+            host_load_identifiers=load_identifiers,
         )
     )
     report["integration_discovery"] = {
         "success": discovery.success,
         "error_key": discovery.error_key,
         "query_window": discovery.query_window,
+        "host_identity_records": len(load_identifiers),
         "circuits": [
             {
                 "circuit_key": key,

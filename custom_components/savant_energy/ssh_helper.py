@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import posixpath
+import re
 import shlex
 from dataclasses import dataclass
 
@@ -26,6 +27,7 @@ _TOKEN_BUNDLE_PATH = (
     "/data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia"
     "/statusfiles/InfluxDB2/.influxtoken"
 )
+_LOAD_IDENTIFIERS_FILENAME = "loadIdentifiers.json"
 _RPM_HOME = "/data/RPM"
 _AUTH_KEYS_PATH = f"{_RPM_HOME}/.ssh/authorized_keys"
 
@@ -115,6 +117,7 @@ class InfluxHostMetadata:
     bucket_name: str | None = None
     auth_org_id: str | None = None
     source_files: tuple[str, ...] = ()
+    load_identifiers: tuple[dict[str, str], ...] = ()
 
 
 def _read_remote_text(client, path: str, *, required: bool = False) -> str:
@@ -207,10 +210,56 @@ def _read_influx_token_candidates(client) -> list[InfluxTokenCandidate]:
         metadata = _build_influx_host_metadata(
             _read_remote_text(client, setup_path), _read_remote_text(client, bundle_path)
         )
+        statusfiles_root = posixpath.dirname(posixpath.dirname(setup_path))
+        load_identifiers_path = posixpath.join(statusfiles_root, _LOAD_IDENTIFIERS_FILENAME)
+        load_identifiers = _parse_load_identifiers(_read_remote_text(client, load_identifiers_path))
+        if load_identifiers and metadata is None:
+            metadata = InfluxHostMetadata()
         if metadata:
-            metadata.source_files = (setup_path, bundle_path)
+            metadata.source_files = (setup_path, bundle_path, load_identifiers_path)
+            metadata.load_identifiers = load_identifiers
         result.append(InfluxTokenCandidate(resolution=resolution, metadata=metadata))
     return result
+
+
+def _parse_load_identifiers(text: str) -> tuple[dict[str, str], ...]:
+    """Parse Savant's stable UUID-to-relay inventory.
+
+    Some hosts emit an empty optional ``channels`` value for a CT-only load
+    (``"channels": ,``). Repair only that known malformed value; relay records
+    remain ordinary JSON and are otherwise rejected on parse failure.
+    """
+    if not text.strip():
+        return ()
+    repaired = re.sub(r'("channels"\s*:\s*),', r"\1null,", text)
+    try:
+        raw_records = json.loads(repaired)
+    except (TypeError, ValueError):
+        _LOGGER.warning("Savant loadIdentifiers.json could not be parsed")
+        return ()
+    if not isinstance(raw_records, list):
+        return ()
+
+    records: list[dict[str, str]] = []
+    seen_uuids: set[str] = set()
+    for raw in raw_records:
+        if not isinstance(raw, dict):
+            continue
+        savant_uuid = str(raw.get("uuid") or "").strip()
+        if not savant_uuid or savant_uuid in seen_uuids:
+            continue
+        state_name = str(raw.get("stateName") or "").strip()
+        channel_match = re.search(r"CurrentDimmerLevel_(\d+)_", state_name)
+        records.append(
+            {
+                "name": str(raw.get("name") or "").strip(),
+                "savant_uuid": savant_uuid,
+                "relay_uid": str(raw.get("bleAddress") or "").strip(),
+                "state_channel": channel_match.group(1) if channel_match else "",
+            }
+        )
+        seen_uuids.add(savant_uuid)
+    return tuple(records)
 
 
 def _metadata_paths(resolution: InfluxTokenResolution) -> tuple[str, str]:
