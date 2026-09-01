@@ -92,6 +92,108 @@ class _FakeServices:
 
 
 class CircuitMapNotificationTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _zero_power_snapshot(*powers, status=None):
+        return {
+            "presentDemands": [
+                {"role": "relay", "power": power} for power in powers
+            ] + [{"role": "ct_sensor", "power": 2400}],
+            "circuit_map_status": status or {
+                "inventory_status": "complete",
+                "inventory_authoritative": True,
+            },
+        }
+
+    async def _zero_power_coordinator(self, module):
+        coordinator = object.__new__(module.SavantEnergyCoordinator)
+        coordinator.hass = types.SimpleNamespace(services=_FakeServices())
+        coordinator._zero_relay_power_pending_since = None
+        coordinator._zero_relay_power_notification_active = False
+        coordinator._zero_relay_power_recovery_checked = False
+        return coordinator
+
+    async def test_zero_relay_power_debounces_dedupes_and_dismisses_on_recovery(self):
+        module = _load_integration_module()
+        coordinator = await self._zero_power_coordinator(module)
+        base = module.datetime(2026, 9, 1, 12, 0, 0)
+        snapshot = self._zero_power_snapshot(0, 1e-7)
+
+        await coordinator._async_handle_zero_relay_power(snapshot, "-2m", base)
+        self.assertEqual(coordinator.hass.services.calls, [])
+        await coordinator._async_handle_zero_relay_power(
+            snapshot, "-2m", base + module.timedelta(seconds=59)
+        )
+        self.assertEqual(coordinator.hass.services.calls, [])
+        await coordinator._async_handle_zero_relay_power(
+            snapshot, "-2m", base + module.timedelta(seconds=60)
+        )
+        await coordinator._async_handle_zero_relay_power(
+            snapshot, "-2m", base + module.timedelta(seconds=120)
+        )
+        self.assertEqual(len(coordinator.hass.services.calls), 1)
+        self.assertEqual(
+            coordinator.hass.services.calls[0][2]["notification_id"],
+            module.ZERO_RELAY_POWER_NOTIFICATION_ID,
+        )
+
+        recovered = self._zero_power_snapshot(0, 15)
+        await coordinator._async_handle_zero_relay_power(
+            recovered, "-2m", base + module.timedelta(seconds=121)
+        )
+        self.assertEqual(len(coordinator.hass.services.calls), 2)
+        self.assertEqual(coordinator.hass.services.calls[-1][1], "dismiss")
+
+    async def test_zero_relay_power_guards_reset_pending_without_dismiss(self):
+        module = _load_integration_module()
+        coordinator = await self._zero_power_coordinator(module)
+        base = module.datetime(2026, 9, 1, 12, 0, 0)
+        valid = self._zero_power_snapshot(0, 0)
+        await coordinator._async_handle_zero_relay_power(valid, "-2m", base)
+        coordinator._zero_relay_power_notification_active = True
+        guards = [
+            (valid, "-15m"),
+            (self._zero_power_snapshot(0, 0, status={"inventory_status": "partial", "inventory_authoritative": False}), "-2m"),
+            (self._zero_power_snapshot(0), "-2m"),
+            (self._zero_power_snapshot(0, None), "-2m"),
+        ]
+        for snapshot, window in guards:
+            await coordinator._async_handle_zero_relay_power(snapshot, window, base + module.timedelta(seconds=60))
+            self.assertIsNone(coordinator._zero_relay_power_pending_since)
+        self.assertEqual(coordinator.hass.services.calls, [])
+
+    async def test_zero_relay_power_nonzero_ct_does_not_mask_zero_relays(self):
+        module = _load_integration_module()
+        coordinator = await self._zero_power_coordinator(module)
+        base = module.datetime(2026, 9, 1, 12, 0, 0)
+        snapshot = self._zero_power_snapshot(0, 0)
+        await coordinator._async_handle_zero_relay_power(snapshot, "-2m", base)
+        await coordinator._async_handle_zero_relay_power(snapshot, "-2m", base + module.timedelta(seconds=60))
+        self.assertEqual(len(coordinator.hass.services.calls), 1)
+
+    async def test_zero_relay_power_reconfigure_inventory_never_alerts(self):
+        module = _load_integration_module()
+        coordinator = await self._zero_power_coordinator(module)
+        base = module.datetime(2026, 9, 1, 12, 0, 0)
+        for status in (
+            {"inventory_status": "complete", "inventory_authoritative": True, "reconfigure_required": True},
+            {"inventory_status": "complete", "inventory_authoritative": True, "unknown_circuit_keys": ["new"]},
+        ):
+            snapshot = self._zero_power_snapshot(0, 0, status=status)
+            await coordinator._async_handle_zero_relay_power(snapshot, "-2m", base)
+            await coordinator._async_handle_zero_relay_power(snapshot, "-2m", base + module.timedelta(seconds=60))
+        self.assertEqual(coordinator.hass.services.calls, [])
+
+    async def test_zero_relay_power_recovery_dismisses_once_after_reload(self):
+        module = _load_integration_module()
+        coordinator = await self._zero_power_coordinator(module)
+        base = module.datetime(2026, 9, 1, 12, 0, 0)
+        recovered = self._zero_power_snapshot(1, 2)
+        await coordinator._async_handle_zero_relay_power(recovered, "-2m", base)
+        await coordinator._async_handle_zero_relay_power(recovered, "-2m", base + module.timedelta(seconds=60))
+        self.assertEqual(len(coordinator.hass.services.calls), 1)
+        await coordinator._async_handle_zero_relay_power(recovered, "-2m", base + module.timedelta(seconds=120))
+        self.assertEqual(len(coordinator.hass.services.calls), 1)
+
     async def test_connection_state_is_unchanged_when_persist_raises(self):
         module = _load_integration_module()
         coordinator = object.__new__(module.SavantEnergyCoordinator)

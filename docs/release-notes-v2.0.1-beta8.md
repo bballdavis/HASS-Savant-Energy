@@ -13,6 +13,7 @@ The same host also publishes named type-`007A` CT rows without `savantUUID`. The
 ## Changes
 
 - Preserve every stored/source Savant UUID as authoritative; names are matching aliases only and never entity identity.
+- Detect a successful but stalled relay feed when every authoritative live relay power reading remains at zero for 60 seconds; create one persistent Home Assistant notification recommending a Savant host restart and dismiss it after measured recovery.
 - Read Savant's `loadIdentifiers.json` during SSH discovery to recover the direct UUID-to-SEM/BLE UID mapping even when detailed Influx relay rows are absent.
 - Merge reconfigure results by stable Savant UUID, preserving established entity/channel identity while accepting refreshed metadata and newly discovered CTs.
 - Include named type-`007A` CT rows that genuinely omit `savantUUID`, keeping `savant_uuid` empty and using a separate stable measurement-derived `source_uid` plus channel.
@@ -30,7 +31,8 @@ The same host also publishes named type-`007A` CT rows without `savantUUID`. The
 - The production shaping function returned the expected aggregate and leg entities and excluded the zero-filled relay placeholders.
 - Live read-only discovery reconstructed all 28 relays with both their original Savant UUID and SEM UID, with no duplicate identities or warnings.
 - Historical downsample data showed 28 relay/load series stopped producing nonzero values simultaneously at 2026-08-23 05:30 UTC; current raw Influx data already contains the zero placeholders before Home Assistant reads it.
-- The complete automated suite passed: 81 tests.
+- Restarting the Savant host restored 29 current circuit readings; all 29 were nonzero and changed across two direct samples, confirming the stalled acquisition pattern was host-side.
+- The complete automated suite passed: 86 tests.
 - Python compilation and `git diff --check` passed.
 
 ## Installed verification required

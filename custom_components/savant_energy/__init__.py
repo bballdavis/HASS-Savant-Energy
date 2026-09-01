@@ -6,6 +6,7 @@ InfluxDB 2 (data) and OLA/DMX (relay control).
 
 import copy
 import logging
+import math
 from datetime import timedelta, datetime
 import os
 from typing import Any
@@ -75,7 +76,9 @@ LEGACY_FEED_NOTIFICATION_ID = f"{DOMAIN}_legacy_feed_unavailable"
 INFLUX_ORG_NOTIFICATION_ID = f"{DOMAIN}_influx_org_selection_required"
 CIRCUIT_MAP_NOTIFICATION_ID = f"{DOMAIN}_circuit_map_reconfigure_required"
 INFLUX_TOKEN_NOTIFICATION_ID = f"{DOMAIN}_influx_token_reconfigure_required"
+ZERO_RELAY_POWER_NOTIFICATION_ID = f"{DOMAIN}_zero_relay_power_restart_required"
 _BACKFILL_WINDOWS = ("-2m", "-15m", "-24h", "-7d")
+_ZERO_RELAY_POWER_DEBOUNCE = timedelta(seconds=60)
 _UNSET = object()
 
 
@@ -115,6 +118,9 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self._circuit_map_mismatch_fingerprint: tuple[tuple[str, ...], tuple[str, ...]] | None = None
         self._circuit_map_status_initialized = False
         self._influx_token_notification_active = False
+        self._zero_relay_power_pending_since: datetime | None = None
+        self._zero_relay_power_notification_active = False
+        self._zero_relay_power_recovery_checked = False
         self.energy_scale_state: dict[str, dict] = {}
 
         self.ssh_private_key = entry.data.get(CONF_SSH_PRIVATE_KEY, "")
@@ -302,6 +308,84 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             blocking=True,
         )
         self._influx_token_notification_active = False
+
+    async def _async_notify_zero_relay_power_restart_required(self) -> None:
+        """Tell the user when live relay measurements remain at zero."""
+        if self._zero_relay_power_notification_active:
+            return
+        await self.hass.services.async_call(
+            "persistent_notification", "create",
+            {
+                "title": "Savant Energy Host May Need a Restart",
+                "message": (
+                    "Savant Energy is connected to InfluxDB, but all relay circuit power "
+                    "readings have remained at zero for at least 60 seconds. The Savant "
+                    "host likely needs to be restarted. After restarting it, wait roughly "
+                    "two minutes for InfluxDB to start writing readings again."
+                ),
+                "notification_id": ZERO_RELAY_POWER_NOTIFICATION_ID,
+            }, blocking=True,
+        )
+        self._zero_relay_power_notification_active = True
+
+    async def _async_dismiss_zero_relay_power_notification(self, force: bool = False) -> None:
+        """Dismiss the zero-relay-power notification after measured recovery."""
+        if not self._zero_relay_power_notification_active and not force:
+            return
+        await self.hass.services.async_call(
+            "persistent_notification", "dismiss",
+            {"notification_id": ZERO_RELAY_POWER_NOTIFICATION_ID}, blocking=True,
+        )
+        self._zero_relay_power_notification_active = False
+
+    async def _async_handle_zero_relay_power(
+        self, snapshot_data: dict[str, Any], query_window: str | None,
+        observed_at: datetime | None = None,
+    ) -> None:
+        """Debounce an authoritative live all-zero relay snapshot."""
+        status = snapshot_data.get("circuit_map_status") or {}
+        if (
+            query_window != _BACKFILL_WINDOWS[0]
+            or status.get("inventory_status") != "complete"
+            or status.get("inventory_authoritative") is not True
+            or status.get("reconfigure_required") is True
+            or bool(status.get("unknown_circuit_keys"))
+        ):
+            self._zero_relay_power_pending_since = None
+            return
+        demands = snapshot_data.get("presentDemands")
+        if not isinstance(demands, list):
+            self._zero_relay_power_pending_since = None
+            return
+        relays = [
+            demand for demand in demands
+            if isinstance(demand, dict)
+            and str(demand.get("role", "")).strip().lower() == "relay"
+        ]
+        powers: list[float] = []
+        for relay in relays:
+            power = relay.get("power")
+            if (isinstance(power, bool) or not isinstance(power, (int, float))
+                    or not math.isfinite(float(power))):
+                self._zero_relay_power_pending_since = None
+                return
+            powers.append(float(power))
+        if len(powers) < 2:
+            self._zero_relay_power_pending_since = None
+            return
+        now = observed_at or datetime.now()
+        if any(abs(power) > 1e-6 for power in powers):
+            self._zero_relay_power_pending_since = None
+            if (self._zero_relay_power_notification_active
+                    or not self._zero_relay_power_recovery_checked):
+                await self._async_dismiss_zero_relay_power_notification(force=True)
+                self._zero_relay_power_recovery_checked = True
+            return
+        if self._zero_relay_power_pending_since is None:
+            self._zero_relay_power_pending_since = now
+            return
+        if now - self._zero_relay_power_pending_since >= _ZERO_RELAY_POWER_DEBOUNCE:
+            await self._async_notify_zero_relay_power_restart_required()
 
     @staticmethod
     def _circuit_map_status_fingerprint(
@@ -524,6 +608,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
 
         def _failure_payload(fetch_result: InfluxFetchResult) -> dict:
             self._adjust_interval(success=False)
+            self._zero_relay_power_pending_since = None
             self.last_fetch_error = {
                 "type": fetch_result.error_type,
                 "message": fetch_result.error_message,
@@ -662,6 +747,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         snapshot_data = result.data
         self._adjust_interval(success=True)
         self.last_fetch_error = None
+        await self._async_handle_zero_relay_power(snapshot_data, result.query_window)
         await self._async_dismiss_influx_org_notification()
         await self._async_dismiss_influx_token_notification()
         circuit_map_status = snapshot_data.get("circuit_map_status", {})
