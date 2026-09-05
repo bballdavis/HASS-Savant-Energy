@@ -327,6 +327,76 @@ class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(flow.hass.config_entries.updated_entry)
         self.assertEqual(entry.data, original_data)
 
+    async def test_ssh_password_is_preserved_exactly_across_setup_reconfigure_and_reprovision(self):
+        module = _load_config_flow_module()
+        password = "  leading-and-trailing  "
+        expected = (None, None, [], "ssh_password_auth_failed")
+
+        current = module.ConfigFlow()
+        current.hass = _FakeHass(types.SimpleNamespace(entry_id="unused", data={}))
+        current.context = {}
+        current._pending = {module.CONF_HOST: "current-host"}
+        with mock.patch.object(
+            module,
+            "_async_safe_ssh_prepare_bootstrap_candidates",
+            new=mock.AsyncMock(return_value=expected),
+        ) as prepare:
+            await current.async_step_current_ssh({module.CONF_SSH_PASSWORD: password})
+        prepare.assert_awaited_once_with(current.hass, "current-host", module.DEFAULT_SSH_USERNAME, password)
+
+        entry = types.SimpleNamespace(
+            entry_id="entry",
+            data={module.CONF_HOST: "reconfigure-host"},
+            options={},
+        )
+        reconfigure = module.ConfigFlow()
+        reconfigure.hass = _FakeHass(entry)
+        reconfigure.context = {"entry_id": entry.entry_id}
+        reconfigure._pending = {module.CONF_HOST: "reconfigure-host"}
+        with mock.patch.object(
+            module,
+            "_async_safe_ssh_prepare_bootstrap_candidates",
+            new=mock.AsyncMock(return_value=expected),
+        ) as prepare:
+            await reconfigure.async_step_reconfigure_ssh({module.CONF_SSH_PASSWORD: password})
+        prepare.assert_awaited_once_with(reconfigure.hass, "reconfigure-host", module.DEFAULT_SSH_USERNAME, password)
+
+        reprovision = module.OptionsFlowHandler()
+        reprovision.hass = _FakeHass(entry)
+        reprovision.config_entry = types.SimpleNamespace(
+            data={module.CONF_HOST: "reprovision-host"}, options={}
+        )
+        with mock.patch.object(
+            module,
+            "_async_safe_ssh_prepare_bootstrap_candidates",
+            new=mock.AsyncMock(return_value=expected),
+        ) as prepare:
+            await reprovision.async_step_reprovision_ssh({module.CONF_SSH_PASSWORD: password})
+        prepare.assert_awaited_once_with(reprovision.hass, "reprovision-host", module.DEFAULT_SSH_USERNAME, password)
+
+    async def test_ssh_candidate_exception_log_redacts_connection_secrets(self):
+        module = _load_config_flow_module()
+        password = "raw-password"
+        host = "raw-host"
+        username = "raw-user"
+
+        async def fail(*_args):
+            raise RuntimeError(f"credentials {password} for {username}@{host}")
+
+        with mock.patch.object(module, "async_ssh_prepare_bootstrap_candidates", new=fail), self.assertLogs(
+            module._LOGGER, level="ERROR"
+        ) as logs:
+            result = await module._async_safe_ssh_prepare_bootstrap_candidates(
+                object(), host, username, password
+            )
+
+        self.assertEqual(result, (None, None, [], "setup_unexpected"))
+        output = "\n".join(logs.output)
+        self.assertIn("setup_unexpected", output)
+        self.assertNotIn(password, output)
+        self.assertNotIn(host, output)
+        self.assertNotIn(username, output)
+
     async def test_reconfigure_partial_discovery_preserves_complete_stored_circuit_map(self):
         module = _load_config_flow_module()
         existing_map = {"uuid::1": {"circuit_key": "uuid::1"}, "uuid::2": {"circuit_key": "uuid::2"}}

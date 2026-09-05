@@ -55,6 +55,11 @@ def _safe_ssh_error(exc: Exception, *secrets: str) -> str:
     return text[:240]
 
 
+def _is_ssh_authentication_error(exc: Exception) -> bool:
+    """Recognize Paramiko authentication errors without importing it globally."""
+    return any(cls.__name__ == "AuthenticationException" for cls in type(exc).__mro__)
+
+
 @dataclass(slots=True)
 class InfluxTokenResolution:
     token: str
@@ -569,11 +574,24 @@ def _ssh_read_influx_bundle_candidates_with_password_worker(
     except _SSHOperationError as exc:
         return [], "ssh_token_empty" if exc.operation == "token_read" else "ssh_failed"
     except Exception as exc:
-        _LOGGER.warning("SSH bundle read failed: %s", _safe_ssh_error(exc, password, host, username))
-        return [], "ssh_failed"
+        error_key = (
+            "ssh_password_auth_failed"
+            if _is_ssh_authentication_error(exc)
+            else "ssh_connect_failed"
+        )
+        _LOGGER.warning(
+            "SSH bundle read stage=connect error_key=%s host=%s detail=%s",
+            error_key,
+            host,
+            _safe_ssh_error(exc, password, host, username),
+        )
+        return [], error_key
     finally:
         if client:
-            client.close()
+            try:
+                client.close()
+            except Exception:
+                _LOGGER.debug("SSH bundle read stage=close error_key=ssh_connect_failed host=%s", host)
 
 
 def _ssh_read_influx_bundle_with_password_worker(
@@ -623,7 +641,7 @@ def _ssh_install_and_verify_key_worker(
             # key was installed. Paramiko's AuthenticationException is
             # intentionally detected by class name to keep test doubles and
             # optional Paramiko imports compatible.
-            if exc.__class__.__name__ == "AuthenticationException":
+            if _is_ssh_authentication_error(exc):
                 return "ssh_password_auth_failed"
             return "ssh_connect_failed"
         auth_path, added = _install_authorized_key(password_client, username, public_key_line)

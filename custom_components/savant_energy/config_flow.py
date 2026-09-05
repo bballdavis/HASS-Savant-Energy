@@ -96,7 +96,11 @@ async def _async_safe_ssh_prepare_bootstrap_candidates(hass, host: str, username
     try:
         return await async_ssh_prepare_bootstrap_candidates(hass, host, username, password)
     except Exception:
-        _LOGGER.exception("SSH candidate enumeration failed (setup_unexpected)")
+        trace = traceback.format_exc()
+        for secret in (password, host, username):
+            if secret:
+                trace = trace.replace(secret, "[redacted]")
+        _LOGGER.error("SSH candidate enumeration failed (setup_unexpected): %s", trace)
         return None, None, [], "setup_unexpected"
 
 
@@ -646,7 +650,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors[CONF_SSH_PASSWORD] = self._pending_ssh_error
             self._pending_ssh_error = None
         if user_input is not None:
-            ssh_password = (user_input.get(CONF_SSH_PASSWORD) or "").strip()
+            ssh_password = user_input.get(CONF_SSH_PASSWORD) or ""
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
@@ -878,7 +882,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors[CONF_SSH_PASSWORD] = self._pending_ssh_error
             self._pending_ssh_error = None
         if user_input is not None:
-            ssh_password = (user_input.get(CONF_SSH_PASSWORD) or "").strip()
+            ssh_password = user_input.get(CONF_SSH_PASSWORD) or ""
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:
@@ -1037,7 +1041,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         """Re-bootstrap the SSH key using a fresh password."""
         errors = {}
         if user_input is not None:
-            ssh_password = (user_input.get(CONF_SSH_PASSWORD) or "").strip()
+            ssh_password = user_input.get(CONF_SSH_PASSWORD) or ""
             if not ssh_password:
                 errors[CONF_SSH_PASSWORD] = "required"
             else:

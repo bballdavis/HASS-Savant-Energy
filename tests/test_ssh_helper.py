@@ -501,6 +501,87 @@ class SshHelperTests(unittest.TestCase):
         reader.assert_called_once_with("example.com", "user", "pass")
         installer.assert_not_called()
 
+    def test_password_bundle_worker_classifies_authentication_and_redacts_logs(self):
+        module = _load_ssh_helper_module()
+
+        class AuthenticationException(Exception):
+            pass
+
+        class BadAuthenticationType(AuthenticationException):
+            pass
+
+        class AuthClient:
+            closed = False
+
+            def set_missing_host_key_policy(self, *_args, **_kwargs):
+                pass
+
+            def connect(self, **_kwargs):
+                raise BadAuthenticationType("bad password secret-password")
+
+            def close(self):
+                self.closed = True
+
+        client = AuthClient()
+        fake_paramiko = SimpleNamespace(
+            SSHClient=lambda: client,
+            AutoAddPolicy=lambda: None,
+        )
+        with mock.patch.dict("sys.modules", {"paramiko": fake_paramiko}), self.assertLogs(
+            module._LOGGER, level="WARNING"
+        ) as logs:
+            candidates, error_key = module._ssh_read_influx_bundle_candidates_with_password_worker(
+                "host", "RPM", "secret-password"
+            )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(error_key, "ssh_password_auth_failed")
+        self.assertTrue(client.closed)
+        output = "\n".join(logs.output)
+        self.assertIn("stage=connect", output)
+        self.assertIn("error_key=ssh_password_auth_failed", output)
+        self.assertNotIn("secret-password", output)
+
+    def test_password_bundle_worker_classifies_other_connect_errors(self):
+        module = _load_ssh_helper_module()
+        client = mock.Mock()
+        client.connect.side_effect = TimeoutError("connection timed out")
+        fake_paramiko = SimpleNamespace(
+            SSHClient=lambda: client,
+            AutoAddPolicy=lambda: None,
+        )
+        with mock.patch.dict("sys.modules", {"paramiko": fake_paramiko}):
+            candidates, error_key = module._ssh_read_influx_bundle_candidates_with_password_worker(
+                "host", "RPM", "password"
+            )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(error_key, "ssh_connect_failed")
+        client.close.assert_called_once_with()
+
+    def test_key_install_worker_classifies_authentication_subclass(self):
+        module = _load_ssh_helper_module()
+
+        class AuthenticationException(Exception):
+            pass
+
+        class BadAuthenticationType(AuthenticationException):
+            pass
+
+        client = mock.Mock()
+        client.connect.side_effect = BadAuthenticationType("bad password")
+        fake_paramiko = SimpleNamespace(
+            SSHClient=lambda: client,
+            AutoAddPolicy=lambda: None,
+        )
+        with mock.patch.dict("sys.modules", {"paramiko": fake_paramiko}):
+            error_key = module._ssh_install_and_verify_key_worker(
+                "host", "RPM", "password", "private", "public", "token"
+            )
+
+        self.assertEqual(error_key, "ssh_password_auth_failed")
+        client.close.assert_called_once_with()
+
     def test_key_verification_failure_rolls_back_only_new_authorized_key(self):
         module = _load_ssh_helper_module()
         auth_path = "/data/home/RPM/.ssh/authorized_keys"

@@ -85,6 +85,8 @@ The relay control side got cleaned up too. Instead of routing commands through t
 
 **The one setup requirement: SSH access to the Savant host.**
 
+If Current-mode setup fails, use the [SSH troubleshooting guide](docs/troubleshooting-ssh.md) to capture focused Home Assistant logs and check the host connection.
+
 InfluxDB uses a token-based auth model, but normal setup retrieves the read token over SSH rather than asking you to copy it. During setup, enter the `RPM` user's password. The integration reads the token from the host, validates a candidate against real Savant circuit data, installs a refresh key, and then creates the entry. Your password is used only for that bootstrap operation and is never stored. The generated SSH private key and validated InfluxDB token are stored in Home Assistant's encrypted config storage.
 
 That SSH key is not just for first setup. If InfluxDB later rejects the token with an auth failure, the integration uses the stored key to fetch a fresh token automatically, so normal token rotation or host restarts do not require re-entering the SSH password.

@@ -438,7 +438,11 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.success)
         self.assertTrue(result.websocket_inventory_used)
-        ws_mock.assert_awaited_once()
+        ws_mock.assert_awaited_once_with(
+            pbc_host="sem-host",
+            pbc_port=8480,
+            pbc_device_id="PBC-1",
+        )
         assert result.circuit_map is not None
         circuit = result.circuit_map["UUID-1::1"]
         self.assertEqual(circuit["role"], "relay")

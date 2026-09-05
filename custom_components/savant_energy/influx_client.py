@@ -2033,7 +2033,7 @@ async def discover_circuit_metadata(
     websocket_devices: list[dict[str, Any]] = []
     if unresolved_relay_candidates:
         ws_ok, websocket_devices = await fetch_pbc_websocket_devices(
-            sem_host=sem_host,
+            pbc_host=sem_host,
             pbc_port=pbc_websocket_port,
             pbc_device_id=_pbc_device_id,
         )
