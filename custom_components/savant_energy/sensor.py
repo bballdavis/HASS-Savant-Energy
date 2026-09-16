@@ -19,6 +19,7 @@ from .models import get_device_model
 from .power_device_sensor import EnergyDeviceSensor, IndividualLoadEnergySensor
 from .dmx_address_sensor import DMXAddressSensor
 from .utils import calculate_dmx_uid
+from .influx_client import build_measurement_bootstrap_inventory
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -103,12 +104,19 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     )
 
     # --- Per-circuit entities ---
-    if (
-        snapshot_data
-        and isinstance(snapshot_data, dict)
-        and "presentDemands" in snapshot_data
-    ):
-        demands = snapshot_data["presentDemands"]
+    if snapshot_data and isinstance(snapshot_data, dict):
+        # Include stored identity shells so a previous partial response cannot
+        # permanently erase measurement entities. Values remain unavailable
+        # until the matching item reappears in presentDemands.
+        demands = build_measurement_bootstrap_inventory(
+            snapshot_data, config_entry.data.get("circuit_map", {})
+        )
+        for live in snapshot_data.get("presentDemands") or []:
+            if isinstance(live, dict):
+                uid = live.get("uid")
+                demands = [live if item.get("uid") == uid else item for item in demands]
+                if uid and not any(item.get("uid") == uid for item in demands):
+                    demands.append(live)
         _LOGGER.info("sensor setup: %d circuits found", len(demands))
 
         for device in demands:
@@ -147,7 +155,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
             ]
     else:
         _LOGGER.warning(
-            "sensor setup: no presentDemands — circuit sensors will not be created. "
+            "sensor setup: no snapshot data — circuit sensors will not be created. "
             "snapshot_data type=%s keys=%s",
             type(snapshot_data),
             list(snapshot_data.keys()) if isinstance(snapshot_data, dict) else "N/A",

@@ -119,7 +119,117 @@ def _single_circuit_csv(
     return "\n".join(rows)
 
 
+def _named_uuidless_ct_csv() -> str:
+    header = (
+        "result,table,_measurement,savantUUID,name,channel,classification,"
+        "dimmable,override,type,_field,_value"
+    )
+    rows = [header]
+    for channel, name, power in (("0", "Main Feed", "-0.056"), ("1", "Main Feed", "0.016")):
+        rows.extend(
+            [
+                f",_result,50338B0B8E28007A,,{name},{channel},Consumption,false,false,007A,power,{power}",
+                f",_result,50338B0B8E28007A,,{name},{channel},Consumption,false,false,007A,current,0.001",
+                f",_result,50338B0B8E28007A,,{name},{channel},Consumption,false,false,007A,voltage,123",
+                f",_result,50338B0B8E28007A,,{name},{channel},Consumption,false,false,007A,energy,1800000000000",
+            ]
+        )
+    rows.append(
+        ",_result,50338B0B8E28007A,,,3,Consumption,false,false,007A,power,0.005"
+    )
+    return "\n".join(rows)
+
+
 class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_hub_circuit_rows_ignore_zero_filled_placeholders(self):
+        module = _load_influx_client_module()
+        system_text = "\n".join(
+            [
+                "result,table,_measurement,type,channel,_field,_value",
+                ",_result,hub,0000,Energy.Circuit.Dining Room.Power,power,0",
+                ",_result,hub,0000,Energy.Circuit.Dining Room.Energy,energy,0",
+                ",_result,hub,0000,Energy.Circuit.Garage Lights.Power,power,0",
+                ",_result,hub,0000,Energy.Circuit.Garage Lights.Energy,energy,1250",
+            ]
+        )
+
+        rows = module._build_hub_circuit_rows(system_text)
+
+        self.assertNotIn("Dining Room", rows)
+        self.assertEqual(rows["Garage Lights"]["power"], 0.0)
+        self.assertEqual(rows["Garage Lights"]["energy"], 1250.0)
+
+    async def test_build_circuit_rows_uses_measurement_identity_for_named_uuidless_ct(self):
+        module = _load_influx_client_module()
+
+        _measurement, rows = module._build_circuit_rows(_named_uuidless_ct_csv())
+
+        self.assertEqual(sorted(rows), ["50338B0B8E28007A::0", "50338B0B8E28007A::1"])
+        self.assertEqual(rows["50338B0B8E28007A::0"]["name"], "Main Feed")
+        self.assertEqual(rows["50338B0B8E28007A::0"]["savantUUID"], "")
+        self.assertEqual(rows["50338B0B8E28007A::0"]["source_uid"], "50338B0B8E28007A")
+        self.assertEqual(rows["50338B0B8E28007A::0"]["identity_source"], "measurement")
+
+    async def test_fetch_influx_snapshot_publishes_new_named_uuidless_ct_read_only(self):
+        module = _load_influx_client_module()
+        circuit_text = _named_uuidless_ct_csv()
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if "r.type == \"0000\"" in query:
+                return True, "", "", False, False
+            return True, circuit_text, "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example",
+                "token",
+                "org-1",
+                circuit_metadata={},
+                scale_state={},
+            )
+
+        self.assertTrue(snapshot.success)
+        assert snapshot.data is not None
+        demands = snapshot.data["presentDemands"]
+        aggregate = next(item for item in demands if item["uid"] == "50338B0B8E28007A")
+        self.assertEqual(aggregate["name"], "Main Feed")
+        self.assertEqual(aggregate["role"], "ct_sensor")
+        self.assertFalse(aggregate["has_relay"])
+        self.assertEqual(round(aggregate["power"], 3), -0.04)
+        self.assertTrue(snapshot.data["circuit_map_status"]["reconfigure_required"])
+
+    async def test_system_channels_require_nonzero_capability_evidence_then_retain_zero(self):
+        module = _load_influx_client_module()
+        circuit_text = _named_uuidless_ct_csv()
+        garage_power = 2.5
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if "r.type == \"0000\"" not in query:
+                return True, circuit_text, "", False, False
+            system_text = "\n".join(
+                [
+                    "result,table,_measurement,type,channel,_field,_value",
+                    ",_result,hub,0000,Energy.Total.Consumption.Power,power,0",
+                    f",_result,hub,0000,Energy.Group.Garage.Power,power,{garage_power}",
+                ]
+            )
+            return True, system_text, "", False, False
+
+        state = {}
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            first = await module.fetch_influx_snapshot(
+                "http://example", "token", "org-1", circuit_metadata={}, scale_state=state
+            )
+            garage_power = 0
+            second = await module.fetch_influx_snapshot(
+                "http://example", "token", "org-1", circuit_metadata={}, scale_state=state
+            )
+
+        assert first.data is not None and second.data is not None
+        self.assertNotIn("Energy.Total.Consumption.Power", first.data["system_data"])
+        self.assertEqual(first.data["system_data"]["Energy.Group.Garage.Power"], 2.5)
+        self.assertEqual(second.data["system_data"]["Energy.Group.Garage.Power"], 0.0)
+
     async def test_build_circuit_rows_handles_mixed_headers_and_newlines(self):
         module = _load_influx_client_module()
 
@@ -128,6 +238,8 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 30)
         self.assertEqual(rows["B2F4BD96-9B57-BF0F-5AF0-1D6C5DB63869::1"]["name"], "Kylos Room")
         self.assertEqual(rows[f"{_TESLA_UUID}::6"]["name"], "Tesla")
+        self.assertEqual(rows[f"{_TESLA_UUID}::6"]["savantUUID"], _TESLA_UUID)
+        self.assertEqual(rows[f"{_TESLA_UUID}::6"]["source_uid"], _TESLA_UUID)
 
     async def test_discover_circuit_metadata_resolves_relays_and_cts(self):
         module = _load_influx_client_module()
@@ -159,6 +271,82 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.circuit_map["58DB62D6-6CDB-3000-45E0-321E9A03BB81::10"]["influx_name"], "Yvettes Off")
         self.assertEqual(result.circuit_map[f"{_TESLA_UUID}::6"]["legacy_uid"], f"{_TESLA_UUID}.6")
         self.assertEqual(result.circuit_map[f"{_TESLA_UUID}::7"]["legacy_uid"], f"{_TESLA_UUID}.7")
+
+    async def test_discover_circuit_metadata_persists_named_uuidless_ct(self):
+        module = _load_influx_client_module()
+        circuit_text = _named_uuidless_ct_csv()
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            return True, circuit_text, "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux), mock.patch.object(
+            module,
+            "fetch_sem_devices_from_sem",
+            new=mock.AsyncMock(
+                return_value=(
+                    True,
+                    [{"uid": "relay-1", "device_label": "Relay", "load_name": "Relay"}],
+                )
+            ),
+        ):
+            result = await module.discover_circuit_metadata(
+                "http://example", "token", "org-1", sem_host="sem-host"
+            )
+
+        self.assertTrue(result.success)
+        assert result.circuit_map is not None
+        self.assertEqual(sorted(result.circuit_map), ["50338B0B8E28007A::0", "50338B0B8E28007A::1"])
+        self.assertEqual(result.circuit_map["50338B0B8E28007A::0"]["role"], "ct_sensor")
+        self.assertEqual(result.circuit_map["50338B0B8E28007A::0"]["savant_uuid"], "")
+        self.assertEqual(result.circuit_map["50338B0B8E28007A::0"]["source_uid"], "50338B0B8E28007A")
+        self.assertEqual(result.circuit_map["50338B0B8E28007A::0"]["legacy_base_uid"], "50338B0B8E28007A")
+
+    async def test_discovery_seeds_stable_relay_identity_from_host_inventory(self):
+        module = _load_influx_client_module()
+        circuit_text = _named_uuidless_ct_csv()
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            return True, circuit_text, "", False, False
+
+        host_identifiers = (
+            {
+                "name": "Dining Room",
+                "savant_uuid": "UUID-DINING",
+                "relay_uid": "001AAE173FBA",
+                "state_channel": "16",
+            },
+        )
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux), mock.patch.object(
+            module,
+            "fetch_sem_devices_from_sem",
+            new=mock.AsyncMock(
+                return_value=(
+                    True,
+                    [
+                        {
+                            "uid": "001AAE173FBA",
+                            "device_label": "Dining Room",
+                            "load_name": "Dining Room",
+                        }
+                    ],
+                )
+            ),
+        ):
+            result = await module.discover_circuit_metadata(
+                "http://example",
+                "token",
+                "org-1",
+                sem_host="sem-host",
+                host_load_identifiers=host_identifiers,
+            )
+
+        self.assertTrue(result.success)
+        assert result.circuit_map is not None
+        relay = result.circuit_map["UUID-DINING::16"]
+        self.assertEqual(relay["savant_uuid"], "UUID-DINING")
+        self.assertEqual(relay["relay_uid"], "001AAE173FBA")
+        self.assertEqual(relay["legacy_uid"], "001AAE173FBA.0")
+        self.assertEqual(relay["role_source"], "host_load_identifier")
 
     async def test_discover_circuit_metadata_uses_alias_match_for_relays(self):
         module = _load_influx_client_module()
@@ -250,7 +438,11 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.success)
         self.assertTrue(result.websocket_inventory_used)
-        ws_mock.assert_awaited_once()
+        ws_mock.assert_awaited_once_with(
+            pbc_host="sem-host",
+            pbc_port=8480,
+            pbc_device_id="PBC-1",
+        )
         assert result.circuit_map is not None
         circuit = result.circuit_map["UUID-1::1"]
         self.assertEqual(circuit["role"], "relay")
@@ -397,7 +589,10 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
         circuit_map = dict(discovery.circuit_map or {})
         circuit_map.pop("B2F4BD96-9B57-BF0F-5AF0-1D6C5DB63869::1")
 
-        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux), self.assertNoLogs(
+            module._LOGGER.name,
+            level="WARNING",
+        ):
             snapshot = await module.fetch_influx_snapshot(
                 "http://example",
                 "token",
@@ -412,6 +607,264 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "B2F4BD96-9B57-BF0F-5AF0-1D6C5DB63869::1",
             snapshot.data["circuit_map_status"]["unknown_circuit_keys"],
+        )
+        unknown = snapshot.data["circuit_map_status"]["unknown_circuits"]
+        self.assertEqual(
+            unknown,
+            [
+                {
+                    "circuit_key": "B2F4BD96-9B57-BF0F-5AF0-1D6C5DB63869::1",
+                    "display_name": "Kylos Room",
+                    "channel": "1",
+                    "type": "0074",
+                }
+            ],
+        )
+
+    async def test_hub_circuit_measurements_fill_stored_relay_without_inventing_control(self):
+        """Hub-only relay channels stay measurement-only and never beat UUID rows."""
+        module = _load_influx_client_module()
+        tesla_key = f"{_TESLA_UUID}::6"
+        relay_key = "RELAY-UUID::1"
+        circuit_text = _single_circuit_csv(
+            name="Tesla",
+            savant_uuid=_TESLA_UUID,
+            channel="6",
+            classification="Consumption",
+            device_type="007A",
+        )
+        hub_text = "\n".join(
+            [
+                "result,table,_measurement,type,channel,_field,_value",
+                ",_result,hub,0000,Energy.Circuit.Tesla.Power,power,999",
+                ",_result,hub,0000,Energy.Circuit.Tesla.Energy,energy,999999",
+                ",_result,hub,0000,Energy.Circuit.Garage Lights.Power,power,42.5",
+                ",_result,hub,0000,Energy.Circuit.Garage Lights.Energy,energy,1234567",
+            ]
+        )
+        circuit_map = {
+            tesla_key: {
+                "circuit_key": tesla_key,
+                "savant_uuid": _TESLA_UUID,
+                "channel": "6",
+                "type": "007A",
+                "role": "ct_sensor",
+                "display_name": "Tesla",
+                "influx_name": "Tesla",
+                "legacy_uid": f"{_TESLA_UUID}.6",
+                "legacy_base_uid": _TESLA_UUID,
+            },
+            relay_key: {
+                "circuit_key": relay_key,
+                "savant_uuid": "RELAY-UUID",
+                "channel": "1",
+                "type": "0000",
+                "role": "relay",
+                "relay_uid": "001AAE1732B0",
+                "display_name": "Garage Lights",
+                "influx_name": "Garage Ligh",
+                "relay_match_name": "Garage Lights",
+                "legacy_uid": "001AAE1732B0.0",
+                "legacy_base_uid": "001AAE1732B0",
+            },
+        }
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                self.assertIn('r._field == "energy"', query)
+                return True, hub_text, "", False, False
+            return True, circuit_text, "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example",
+                "token",
+                "org-1",
+                circuit_metadata=circuit_map,
+                scale_state={},
+            )
+
+        self.assertTrue(snapshot.success)
+        assert snapshot.data is not None
+        demands = {item["circuit_key"]: item for item in snapshot.data["presentDemands"]}
+        self.assertEqual(demands[tesla_key]["power"], 123.4)
+        relay = demands[relay_key]
+        self.assertEqual(relay["power"], 42.5)
+        self.assertEqual(relay["energy_raw"], 1234567.0)
+        self.assertEqual(relay["energy"], 1234.567)
+        self.assertEqual(relay["energy_scale_divisor"], 1_000)
+        self.assertEqual(relay["energy_scale_status"], "hub_wh_to_kwh")
+        self.assertEqual(relay["hub_match_source"], "hub_exact")
+        self.assertFalse(relay["has_relay"])
+        for unavailable_field in ("current", "voltage", "flags", "percentCommanded", "relay_uid"):
+            self.assertNotIn(unavailable_field, relay)
+        self.assertEqual(snapshot.data["circuit_map_status"]["missing_circuit_keys"], [])
+        self.assertFalse(snapshot.data["circuit_map_status"]["reconfigure_required"])
+
+    async def test_hub_aggregate_never_fills_one_missing_leg_of_an_ambiguous_alias(self):
+        module = _load_influx_client_module()
+        first_leg = f"{_TESLA_UUID}::6"
+        missing_leg = f"{_TESLA_UUID}::7"
+        circuit_text = _single_circuit_csv(
+            name="Tesla",
+            savant_uuid=_TESLA_UUID,
+            channel="6",
+            classification="Consumption",
+            device_type="007A",
+        )
+        hub_text = "\n".join(
+            [
+                "result,table,_measurement,type,channel,_field,_value",
+                ",_result,hub,0000,Energy.Circuit.Tesla.Power,power,999",
+                ",_result,hub,0000,Energy.Circuit.Tesla.Energy,energy,999999",
+            ]
+        )
+        circuit_map = {
+            key: {
+                "circuit_key": key,
+                "savant_uuid": _TESLA_UUID,
+                "channel": channel,
+                "type": "007A",
+                "role": "ct_sensor",
+                "display_name": "Tesla",
+                "influx_name": "Tesla",
+                "legacy_uid": f"{_TESLA_UUID}.{channel}",
+                "legacy_base_uid": _TESLA_UUID,
+            }
+            for key, channel in ((first_leg, "6"), (missing_leg, "7"))
+        }
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                return True, hub_text, "", False, False
+            return True, circuit_text, "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example",
+                "token",
+                "org-1",
+                circuit_metadata=circuit_map,
+                scale_state={},
+            )
+
+        self.assertTrue(snapshot.success)
+        assert snapshot.data is not None
+        demands = {item["circuit_key"]: item for item in snapshot.data["presentDemands"]}
+        self.assertEqual(set(demands), {first_leg})
+        self.assertEqual(demands[first_leg]["power"], 123.4)
+        self.assertNotIn(missing_leg, demands)
+        self.assertEqual(snapshot.data["circuit_map_status"]["missing_circuit_keys"], [missing_leg])
+        self.assertTrue(snapshot.data["circuit_map_status"]["reconfigure_required"])
+
+    async def test_distinct_raw_hub_labels_that_canonicalize_together_stay_ambiguous(self):
+        module = _load_influx_client_module()
+        circuit_key = "ISLAND::1"
+        hub_text = "\n".join(
+            [
+                "result,table,_measurement,type,channel,_field,_value",
+                ",_result,hub,0000,Energy.Circuit.Kitchen / Island.Power,power,42",
+                ",_result,hub,0000,Energy.Circuit.Kitchen - Island.Energy,energy,42000",
+            ]
+        )
+        circuit_map = {
+            circuit_key: {
+                "circuit_key": circuit_key,
+                "savant_uuid": "ISLAND",
+                "channel": "1",
+                "role": "relay",
+                "display_name": "Kitchen Island",
+                "legacy_uid": "relay.0",
+                "legacy_base_uid": "relay",
+            }
+        }
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                return True, hub_text, "", False, False
+            return True, "", "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example",
+                "token",
+                "org-1",
+                circuit_metadata=circuit_map,
+                scale_state={},
+            )
+
+        self.assertTrue(snapshot.success)
+        assert snapshot.data is not None
+        self.assertEqual(snapshot.data["presentDemands"], [])
+        self.assertEqual(snapshot.data["circuit_map_status"]["missing_circuit_keys"], [circuit_key])
+        self.assertTrue(snapshot.data["circuit_map_status"]["reconfigure_required"])
+
+    def test_hub_matcher_recovers_known_label_variants_but_rejects_ambiguous_fuzzy_match(self):
+        module = _load_influx_client_module()
+        known_pairs = [
+            ("Queen Room", "Queen"),
+            ("Smoke Detector", "Smoke Detectors"),
+            ("Yvettes Office", "Yvett's Office"),
+            ("A/C Down Blower", "Downstairs A/C - Blower"),
+            ("A/C Downstairs", "Downstairs A/C"),
+            ("Kylos Room", "Kylo's Room"),
+            ("Patio Kitchen", "Patio - TV / Kitchen"),
+            ("A/C Upstairs", "Upstairs A/C"),
+            ("Kitchen Island", "Kitchen - Island & Left Counter"),
+            ("A/C Up Blower", "Upstairs A/C - Blower"),
+            ("Garg Outlets", "Garage Outlets"),
+        ]
+        stored = {
+            f"stored::{index}": {"display_name": stored_name}
+            for index, (stored_name, _hub_name) in enumerate(known_pairs, start=1)
+        }
+        # Both candidates are high-scoring fuzzy variants for this hub label;
+        # neither has enough separation to justify a match.
+        stored.update(
+            {
+                "ambiguous::1": {"display_name": "Patio Light"},
+                "ambiguous::2": {"display_name": "Patio Lightss"},
+            }
+        )
+        hub_rows = {
+            module._normalize_name(hub_name): {"name": hub_name}
+            for _stored_name, hub_name in known_pairs
+        }
+        hub_rows[module._normalize_name("Patio Lights")] = {"name": "Patio Lights"}
+
+        matches = module._resolve_hub_circuit_matches(hub_rows, stored, set())
+
+        expected = {
+            module._normalize_name(hub_name): f"stored::{index}"
+            for index, (_stored_name, hub_name) in enumerate(known_pairs, start=1)
+        }
+        self.assertEqual({hub_key: key for hub_key, (key, _source) in matches.items()}, expected)
+        self.assertNotIn(module._normalize_name("Patio Lights"), matches)
+        self.assertEqual(matches[module._normalize_name("Yvett's Office")][1], "hub_fuzzy")
+        self.assertEqual(matches[module._normalize_name("Patio - TV / Kitchen")][1], "hub_token_containment")
+
+    def test_higher_tier_hub_match_is_excluded_from_later_containment_candidates(self):
+        module = _load_influx_client_module()
+        stored = {
+            "island::1": {"display_name": "Kitchen Island"},
+            "counter::1": {"display_name": "Kitchen Counter"},
+        }
+        hub_rows = {
+            module._normalize_name("Kitchen - Counter"): {"name": "Kitchen - Counter"},
+            module._normalize_name("Kitchen - Island & Left Counter"): {
+                "name": "Kitchen - Island & Left Counter"
+            },
+        }
+
+        matches = module._resolve_hub_circuit_matches(hub_rows, stored, set())
+
+        self.assertEqual(
+            matches[module._normalize_name("Kitchen - Counter")],
+            ("counter::1", "hub_exact"),
+        )
+        self.assertEqual(
+            matches[module._normalize_name("Kitchen - Island & Left Counter")],
+            ("island::1", "hub_token_containment"),
         )
 
 

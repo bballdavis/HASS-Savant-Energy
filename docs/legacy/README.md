@@ -38,6 +38,6 @@ From integration reconfigure:
 
 1. Change mode to Current (>=11.2).
 2. Provide host IP.
-3. Provide Influx token directly, or provide SSH password so token can be fetched.
+3. Provide the RPM SSH password so SSH bootstrap can fetch and validate the managed Influx token.
 
 See [docs/current-api-workflow.md](../current-api-workflow.md) for the current-mode architecture and data/control paths.

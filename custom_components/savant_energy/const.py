@@ -21,7 +21,7 @@ CONF_OLA_PORT = "ola_port"        # Port for OLA/DMX relay control API
 CONF_SCAN_INTERVAL = "scan_interval"  # InfluxDB poll interval (seconds)
 CONF_SWITCH_COOLDOWN = "switch_cooldown"  # Minimum seconds between relay toggles
 CONF_DMX_TESTING_MODE = "dmx_testing_mode"  # Enable advanced DMX testing mode
-CONF_INFLUX_AUTH_METHOD = "influx_auth_method"  # Choose token or SSH-based token fetch
+CONF_INFLUX_AUTH_METHOD = "influx_auth_method"  # Persisted auth provenance for compatibility
 
 CONF_PENDING_CONFIRM_MULTIPLIER = "pending_confirm_multiplier"
 
@@ -29,6 +29,7 @@ CONF_PENDING_CONFIRM_MULTIPLIER = "pending_confirm_multiplier"
 CONF_INFLUX_URL = "influx_url"    # InfluxDB base URL, e.g. http://192.168.1.14:8086
 CONF_INFLUX_TOKEN = "influx_token"  # InfluxDB read token
 CONF_INFLUX_ORG = "influx_org"    # InfluxDB org ID
+CONF_INFLUX_BUCKET = "influx_bucket"  # InfluxDB bucket name
 CONF_CIRCUIT_MAP = "circuit_map"  # Persisted circuit classification and relay mapping
 
 # Default values
@@ -39,6 +40,7 @@ DEFAULT_SEM_COMPANION_PORT = 8644
 DEFAULT_SCAN_INTERVAL = 5     # seconds between InfluxDB polls
 DEFAULT_INFLUX_URL = "http://192.168.1.14:8086"
 DEFAULT_INFLUX_ORG = ""
+DEFAULT_INFLUX_BUCKET = "localHub"
 
 MODE_LEGACY = "legacy"
 MODE_CURRENT = "current"
@@ -52,7 +54,7 @@ DEFAULT_PENDING_CONFIRM_MULTIPLIER = 2
 
 AUTH_INFLUX_TOKEN = "token"
 AUTH_INFLUX_SSH = "ssh"
-DEFAULT_INFLUX_AUTH_METHOD = AUTH_INFLUX_TOKEN
+DEFAULT_INFLUX_AUTH_METHOD = AUTH_INFLUX_SSH
 
 CONF_SSH_PASSWORD = "ssh_password"
 DEFAULT_SSH_PASSWORD = ""

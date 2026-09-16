@@ -6,6 +6,7 @@ InfluxDB 2 (data) and OLA/DMX (relay control).
 
 import copy
 import logging
+import math
 from datetime import timedelta, datetime
 import os
 from typing import Any
@@ -26,6 +27,7 @@ from .const import (
     CONF_CIRCUIT_MAP,
     CONF_HOST,
     CONF_INFLUX_AUTH_METHOD,
+    CONF_INFLUX_BUCKET,
     CONF_MODE,
     CONF_OLA_PORT,
     CONF_SCAN_INTERVAL,
@@ -42,11 +44,13 @@ from .const import (
     DEFAULT_SEM_COMPANION_PORT,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_INFLUX_ORG,
+    DEFAULT_INFLUX_BUCKET,
 )
 from .current.influx_client import (
     InfluxFetchResult,
     fetch_influx_snapshot_with_backfill,
 )
+from .influx_client import discover_circuit_metadata_with_backfill
 from .current.relay_control import SavantRelayController
 from .config_storage import normalize_entry_storage
 from .influx_org_resolver import InfluxOrgCandidate, async_discover_influx_org
@@ -71,7 +75,10 @@ LOVELACE_CARD_FILENAME = "savant-energy-scenes-card.js"
 LEGACY_FEED_NOTIFICATION_ID = f"{DOMAIN}_legacy_feed_unavailable"
 INFLUX_ORG_NOTIFICATION_ID = f"{DOMAIN}_influx_org_selection_required"
 CIRCUIT_MAP_NOTIFICATION_ID = f"{DOMAIN}_circuit_map_reconfigure_required"
+INFLUX_TOKEN_NOTIFICATION_ID = f"{DOMAIN}_influx_token_reconfigure_required"
+ZERO_RELAY_POWER_NOTIFICATION_ID = f"{DOMAIN}_zero_relay_power_restart_required"
 _BACKFILL_WINDOWS = ("-2m", "-15m", "-24h", "-7d")
+_ZERO_RELAY_POWER_DEBOUNCE = timedelta(seconds=60)
 _UNSET = object()
 
 
@@ -99,6 +106,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.influx_url = entry.data.get(CONF_INFLUX_URL, f"http://{self.host}:8086")
         self.influx_token = entry.data.get(CONF_INFLUX_TOKEN, "")
         self.influx_org = entry.data.get(CONF_INFLUX_ORG, DEFAULT_INFLUX_ORG)
+        self.influx_bucket = entry.data.get(CONF_INFLUX_BUCKET, DEFAULT_INFLUX_BUCKET) or DEFAULT_INFLUX_BUCKET
         self.circuit_map = entry.data.get(CONF_CIRCUIT_MAP, {})
         self.influx_host_metadata: InfluxHostMetadata | None = None
         self.config_entry = entry
@@ -107,6 +115,12 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.cached_present_demands: list = []
         self.last_fetch_error: dict | None = None
         self._legacy_feed_notification_key: tuple[str | None, str | None] | None = None
+        self._circuit_map_mismatch_fingerprint: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+        self._circuit_map_status_initialized = False
+        self._influx_token_notification_active = False
+        self._zero_relay_power_pending_since: datetime | None = None
+        self._zero_relay_power_notification_active = False
+        self._zero_relay_power_recovery_checked = False
         self.energy_scale_state: dict[str, dict] = {}
 
         self.ssh_private_key = entry.data.get(CONF_SSH_PRIVATE_KEY, "")
@@ -133,22 +147,31 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         *,
         token=_UNSET,
         org=_UNSET,
+        bucket=_UNSET,
         ssh_private_key=_UNSET,
     ) -> bool:
         """Persist current-mode auth/config values into config-entry data."""
         updated_data = dict(self.config_entry.data)
         changed = False
 
+        next_token = self.influx_token
+        next_org = self.influx_org
+        next_bucket = self.influx_bucket
+        next_ssh_private_key = self.ssh_private_key
         if token is not _UNSET and token != self.influx_token:
-            self.influx_token = token
+            next_token = token
             updated_data[CONF_INFLUX_TOKEN] = token
             changed = True
         if org is not _UNSET and org != self.influx_org:
-            self.influx_org = org
+            next_org = org
             updated_data[CONF_INFLUX_ORG] = org
             changed = True
+        if bucket is not _UNSET and bucket != self.influx_bucket:
+            next_bucket = bucket or DEFAULT_INFLUX_BUCKET
+            updated_data[CONF_INFLUX_BUCKET] = next_bucket
+            changed = True
         if ssh_private_key is not _UNSET and ssh_private_key != self.ssh_private_key:
-            self.ssh_private_key = ssh_private_key
+            next_ssh_private_key = ssh_private_key
             updated_data[CONF_SSH_PRIVATE_KEY] = ssh_private_key
             changed = True
 
@@ -163,6 +186,10 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 self.config_entry,
                 data=updated_data,
             )
+            self.influx_token = next_token
+            self.influx_org = next_org
+            self.influx_bucket = next_bucket
+            self.ssh_private_key = next_ssh_private_key
         return changed
 
     async def _async_notify_influx_org_selection_required(
@@ -205,13 +232,25 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
     ) -> None:
         """Tell the user to reconfigure when Influx no longer matches the stored circuit map."""
         unknown = status.get("unknown_circuit_keys") or []
+        unknown_circuits = status.get("unknown_circuits") or []
         missing = status.get("missing_circuit_keys") or []
         message = (
             "Savant Energy found a circuit inventory mismatch between InfluxDB and the stored "
             "relay/CT map. Run Reconfigure so the integration can rebuild its circuit mapping."
         )
         details: list[str] = []
-        if unknown:
+        if unknown_circuits:
+            formatted_unknown = []
+            for circuit in unknown_circuits[:5]:
+                if not isinstance(circuit, dict):
+                    continue
+                name = str(circuit.get("display_name", "")).strip() or "Unnamed circuit"
+                channel = str(circuit.get("channel", "")).strip() or "?"
+                type_code = str(circuit.get("type", "")).strip() or "unknown"
+                formatted_unknown.append(f"{name} (channel {channel}, type {type_code})")
+            if formatted_unknown:
+                details.append(f"New/unmapped circuits: {', '.join(formatted_unknown)}")
+        elif unknown:
             details.append(f"New/unmapped circuits: {', '.join(unknown[:5])}")
         if missing:
             details.append(f"Missing stored circuits: {', '.join(missing[:5])}")
@@ -238,6 +277,146 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             blocking=True,
         )
 
+    async def _async_notify_influx_token_reconfigure_required(self) -> None:
+        """Tell pasted-token users when Influx rejects their stored token."""
+        if self._influx_token_notification_active:
+            return
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "create",
+            {
+                "title": "Savant Energy Influx Token Needs Updating",
+                "message": (
+                    "InfluxDB rejected the token saved by Savant Energy. It may have rotated, "
+                    "been revoked, or no longer have access to this InfluxDB host. Run the "
+                    "integration Reconfigure flow and paste a fresh read token."
+                ),
+                "notification_id": INFLUX_TOKEN_NOTIFICATION_ID,
+            },
+            blocking=True,
+        )
+        self._influx_token_notification_active = True
+
+    async def _async_dismiss_influx_token_notification(self) -> None:
+        """Dismiss the pasted-token notification after a successful fetch."""
+        if not self._influx_token_notification_active:
+            return
+        await self.hass.services.async_call(
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": INFLUX_TOKEN_NOTIFICATION_ID},
+            blocking=True,
+        )
+        self._influx_token_notification_active = False
+
+    async def _async_notify_zero_relay_power_restart_required(self) -> None:
+        """Tell the user when live relay measurements remain at zero."""
+        if self._zero_relay_power_notification_active:
+            return
+        await self.hass.services.async_call(
+            "persistent_notification", "create",
+            {
+                "title": "Savant Energy Host May Need a Restart",
+                "message": (
+                    "Savant Energy is connected to InfluxDB, but all relay circuit power "
+                    "readings have remained at zero for at least 60 seconds. The Savant "
+                    "host likely needs to be restarted. After restarting it, wait roughly "
+                    "two minutes for InfluxDB to start writing readings again."
+                ),
+                "notification_id": ZERO_RELAY_POWER_NOTIFICATION_ID,
+            }, blocking=True,
+        )
+        self._zero_relay_power_notification_active = True
+
+    async def _async_dismiss_zero_relay_power_notification(self, force: bool = False) -> None:
+        """Dismiss the zero-relay-power notification after measured recovery."""
+        if not self._zero_relay_power_notification_active and not force:
+            return
+        await self.hass.services.async_call(
+            "persistent_notification", "dismiss",
+            {"notification_id": ZERO_RELAY_POWER_NOTIFICATION_ID}, blocking=True,
+        )
+        self._zero_relay_power_notification_active = False
+
+    async def _async_handle_zero_relay_power(
+        self, snapshot_data: dict[str, Any], query_window: str | None,
+        observed_at: datetime | None = None,
+    ) -> None:
+        """Debounce an authoritative live all-zero relay snapshot."""
+        status = snapshot_data.get("circuit_map_status") or {}
+        if (
+            query_window != _BACKFILL_WINDOWS[0]
+            or status.get("inventory_status") != "complete"
+            or status.get("inventory_authoritative") is not True
+            or status.get("reconfigure_required") is True
+            or bool(status.get("unknown_circuit_keys"))
+        ):
+            self._zero_relay_power_pending_since = None
+            return
+        demands = snapshot_data.get("presentDemands")
+        if not isinstance(demands, list):
+            self._zero_relay_power_pending_since = None
+            return
+        relays = [
+            demand for demand in demands
+            if isinstance(demand, dict)
+            and str(demand.get("role", "")).strip().lower() == "relay"
+        ]
+        powers: list[float] = []
+        for relay in relays:
+            power = relay.get("power")
+            if (isinstance(power, bool) or not isinstance(power, (int, float))
+                    or not math.isfinite(float(power))):
+                self._zero_relay_power_pending_since = None
+                return
+            powers.append(float(power))
+        if len(powers) < 2:
+            self._zero_relay_power_pending_since = None
+            return
+        now = observed_at or datetime.now()
+        if any(abs(power) > 1e-6 for power in powers):
+            self._zero_relay_power_pending_since = None
+            if (self._zero_relay_power_notification_active
+                    or not self._zero_relay_power_recovery_checked):
+                await self._async_dismiss_zero_relay_power_notification(force=True)
+                self._zero_relay_power_recovery_checked = True
+            return
+        if self._zero_relay_power_pending_since is None:
+            self._zero_relay_power_pending_since = now
+            return
+        if now - self._zero_relay_power_pending_since >= _ZERO_RELAY_POWER_DEBOUNCE:
+            await self._async_notify_zero_relay_power_restart_required()
+
+    @staticmethod
+    def _circuit_map_status_fingerprint(
+        status: dict[str, Any],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+        """Return a stable identity for a circuit-map inventory mismatch."""
+        unknown = tuple(sorted(str(key) for key in status.get("unknown_circuit_keys") or []))
+        missing = tuple(sorted(str(key) for key in status.get("missing_circuit_keys") or []))
+        return (unknown, missing) if unknown or missing else None
+
+    async def _async_handle_circuit_map_status(self, status: dict[str, Any]) -> None:
+        """Report each distinct circuit-map mismatch once per coordinator lifetime."""
+        fingerprint = self._circuit_map_status_fingerprint(status)
+        if self._circuit_map_status_initialized and fingerprint == self._circuit_map_mismatch_fingerprint:
+            return
+
+        self._circuit_map_status_initialized = True
+        self._circuit_map_mismatch_fingerprint = fingerprint
+        if fingerprint is None:
+            await self._async_dismiss_circuit_map_notification()
+            return
+
+        unknown, missing = fingerprint
+        _LOGGER.warning(
+            "Savant circuit inventory mismatch detected (%d new/unmapped, %d missing stored). "
+            "Run Reconfigure to rebuild the relay/CT map.",
+            len(unknown),
+            len(missing),
+        )
+        await self._async_notify_circuit_map_reconfigure_required(status)
+
     async def _async_resolve_influx_org(
         self,
         host_metadata: InfluxHostMetadata | None = None,
@@ -262,7 +441,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 len(result.candidates),
                 result.source or "unknown",
             )
-            await self._async_persist_connection_state(org=result.selected_org_id)
+            await self._async_persist_connection_state(org=result.selected_org_id, bucket=result.selected_bucket)
             await self._async_dismiss_influx_org_notification()
             return True, False
 
@@ -292,32 +471,43 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
 
         self._token_refresh_in_progress = True
         try:
-            from .ssh_helper import async_ssh_fetch_influx_bundle_with_key
+            from .ssh_helper import async_ssh_fetch_influx_candidates_with_key
 
             host = self.host or self._hub_host_from_influx_url()
-            new_token, metadata = await async_ssh_fetch_influx_bundle_with_key(
+            candidates = await async_ssh_fetch_influx_candidates_with_key(
                 self.hass, host, DEFAULT_SSH_USERNAME, self.ssh_private_key
             )
-            if not new_token:
-                return False, metadata
-
-            if new_token != self.influx_token:
-                _LOGGER.info("Auto-refreshed InfluxDB token via SSH key from %s", host)
-                await self._async_persist_connection_state(token=new_token)
-            else:
-                _LOGGER.debug("SSH token refresh returned the current token unchanged")
-
-            if metadata:
-                _LOGGER.debug(
-                    "SSH token refresh metadata: org_id=%s org_name=%s bucket=%s auth_org_id=%s",
-                    metadata.org_id or "<unset>",
-                    metadata.org_name or "<unset>",
-                    metadata.bucket_name or "<unset>",
-                    metadata.auth_org_id or "<unset>",
+            for candidate in candidates:
+                discovery = await async_discover_influx_org(
+                    self.influx_url, candidate.token, candidate.metadata
                 )
-                self.influx_host_metadata = metadata
-            self._adjust_interval(success=True)
-            return True, metadata
+                if not discovery.selected_org_id:
+                    continue
+                circuit_result = await discover_circuit_metadata_with_backfill(
+                    self.influx_url,
+                    candidate.token,
+                    discovery.selected_org_id,
+                    sem_host=self.sem_host,
+                    influx_bucket=discovery.selected_bucket or DEFAULT_INFLUX_BUCKET,
+                    host_load_identifiers=(
+                        candidate.metadata.load_identifiers if candidate.metadata else ()
+                    ),
+                )
+                if not (circuit_result.success and circuit_result.circuit_map):
+                    continue
+                # All three values change together only after the candidate
+                # has passed host metadata, Influx org/bucket, and circuit
+                # discovery. A failed candidate leaves current state intact.
+                await self._async_persist_connection_state(
+                    token=candidate.token,
+                    org=discovery.selected_org_id,
+                    bucket=discovery.selected_bucket or DEFAULT_INFLUX_BUCKET,
+                )
+                self.influx_host_metadata = candidate.metadata
+                self._adjust_interval(success=True)
+                return True, candidate.metadata
+            _LOGGER.warning("No SSH Influx token candidate passed org and circuit validation for %s", host)
+            return False, None
         finally:
             self._token_refresh_in_progress = False
 
@@ -336,6 +526,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             scale_state=self.energy_scale_state,
             circuit_metadata=self.circuit_map,
             sample_seconds=float(self.update_interval.total_seconds()),
+            influx_bucket=self.influx_bucket,
         )
         if result.success and result.data is not None and result.query_window and result.query_window != _BACKFILL_WINDOWS[0]:
             _LOGGER.info(
@@ -417,6 +608,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
 
         def _failure_payload(fetch_result: InfluxFetchResult) -> dict:
             self._adjust_interval(success=False)
+            self._zero_relay_power_pending_since = None
             self.last_fetch_error = {
                 "type": fetch_result.error_type,
                 "message": fetch_result.error_message,
@@ -427,6 +619,10 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 fetch_result.error_type,
                 fetch_result.error_message,
             )
+            if fetch_result.auth_failure and not self.ssh_private_key:
+                self.hass.async_create_task(
+                    self._async_notify_influx_token_reconfigure_required()
+                )
 
             existing = dict(self.data) if isinstance(self.data, dict) else {}
             existing.setdefault("snapshot_data", None)
@@ -519,12 +715,18 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                     org_failure=True,
                 )
 
-        elif result.org_failure:
+        elif result.org_failure or result.bucket_failure:
             _LOGGER.warning(
-                "InfluxDB org failure (%s) - attempting org rediscovery",
+                "InfluxDB org/bucket failure (%s, class=%s) - attempting connection rediscovery",
                 result.error_type,
+                result.failure_class or "unknown",
             )
-            _LOGGER.debug("Org failure details: window=%s", result.query_window or "<unset>")
+            _LOGGER.debug(
+                "Influx connection failure details: org=%s bucket=%s window=%s",
+                self.influx_org or "<unset>",
+                self.influx_bucket or "<unset>",
+                result.query_window or "<unset>",
+            )
             resolved, ambiguous = await self._async_resolve_influx_org(self.influx_host_metadata)
             if resolved:
                 result = await self._async_fetch_influx_snapshot_with_backfill()
@@ -545,12 +747,11 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         snapshot_data = result.data
         self._adjust_interval(success=True)
         self.last_fetch_error = None
+        await self._async_handle_zero_relay_power(snapshot_data, result.query_window)
         await self._async_dismiss_influx_org_notification()
+        await self._async_dismiss_influx_token_notification()
         circuit_map_status = snapshot_data.get("circuit_map_status", {})
-        if circuit_map_status.get("reconfigure_required"):
-            await self._async_notify_circuit_map_reconfigure_required(circuit_map_status)
-        else:
-            await self._async_dismiss_circuit_map_notification()
+        await self._async_handle_circuit_map_status(circuit_map_status)
 
         present_demands = snapshot_data.get("presentDemands", [])
         if isinstance(present_demands, list):
@@ -743,7 +944,17 @@ async def _async_remove_stale_circuit_entities(
     from homeassistant.helpers.device_registry import async_get as async_get_dr  # type: ignore
 
     snapshot_data = (coordinator.data or {}).get("snapshot_data") or {}
-    demands = snapshot_data.get("presentDemands", [])
+    circuit_status = snapshot_data.get("circuit_map_status") or {}
+    # A successful but partial Influx response is not evidence that circuits
+    # were removed. Never prune registry state from that transient view.
+    if (
+        circuit_status.get("inventory_status") == "partial"
+        or circuit_status.get("missing_circuit_keys")
+        or circuit_status.get("inventory_authoritative") is False
+    ):
+        _LOGGER.debug("Skipping stale entity/device cleanup — circuit inventory is partial")
+        return
+    demands = snapshot_data.get("inventoryDemands") or snapshot_data.get("presentDemands", [])
     if not demands:
         _LOGGER.debug("Skipping stale entity/device cleanup — snapshot has no circuits yet")
         return

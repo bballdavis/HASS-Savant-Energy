@@ -45,9 +45,9 @@ For the current protocol migration and the 2.0.0 release details, see [the curre
 |---|---|---|
 | **Auto** *(recommended)* | New installs - the integration figures out which version you have | PBC IP address |
 | **Legacy (<11.2)** | Older Savant firmware, snapshot + DMX workflow | PBC IP address |
-| **Current (>=11.2)** | Savant firmware 11.2 or later | PBC IP, Host IP, InfluxDB token |
+| **Current (>=11.2)** | Savant firmware 11.2 or later | PBC IP, Host IP, RPM SSH password (one-time bootstrap) |
 
-In **Auto** mode, the integration first tries the legacy feed. If it doesn't find one, it'll prompt you for the Host IP and walk you through getting the InfluxDB token (see the Current mode section below for details on that).
+In **Auto** mode, the integration first tries the legacy feed. If it doesn't find one, it prompts for the Host IP and continues to SSH bootstrap (see the Current mode section below).
 
 If you're on **Legacy** mode and the integration can no longer reach its data source, it will create a Home Assistant notification pointing you to the **Reconfigure** flow.
 
@@ -61,7 +61,7 @@ If you've been running the integration in Legacy mode and you've upgraded your S
 2. Click the **three-dot menu > Reconfigure**
 3. Change the mode to **Current** (or leave it on **Auto** and let it detect)
 4. Provide your **Host IP** (the Savant host running InfluxDB, often a different IP from the PBC)
-5. Provide your **InfluxDB token** (see the Current mode section below for how to get it)
+5. Enter the **RPM SSH password** so the integration can validate and manage the InfluxDB token
 
 **What happens to your existing entities?**
 
@@ -83,13 +83,11 @@ In 11.2, Savant moved to a proper time-series architecture. The energy data now 
 
 The relay control side got cleaned up too. Instead of routing commands through the DMX/OLA layer, we talk directly to the SEM over a simple TCP protocol on port 2000. It's more reliable and noticeably faster.
 
-**The one catch: the InfluxDB read token.**
+**The one setup requirement: SSH access to the Savant host.**
 
-InfluxDB uses a token-based auth model, and Savant stores a read token on the host. You need that token to query the data. There are two ways to get it:
+If Current-mode setup fails, use the [SSH troubleshooting guide](docs/troubleshooting-ssh.md) to capture focused Home Assistant logs and check the host connection.
 
-### Option A - Let the integration grab it automatically (SSH)
-
-During setup, choose **"Retrieve token via SSH"**. The integration will SSH into the Savant host as the `RPM` user, read the token from its known location, and hand it straight to the integration config. Your SSH password is used only for that bootstrap operation and is never stored anywhere - it's held ephemerally in memory just long enough to make the connection, install the SSH key, grab the token, and discard it. The stored credentials are the generated SSH private key and the InfluxDB token, both managed by Home Assistant's encrypted config storage.
+InfluxDB uses a token-based auth model, but normal setup retrieves the read token over SSH rather than asking you to copy it. During setup, enter the `RPM` user's password. The integration reads the token from the host, validates a candidate against real Savant circuit data, installs a refresh key, and then creates the entry. Your password is used only for that bootstrap operation and is never stored. The generated SSH private key and validated InfluxDB token are stored in Home Assistant's encrypted config storage.
 
 That SSH key is not just for first setup. If InfluxDB later rejects the token with an auth failure, the integration uses the stored key to fetch a fresh token automatically, so normal token rotation or host restarts do not require re-entering the SSH password.
 
@@ -97,23 +95,9 @@ That SSH key is not just for first setup. If InfluxDB later rejects the token wi
 - Try the default: **`RPM`**
 - If that doesn't work, and you have access to the **Savant Application Manager**, open the **System Monitor** app, right-click your host, and choose **Set Password** to assign a new one
 
-### Option B - Grab the token yourself
+If SSH setup needs diagnosis, the host may store its token at either `/data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken` or `/data/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken`. Do not copy or share token contents; the integration checks both locations safely. The adjacent `.influxsetup` and `.influxtoken` metadata files help it resolve the organization and bucket.
 
-If you'd rather SSH in on your own terms, that's completely fine. Log in as `RPM` and the token can be extracted with:
-
-```bash
-cat /data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken
-```
-
-If that file is empty or missing, your host may use a different package layout. As a fallback, try the Influx CLI command below (using `nocorrect` avoids zsh autocorrect prompts on hosts where only `influxd` is present):
-
-```bash
-nocorrect influx auth list --json | python3 -c "import sys,json; auths=json.load(sys.stdin); print(next(a['token'] for a in auths if 'read' in [p['action'] for p in a.get('permissions',[])]))"
-```
-
-Or use the discovery tool (see below) which automates this and caches the token locally.
-
-Once you have the token, paste it into the integration config and you're done. From there the integration pulls live circuit data every 5 seconds directly from the time-series database, and everything should be noticeably more responsive than the old snapshot approach.
+Existing token-only entries remain supported at runtime. Reconfigure moves them to the SSH bootstrap flow without changing the saved token, authentication provenance, or key until validation and key installation both succeed.
 
 ---
 
@@ -212,7 +196,7 @@ See `INTEGRATION_API.md` for full documentation.
 | Mode | Auto | Auto, Legacy, or Current |
 | PBC IP Address | (required) | IP of the Panel Bridge Controller |
 | Host IP Address | (required for Current) | IP of the Savant host running InfluxDB |
-| InfluxDB Token | (required for Current) | Read token for InfluxDB |
+| SSH Bootstrap | (required for Current) | One-time RPM password; retrieves and manages the validated InfluxDB read token |
 | Scan Interval | 5 s | How often to poll for new data |
 | Breaker Cooldown | 15 s | Minimum seconds between relay toggles |
 | Pending Confirm Multiplier | 2x | Coordinator cycles to wait for relay confirmation |
@@ -222,7 +206,7 @@ See `INTEGRATION_API.md` for full documentation.
 
 ## InfluxDB Discovery Tool
 
-A standalone discovery tool is included for exploring the InfluxDB data on your Savant host, useful for understanding the available measurements, verifying your token, and debugging.
+A standalone discovery tool is included for exploring InfluxDB data on your Savant host, useful for understanding available measurements and diagnosing setup.
 
 **Setup:**
 ```bash
@@ -265,6 +249,19 @@ This prompts for your SSH password, retrieves and caches the InfluxDB token, the
 ---
 
 ## Contributing
+
+### Savant host token locations and recovery
+
+Current SavantOS releases may store the Influx read token under either layout:
+
+```text
+/data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken
+/data/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken
+```
+
+Adjacent `.influxsetup` and `.influxtoken` files contain useful organization and bucket metadata. When diagnosing over SSH, inspect only paths and file sizes, for example `find /data -path '*/InfluxDB2/.influxReadtoken' -print` and `wc -c <path>`; never print token contents. `influxd` is the InfluxDB daemon, not the `influx` command-line client, and it may not be installed. The integration validates candidate tokens with a real query before saving one and retries after token rotation.
+
+SSH refresh appends the integration key to `authorized_keys`, verifies key login and token access, and rolls back only its exact appended byte suffix on failure. If the file changed concurrently, it leaves that content untouched. A historical backfill is identity inventory only: live availability and controls use fresh measurements, and partial inventory never removes existing entities.
 
 We love contributions! Please:
 - Open issues for bugs or feature requests

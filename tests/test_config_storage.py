@@ -59,6 +59,16 @@ class ConfigStorageTests(unittest.TestCase):
         self.assertNotIn(module.CONF_INFLUX_TOKEN, normalized_options)
         self.assertNotIn(module.CONF_INFLUX_ORG, normalized_options)
 
+    def test_current_entry_defaults_additive_bucket_without_version_change(self):
+        module = _load_config_storage_module()
+
+        normalized_data, _options, changed = module.normalize_entry_storage(
+            {module.CONF_MODE: module.MODE_CURRENT, module.CONF_HOST: "host"}, {}
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(normalized_data[module.CONF_INFLUX_BUCKET], "localHub")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,9 +12,15 @@ import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Any, Optional
 
 import aiohttp
+
+try:
+    from .const import DEFAULT_INFLUX_BUCKET
+except ImportError:  # direct test-module loading compatibility
+    DEFAULT_INFLUX_BUCKET = "localHub"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,15 +38,18 @@ _KNOWN_CT_DEVICE_TYPES = {"007A"}
 _INVALID_NAME_TOKENS = {"", "false", "true", "name", "override"}
 
 # Flux query: fetch last reading for every circuit — relay-controlled and CT-only.
-# We filter on savantUUID being present rather than a specific type code so that
-# CT-monitored loads (EV chargers, solar inverters, etc.) are included alongside
-# relay-switched circuits regardless of their hardware type tag.
+# Savant normally identifies circuits with savantUUID. Some 007A CT channels
+# (notably Main Feed) omit that tag but retain a stable measurement id and a
+# configured name. Include those named CT rows; unnamed 007A channels are spare
+# inputs/noise and are intentionally excluded.
 _BACKFILL_WINDOWS = ("-2m", "-15m", "-24h", "-7d")
 
 _CIRCUIT_QUERY = """\
-from(bucket: "localHub")
+from(bucket: {bucket})
   |> range(start: {range_start})
-  |> filter(fn: (r) => exists r.savantUUID and r.savantUUID != "")
+  |> filter(fn: (r) =>
+      (exists r.savantUUID and r.savantUUID != "") or
+      (exists r.type and r.type == "007A" and exists r.name and r.name != ""))
   |> filter(fn: (r) =>
       r._field == "power" or r._field == "current" or r._field == "voltage" or
       r._field == "energy" or r._field == "percentCommanded" or r._field == "flags")
@@ -50,12 +59,66 @@ from(bucket: "localHub")
 # Flux query: fetch last power reading for all hub-aggregated channels
 # (totals, groups, battery, solar). type="0000" is always the hub measurement.
 _SYSTEM_QUERY = """\
-from(bucket: "localHub")
+from(bucket: {bucket})
   |> range(start: {range_start})
   |> filter(fn: (r) => r.type == "0000")
-  |> filter(fn: (r) => r._field == "power")
+  |> filter(fn: (r) => r._field == "power" or r._field == "energy")
   |> last()
 """
+
+_HUB_CIRCUIT_CHANNEL_RE = re.compile(
+    r"^Energy\.Circuit\.(?P<name>.+)\.(?P<field>Power|Energy)$",
+    re.IGNORECASE,
+)
+_HUB_FUZZY_MIN_SCORE = 0.90
+_HUB_FUZZY_MIN_MARGIN = 0.08
+
+
+def _flux_string(value: str) -> str:
+    """Encode a bucket as a Flux string literal."""
+    return json.dumps(str(value or DEFAULT_INFLUX_BUCKET).strip() or DEFAULT_INFLUX_BUCKET)
+
+
+@dataclass(slots=True)
+class InfluxQueryResult:
+    """Structured Flux request outcome with legacy tuple iteration."""
+
+    success: bool
+    body_text: str = ""
+    error_message: str = ""
+    failure_class: str | None = None
+    http_status: int | None = None
+
+    @property
+    def status(self) -> str:
+        return "success" if self.success else (self.failure_class or "other_query")
+
+    @property
+    def classification(self) -> str | None:
+        return self.failure_class
+
+    @property
+    def auth_failure(self) -> bool:
+        return self.failure_class == "unauthorized_401"
+
+    @property
+    def permission_failure(self) -> bool:
+        return self.failure_class == "forbidden_403"
+
+    @property
+    def org_failure(self) -> bool:
+        return self.failure_class == "invalid_org"
+
+    @property
+    def bucket_failure(self) -> bool:
+        return self.failure_class == "invalid_bucket"
+
+    def __iter__(self):
+        yield self.success
+        yield self.body_text
+        yield self.error_message
+        yield self.auth_failure
+        yield self.org_failure
 
 
 @dataclass(slots=True)
@@ -67,7 +130,10 @@ class InfluxFetchResult:
     error_type: Optional[str] = None
     error_message: Optional[str] = None
     auth_failure: bool = False
+    permission_failure: bool = False
     org_failure: bool = False
+    bucket_failure: bool = False
+    failure_class: Optional[str] = None
     query_window: Optional[str] = None
 
 
@@ -79,6 +145,8 @@ class CircuitDiscoveryResult:
     circuit_map: Optional[dict[str, dict[str, Any]]] = None
     error_key: Optional[str] = None
     error_message: Optional[str] = None
+    failure_class: Optional[str] = None
+    http_status: Optional[int] = None
     query_window: Optional[str] = None
     warnings: list[str] = field(default_factory=list)
     downgraded_circuits: list[dict[str, Any]] = field(default_factory=list)
@@ -136,10 +204,10 @@ async def _post_flux(
     token: str,
     org: str,
     query: str,
-) -> tuple[bool, str, str, bool, bool]:
+) -> InfluxQueryResult:
     """POST a Flux query.
 
-    Returns (success, body_text, error_message, auth_failure, org_failure).
+    Returns a structured result; iteration preserves the historical tuple.
     """
     url = f"{base_url.rstrip('/')}/api/v2/query"
     try:
@@ -156,9 +224,9 @@ async def _post_flux(
         ) as resp:
             text = await resp.text()
             if resp.status == 401:
-                return False, "", "Unauthorized (401) - token is invalid or expired", True, False
+                return InfluxQueryResult(False, error_message="Unauthorized (401) - InfluxDB rejected the token", failure_class="unauthorized_401", http_status=401)
             if resp.status == 403:
-                return False, "", "Forbidden (403) - token lacks read permission", True, False
+                return InfluxQueryResult(False, error_message="Forbidden (403) - token lacks permission for this query", failure_class="forbidden_403", http_status=403)
             if resp.status != 200:
                 lowered = text.lower()
                 org_failure = (
@@ -169,12 +237,33 @@ async def _post_flux(
                         or "org not found" in lowered
                     )
                 )
-                return False, "", f"HTTP {resp.status}: {text[:200]}", False, org_failure
-            return True, text, "", False, False
+                bucket_failure = "bucket" in lowered and any(word in lowered for word in ("not found", "does not exist", "invalid"))
+                failure_class = "invalid_org" if org_failure else "invalid_bucket" if bucket_failure else "other_query"
+                return InfluxQueryResult(False, error_message=f"HTTP {resp.status}: {text[:200]}", failure_class=failure_class, http_status=resp.status)
+            return InfluxQueryResult(True, body_text=text, http_status=200)
     except asyncio.TimeoutError:
-        return False, "", "InfluxDB query timed out after 10 s", False, False
+        return InfluxQueryResult(False, error_message="InfluxDB query timed out after 10 s", failure_class="unreachable")
     except aiohttp.ClientError as exc:
-        return False, "", f"Connection error: {exc}", False, False
+        return InfluxQueryResult(False, error_message=f"Connection error: {exc}", failure_class="unreachable")
+
+
+def _coerce_query_result(value) -> InfluxQueryResult:
+    """Accept old test/integration tuple stubs while using structured results."""
+    if isinstance(value, InfluxQueryResult):
+        return value
+    ok, body, error, auth_failure, org_failure = value
+    failure_class = "unauthorized_401" if auth_failure else "invalid_org" if org_failure else None
+    return InfluxQueryResult(ok, body, error, failure_class)
+
+
+def _query_error_key(result: InfluxQueryResult) -> str:
+    return {
+        "unauthorized_401": "influx_auth_failed",
+        "forbidden_403": "influx_permission_denied",
+        "invalid_org": "influx_org_invalid",
+        "invalid_bucket": "influx_bucket_invalid",
+        "unreachable": "influx_unreachable",
+    }.get(result.failure_class or "", "influx_query_failed")
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -317,15 +406,24 @@ def _expand_multi_leg_ct_circuits(
 
 
 def _build_circuit_rows(circuit_text: str) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Collapse Flux CSV rows into one dict per (savantUUID, channel) circuit."""
+    """Collapse Flux CSV rows into one dict per stable source/channel circuit."""
     by_circuit_key: dict[str, dict[str, Any]] = {}
     pbc_device_id = ""
 
     for row in _parse_influx_csv(circuit_text):
         savant_uuid = (row.get("savantUUID") or "").strip()
+        measurement = (row.get("_measurement") or "").strip()
         channel = (row.get("channel") or "").strip()
-        if (
+        circuit_name = (row.get("name") or "").strip()
+        device_type = (row.get("type") or "").strip().upper()
+        uuidless_named_ct = (
             not savant_uuid
+            and bool(measurement)
+            and _is_usable_name(circuit_name)
+            and device_type in _KNOWN_CT_DEVICE_TYPES
+        )
+        if (
+            (not savant_uuid and not uuidless_named_ct)
             or not channel
             or savant_uuid == "savantUUID"
             or channel == "channel"
@@ -333,9 +431,10 @@ def _build_circuit_rows(circuit_text: str) -> tuple[str, dict[str, dict[str, Any
             continue
 
         if not pbc_device_id:
-            pbc_device_id = (row.get("_measurement") or "").strip()
+            pbc_device_id = measurement
 
-        circuit_key = build_circuit_key(savant_uuid, channel)
+        stable_source_id = savant_uuid or measurement
+        circuit_key = build_circuit_key(stable_source_id, channel)
         if circuit_key not in by_circuit_key:
             known_keys = {
                 "savantUUID",
@@ -362,9 +461,14 @@ def _build_circuit_rows(circuit_text: str) -> tuple[str, dict[str, dict[str, Any
 
             by_circuit_key[circuit_key] = {
                 "circuit_key": circuit_key,
+                # Preserve the source schema: an absent Savant UUID remains
+                # absent. UUID-less named CTs use a separate stable source id
+                # derived from the Influx measurement.
                 "savantUUID": savant_uuid,
+                "source_uid": stable_source_id,
+                "identity_source": "savant_uuid" if savant_uuid else "measurement",
                 "channel": channel,
-                "name": (row.get("name") or "").strip(),
+                "name": circuit_name,
                 "classification": (row.get("classification") or "").strip(),
                 "dimmable": _safe_bool(row.get("dimmable", "False")),
                 "group": (row.get("group") or "").strip(),
@@ -379,6 +483,283 @@ def _build_circuit_rows(circuit_text: str) -> tuple[str, dict[str, dict[str, Any
             by_circuit_key[circuit_key][field] = _safe_float(row.get("_value"))
 
     return pbc_device_id, by_circuit_key
+
+
+def _build_hub_circuit_rows(system_text: str) -> dict[str, dict[str, Any]]:
+    """Extract measurement-only circuit rows from type=0000 hub channels.
+
+    Current Savant hosts can emit relay circuit telemetry only as
+    ``Energy.Circuit.<display name>.Power`` and ``.Energy`` hub channels.  The
+    rows have no ``savantUUID`` and, importantly, contain no relay state or
+    control data.
+    """
+    hub_rows: dict[str, dict[str, Any]] = {}
+    for row in _parse_influx_csv(system_text):
+        channel = str(row.get("channel") or "").strip()
+        match = _HUB_CIRCUIT_CHANNEL_RE.match(channel)
+        if not match:
+            continue
+        display_name = match.group("name").strip()
+        if not _is_usable_name(display_name):
+            continue
+        field = match.group("field").lower()
+        hub_row = hub_rows.setdefault(
+            display_name,
+            {
+                "name": display_name,
+                "raw_display_name": display_name,
+                "channels": {},
+            },
+        )
+        hub_row[field] = _safe_float(row.get("_value"))
+        hub_row["channels"][field] = channel
+    # Savant also publishes zero-filled Energy.Circuit placeholders for relay
+    # loads that have no telemetry source. Treating those rows as live created
+    # convincing but false 0 W / 0 kWh sensors. A hub circuit becomes a
+    # measurement source only after either counter carries actual evidence.
+    return {
+        name: hub_row
+        for name, hub_row in hub_rows.items()
+        if any(
+            field in hub_row and abs(_safe_float(hub_row.get(field))) > 0.0
+            for field in ("power", "energy")
+        )
+    }
+
+
+def _canonical_hub_match_name(value: str) -> str:
+    """Normalize safe Savant label variants without collapsing distinct loads."""
+    text = str(value or "").lower()
+    # Preserve the base name for ordinary possessives (``Kylo's`` -> ``Kylo``).
+    text = re.sub(r"(?<=[a-z0-9])[\u2019']s\b", "", text)
+    tokens = _normalize_name(text).split()
+    canonical_tokens: list[str] = []
+    index = 0
+    while index < len(tokens):
+        # Savant alternates between A/C and AC in relay and hub labels.
+        if tokens[index:index + 2] == ["a", "c"]:
+            canonical_tokens.append("ac")
+            index += 2
+            continue
+        token = tokens[index]
+        canonical_tokens.append(
+            {
+                "up": "upstairs",
+                "down": "downstairs",
+                "detectors": "detector",
+            }.get(token, token)
+        )
+        index += 1
+    return " ".join(canonical_tokens)
+
+
+def _stored_match_aliases(metadata: dict[str, Any]) -> set[str]:
+    """Return every safe, canonical stored name usable for hub matching."""
+    aliases: set[str] = set()
+    for name_field in ("display_name", "influx_name", "relay_match_name"):
+        name = str(metadata.get(name_field) or "").strip()
+        canonical = _canonical_hub_match_name(name)
+        if _is_usable_name(canonical):
+            aliases.add(canonical)
+    return aliases
+
+
+def _mutually_unique_pairs(edges: dict[str, set[str]]) -> list[tuple[str, str]]:
+    """Return only globally one-to-one candidate edges, in stable order."""
+    reverse: dict[str, set[str]] = defaultdict(set)
+    for hub_name, circuit_keys in edges.items():
+        for circuit_key in circuit_keys:
+            reverse[circuit_key].add(hub_name)
+    return [
+        (hub_name, next(iter(circuit_keys)))
+        for hub_name, circuit_keys in sorted(edges.items())
+        if len(circuit_keys) == 1 and len(reverse[next(iter(circuit_keys))]) == 1
+    ]
+
+
+def _resolve_hub_circuit_matches(
+    hub_rows: dict[str, dict[str, Any]],
+    stored_metadata: dict[str, dict[str, Any]],
+    detailed_circuit_keys: set[str],
+) -> dict[str, tuple[str, str]]:
+    """Resolve hub labels with strict, globally one-to-one matching tiers.
+
+    Every tier considers the complete stored map, including detailed live rows,
+    so a partial detailed multi-leg circuit cannot make a previously ambiguous
+    hub label appear unique. ``detailed_circuit_keys`` are allowed to block a
+    match but are never replaced by aggregate hub telemetry.
+    """
+    aliases_by_key = {
+        circuit_key: _stored_match_aliases(metadata)
+        for circuit_key, metadata in stored_metadata.items()
+    }
+    hub_names = {
+        hub_key: _canonical_hub_match_name(str(hub_row.get("name") or ""))
+        for hub_key, hub_row in hub_rows.items()
+    }
+    unresolved = {hub_key for hub_key, name in hub_names.items() if _is_usable_name(name)}
+    detailed_blockers = set(detailed_circuit_keys)
+    # Hub-resolved keys are lower-confidence than detailed rows and can be
+    # removed from later tiers. Detailed blockers deliberately remain in every
+    # candidate edge so a partial UUID snapshot continues to block a hub
+    # aggregate from filling another leg.
+    hub_resolved_keys: set[str] = set()
+    resolved: dict[str, tuple[str, str]] = {}
+
+    def apply_pairs(edges: dict[str, set[str]], source: str) -> None:
+        for hub_key, circuit_key in _mutually_unique_pairs(edges):
+            unresolved.discard(hub_key)
+            if circuit_key not in detailed_blockers:
+                resolved[hub_key] = (circuit_key, source)
+                hub_resolved_keys.add(circuit_key)
+
+    # Tier 1: exact canonical aliases. This covers harmless punctuation,
+    # possessive, A/C, and up/downstairs variations without approximation.
+    exact_edges = {
+        hub_key: {
+            circuit_key
+            for circuit_key, aliases in aliases_by_key.items()
+            if circuit_key not in hub_resolved_keys
+            if hub_name in aliases
+        }
+        for hub_key, hub_name in hub_names.items()
+        if hub_key in unresolved
+    }
+    apply_pairs(exact_edges, "hub_exact")
+
+    # Tier 2a: token-set equality handles harmless word reordering while
+    # keeping a shorter base label from being confused with its "Blower"
+    # sibling.
+    equal_token_edges: dict[str, set[str]] = {}
+    for hub_key in sorted(unresolved):
+        hub_tokens = set(hub_names[hub_key].split())
+        if not hub_tokens:
+            continue
+        equal_token_edges[hub_key] = {
+            circuit_key
+            for circuit_key, aliases in aliases_by_key.items()
+            if circuit_key not in hub_resolved_keys
+            if any(hub_tokens == set(alias.split()) for alias in aliases)
+        }
+    apply_pairs(equal_token_edges, "hub_token_set")
+
+    # Tier 2b: a whole token set contained in the other label. This accepts
+    # label extensions such as "Patio TV Kitchen" but only under the same
+    # global one-to-one rule.
+    containment_edges: dict[str, set[str]] = {}
+    for hub_key in sorted(unresolved):
+        hub_tokens = set(hub_names[hub_key].split())
+        if not hub_tokens:
+            continue
+        containment_edges[hub_key] = {
+            circuit_key
+            for circuit_key, aliases in aliases_by_key.items()
+            if circuit_key not in hub_resolved_keys
+            if any(
+                hub_tokens < set(alias.split()) or set(alias.split()) < hub_tokens
+                for alias in aliases
+            )
+        }
+    apply_pairs(containment_edges, "hub_token_containment")
+
+    # Tier 3: only high-confidence, mutual fuzzy best matches with a clear
+    # score gap. It recovers harmless spelling/truncation variants while
+    # leaving near matches unavailable instead of guessing.
+    score_matrix: dict[str, dict[str, float]] = {}
+    for hub_key in sorted(unresolved):
+        hub_name = hub_names[hub_key]
+        score_matrix[hub_key] = {
+            circuit_key: max(
+                (SequenceMatcher(None, hub_name, alias).ratio() for alias in aliases),
+                default=0.0,
+            )
+            for circuit_key, aliases in aliases_by_key.items()
+            if circuit_key not in hub_resolved_keys
+        }
+
+    def unique_best(scores: dict[str, float]) -> str | None:
+        ranked = sorted(((score, key) for key, score in scores.items()), reverse=True)
+        if not ranked or ranked[0][0] < _HUB_FUZZY_MIN_SCORE:
+            return None
+        if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < _HUB_FUZZY_MIN_MARGIN:
+            return None
+        return ranked[0][1]
+
+    fuzzy_hub_best = {
+        hub_key: unique_best(scores)
+        for hub_key, scores in score_matrix.items()
+    }
+    fuzzy_circuit_keys = next(iter(score_matrix.values()), {})
+    fuzzy_stored_best = {
+        circuit_key: unique_best(
+            {hub_key: scores[circuit_key] for hub_key, scores in score_matrix.items()}
+        )
+        for circuit_key in fuzzy_circuit_keys
+    }
+    for hub_key, circuit_key in sorted(fuzzy_hub_best.items()):
+        if circuit_key is None or fuzzy_stored_best.get(circuit_key) != hub_key:
+            continue
+        unresolved.discard(hub_key)
+        if circuit_key not in detailed_blockers:
+            resolved[hub_key] = (circuit_key, "hub_fuzzy")
+            hub_resolved_keys.add(circuit_key)
+
+    return resolved
+
+
+def _build_hub_present_demand(
+    circuit_key: str,
+    metadata: dict[str, Any],
+    hub_row: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a stored-circuit live row from measurement-only hub telemetry.
+
+    Live Savant evidence establishes that hub circuit counters are Wh (unlike
+    detailed relay rows, which use mWh), so publish kWh with an explicit
+    divisor while retaining the raw value for diagnostics.
+    """
+    savant_uuid, stored_channel = split_circuit_key(circuit_key)
+    savant_uuid = str(metadata.get("savant_uuid") or savant_uuid).strip()
+    stored_channel = str(metadata.get("channel") or stored_channel).strip()
+    role = str(metadata.get("role") or "ct_sensor").strip().lower()
+    if role not in ("relay", "ct_sensor"):
+        role = "ct_sensor"
+
+    demand: dict[str, Any] = {
+        "uid": circuit_key,
+        "circuit_key": circuit_key,
+        "base_uid": savant_uuid or circuit_key,
+        "name": metadata.get("display_name") or metadata.get("influx_name") or hub_row["name"],
+        "influx_name": metadata.get("influx_name") or hub_row["name"],
+        "channel": stored_channel,
+        "classification": metadata.get("classification", ""),
+        "type": metadata.get("type", ""),
+        "role": role,
+        # Stored relay metadata must not make aggregate telemetry controllable.
+        "has_relay": False,
+        "relay_match_name": metadata.get("relay_match_name"),
+        "relay_match_source": metadata.get("role_source"),
+        "power": hub_row.get("power"),
+        "energy_raw": hub_row.get("energy"),
+        "energy_scale_divisor": 1_000,
+        "energy_scale_confidence": 1.0,
+        "energy_scale_status": "hub_wh_to_kwh",
+        "energy_source": "hub_aggregate",
+        "measurement_source": "hub_channel",
+        "hub_match_source": hub_row.get("match_source"),
+        "hub_channels": dict(hub_row.get("channels") or {}),
+        "legacy_uid": metadata.get("legacy_uid", circuit_key),
+        "legacy_base_uid": metadata.get("legacy_base_uid") or savant_uuid or circuit_key,
+    }
+    # Avoid adding a made-up zero when one of the two hub measurements is
+    # absent. The field is live only when Influx actually returned it.
+    if "power" not in hub_row:
+        demand.pop("power")
+    if "energy" in hub_row:
+        demand["energy"] = _safe_float(hub_row["energy"]) / 1_000.0
+    else:
+        demand.pop("energy_raw")
+    return demand
 
 
 def _build_sem_index(
@@ -724,9 +1105,14 @@ def _assign_legacy_identity(circuit_map: dict[str, dict[str, Any]]) -> None:
         if metadata.get("legacy_uid"):
             continue
         savant_uuid = str(metadata.get("savant_uuid", "")).strip()
+        source_uid = str(metadata.get("source_uid", "")).strip() or savant_uuid
         channel = str(metadata.get("channel", "")).strip()
-        metadata["legacy_uid"] = f"{savant_uuid}.{channel}" if savant_uuid and channel else metadata["circuit_key"]
-        metadata["legacy_base_uid"] = savant_uuid or metadata["circuit_key"]
+        metadata["legacy_uid"] = (
+            f"{source_uid}.{channel}"
+            if source_uid and channel
+            else metadata["circuit_key"]
+        )
+        metadata["legacy_base_uid"] = source_uid or metadata["circuit_key"]
 
 
 async def fetch_sem_devices_from_sem(
@@ -917,6 +1303,7 @@ async def fetch_influx_snapshot(
     circuit_metadata: dict[str, dict[str, Any]] | None = None,
     sample_seconds: float = 5.0,
     range_start: str = "-2m",
+    influx_bucket: str = DEFAULT_INFLUX_BUCKET,
 ) -> InfluxFetchResult:
     """Fetch the latest circuit and system data from InfluxDB.
 
@@ -926,31 +1313,40 @@ async def fetch_influx_snapshot(
     """
     try:
         async with aiohttp.ClientSession() as session:
-            ok, circuit_text, err, auth_failure, org_failure = await _post_flux(
+            circuit_result = _coerce_query_result(await _post_flux(
                 session,
                 influx_url,
                 influx_token,
                 influx_org,
-                _CIRCUIT_QUERY.format(range_start=range_start),
-            )
+                _CIRCUIT_QUERY.format(range_start=range_start, bucket=_flux_string(influx_bucket)),
+            ))
+            ok = circuit_result.success
+            circuit_text = circuit_result.body_text
+            err = circuit_result.error_message
+            auth_failure = circuit_result.auth_failure
+            org_failure = circuit_result.org_failure
             if not ok:
                 return InfluxFetchResult(
                     success=False,
-                    error_type="circuit_query_failed",
+                    error_type=_query_error_key(circuit_result),
                     error_message=err,
                     auth_failure=auth_failure,
+                    permission_failure=circuit_result.permission_failure,
                     org_failure=org_failure,
+                    bucket_failure=circuit_result.bucket_failure,
+                    failure_class=circuit_result.failure_class,
                     query_window=range_start,
                 )
 
             # System query failure is non-fatal — degrade gracefully.
-            ok_sys, system_text, _, _, _ = await _post_flux(
+            system_result = _coerce_query_result(await _post_flux(
                 session,
                 influx_url,
                 influx_token,
                 influx_org,
-                _SYSTEM_QUERY.format(range_start=range_start),
-            )
+                _SYSTEM_QUERY.format(range_start=range_start, bucket=_flux_string(influx_bucket)),
+            ))
+            ok_sys, system_text = system_result.success, system_result.body_text
     except Exception as exc:  # pragma: no cover
         return InfluxFetchResult(
             success=False,
@@ -963,27 +1359,75 @@ async def fetch_influx_snapshot(
 
     if scale_state is None:
         scale_state = {}
+
+    # Savant emits zero-filled placeholders for unsupported system channels as
+    # well as circuit channels. Publish a system channel after it has produced
+    # nonzero evidence, then retain legitimate zero states for the rest of this
+    # coordinator lifetime once that capability has been established.
+    system_capabilities = scale_state.setdefault("__system_capabilities__", {})
+    system_data: dict[str, float] = {}
+    if ok_sys:
+        for row in _parse_influx_csv(system_text):
+            channel = row.get("channel", "").strip()
+            if channel:
+                value = _safe_float(row.get("_value"))
+                if abs(value) > 0.0:
+                    system_capabilities[channel] = True
+                if system_capabilities.get(channel):
+                    system_data[channel] = value
+    hub_circuit_rows = _build_hub_circuit_rows(system_text) if ok_sys else {}
+
     stored_metadata = circuit_metadata or {}
 
     present_demands: list[dict[str, Any]] = []
     unknown_circuit_keys: list[str] = []
+    unknown_circuits: list[dict[str, str]] = []
     seen_circuit_keys: set[str] = set()
     for circuit_key, circuit in by_circuit_key.items():
         seen_circuit_keys.add(circuit_key)
         metadata = stored_metadata.get(circuit_key)
         if metadata is None:
             unknown_circuit_keys.append(circuit_key)
-            _LOGGER.warning(
-                "Skipping unmapped Savant circuit %s (%s, channel=%s, type=%s). Run Reconfigure to classify new circuits.",
-                circuit_key,
-                circuit.get("name", "<unnamed>"),
-                circuit.get("channel", "?"),
-                circuit.get("type", "<unknown>"),
+            unknown_circuits.append(
+                {
+                    "circuit_key": circuit_key,
+                    "display_name": str(circuit.get("name", "")).strip()
+                    or f"Circuit {circuit.get('channel', '?')}",
+                    "channel": str(circuit.get("channel", "")).strip(),
+                    "type": str(circuit.get("type", "")).strip(),
+                }
             )
-            continue
+            # A named, known CT type is safe to expose as a read-only sensor
+            # before reconfigure persists it. It can never receive relay
+            # control metadata. Other unknown rows remain excluded.
+            if not _is_known_ct_circuit(
+                circuit.get("classification", ""), circuit.get("type", "")
+            ):
+                continue
+            source_uid = str(circuit.get("source_uid", "")).strip() or str(
+                circuit.get("savantUUID", "")
+            ).strip() or circuit_key
+            channel = str(circuit.get("channel", "")).strip()
+            metadata = {
+                "circuit_key": circuit_key,
+                "savant_uuid": str(circuit.get("savantUUID", "")).strip(),
+                "source_uid": source_uid,
+                "channel": channel,
+                "type": str(circuit.get("type", "")).strip(),
+                "role": "ct_sensor",
+                "relay_uid": "",
+                "display_name": str(circuit.get("name", "")).strip()
+                or f"CT Channel {channel or '?'}",
+                "influx_name": str(circuit.get("name", "")).strip(),
+                "legacy_uid": f"{source_uid}.{channel}" if channel else circuit_key,
+                "legacy_base_uid": source_uid,
+                "role_source": "known_ct_runtime",
+                "resolution_source": "known_ct_runtime",
+            }
 
         savant_uuid = str(circuit.get("savantUUID", "")).strip()
-        base_uid, _ab_side = parse_uid(savant_uuid)
+        source_uid = str(circuit.get("source_uid", "")).strip() or savant_uuid
+        base_uid, _ab_side = parse_uid(source_uid)
         role = str(metadata.get("role", "unknown")).strip().lower()
         if role not in ("relay", "ct_sensor"):
             _LOGGER.warning(
@@ -1042,7 +1486,7 @@ async def fetch_influx_snapshot(
         present_demands.append(
             {
                 # Identity
-                "uid": circuit_key,   # Stable entity key = (savantUUID, channel)
+                "uid": circuit_key,   # Stable entity key = (source identity, channel)
                 "circuit_key": circuit_key,
                 "base_uid": base_uid, # Base UID for HASS device grouping
                 "name": metadata.get("display_name")
@@ -1084,7 +1528,22 @@ async def fetch_influx_snapshot(
             }
         )
 
-    if not by_circuit_key:
+    # Detailed savantUUID rows are authoritative. The resolver is globally
+    # one-to-one across each matching tier, so aggregate labels never fill a
+    # missing leg or an ambiguous relay identity.
+    hub_matches = _resolve_hub_circuit_matches(
+        hub_circuit_rows,
+        stored_metadata,
+        seen_circuit_keys,
+    )
+    for hub_key, (circuit_key, match_source) in sorted(hub_matches.items()):
+        metadata = stored_metadata[circuit_key]
+        hub_row = dict(hub_circuit_rows[hub_key])
+        hub_row["match_source"] = match_source
+        present_demands.append(_build_hub_present_demand(circuit_key, metadata, hub_row))
+        seen_circuit_keys.add(circuit_key)
+
+    if not by_circuit_key and not hub_circuit_rows:
         return InfluxFetchResult(
             success=False,
             error_type="empty_response",
@@ -1114,18 +1573,10 @@ async def fetch_influx_snapshot(
         ),
     )
 
-    # --- Build system_data from hub CSV ---
-    # Keys are the InfluxDB channel tag values, e.g. "Energy.Total.Consumption.Power"
-    system_data: dict[str, float] = {}
-    if ok_sys:
-        for row in _parse_influx_csv(system_text):
-            channel = row.get("channel", "").strip()
-            if channel:
-                system_data[channel] = _safe_float(row.get("_value"))
-
     _LOGGER.debug(
-        "InfluxDB fetch: %d circuits, %d system channels",
+        "InfluxDB fetch: %d circuits (%d hub synthesized), %d system channels",
         len(present_demands),
+        sum(1 for demand in present_demands if demand.get("measurement_source") == "hub_channel"),
         len(system_data),
     )
 
@@ -1144,7 +1595,15 @@ async def fetch_influx_snapshot(
             "pbc_device_id": pbc_device_id,  # PBC SignalR target device ID
             "circuit_map_status": {
                 "reconfigure_required": bool(unknown_circuit_keys or missing_circuit_keys),
-                "unknown_circuit_keys": unknown_circuit_keys,
+                "inventory_status": "partial" if missing_circuit_keys else "complete",
+                "identity_inventory_status": "partial" if missing_circuit_keys else "complete",
+                "inventory_authority": "live_snapshot",
+                "inventory_authoritative": not bool(missing_circuit_keys),
+                "unknown_circuit_keys": sorted(unknown_circuit_keys),
+                "unknown_circuits": sorted(
+                    unknown_circuits,
+                    key=lambda circuit: circuit["circuit_key"],
+                ),
                 "missing_circuit_keys": missing_circuit_keys,
             },
         },
@@ -1162,9 +1621,23 @@ async def fetch_influx_snapshot_with_backfill(
     circuit_metadata: dict[str, dict[str, Any]] | None = None,
     sample_seconds: float = 5.0,
     backfill_windows: tuple[str, ...] = _BACKFILL_WINDOWS,
+    influx_bucket: str = DEFAULT_INFLUX_BUCKET,
 ) -> InfluxFetchResult:
     """Fetch a snapshot, widening the lookback window before failing."""
     last_empty_result: InfluxFetchResult | None = None
+    first_live_result: InfluxFetchResult | None = None
+    inventory_union: dict[str, dict[str, Any]] = {}
+
+    def identity_only(demands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Keep only circuit identity when a historical window fills inventory."""
+        identity_keys = {
+            "uid", "circuit_key", "base_uid", "name", "influx_name", "channel",
+            "classification", "type", "role", "relay_uid", "has_relay",
+            "relay_match_name", "relay_match_source", "capacity", "legacy_uid",
+            "legacy_base_uid",
+        }
+        return [{key: value for key, value in item.items() if key in identity_keys}
+                for item in demands if isinstance(item, dict)]
     for range_start in backfill_windows:
         _LOGGER.debug(
             "InfluxDB snapshot attempt for org %s using lookback %s",
@@ -1181,14 +1654,42 @@ async def fetch_influx_snapshot_with_backfill(
             circuit_metadata=circuit_metadata,
             sample_seconds=sample_seconds,
             range_start=range_start,
+            influx_bucket=influx_bucket,
         )
         if result.success and result.data is not None:
-            _LOGGER.debug(
-                "InfluxDB snapshot attempt succeeded for org %s using %s",
-                influx_org or "<unset>",
-                range_start,
-            )
-            return result
+            status = result.data.get("circuit_map_status", {})
+            if first_live_result is None:
+                # The first successful query is the only authority for live
+                # measurements. Wider windows may fill identity inventory,
+                # but must never replace presentDemands values.
+                first_live_result = result
+            for item in result.data.get("presentDemands") or []:
+                if isinstance(item, dict):
+                    key = str(item.get("circuit_key") or item.get("uid") or "")
+                    if key:
+                        inventory_union[key] = identity_only([item])[0]
+            if not status.get("missing_circuit_keys"):
+                _LOGGER.debug(
+                    "InfluxDB snapshot attempt succeeded for org %s using %s",
+                    influx_org or "<unset>",
+                    range_start,
+                )
+                if first_live_result is result:
+                    result.data.setdefault("circuit_map_status", {})["inventory_status"] = "complete"
+                    result.data["circuit_map_status"]["identity_inventory_status"] = "complete"
+                    result.data["circuit_map_status"]["inventory_authority"] = "live_snapshot"
+                    return result
+                first_live_result.data["inventoryDemands"] = list(inventory_union.values())
+                # `inventory_status` describes the live measurement window.
+                # A historical completion is identity-only and must not make a
+                # partial live snapshot appear authoritative to consumers.
+                first_live_result.data["circuit_map_status"]["identity_inventory_status"] = "complete"
+                first_live_result.data["circuit_map_status"]["inventory_authoritative"] = False
+                first_live_result.data["circuit_map_status"]["inventory_authority"] = "historical_identity_only"
+                return first_live_result
+            # Keep searching for a complete identity inventory. The live
+            # result remains the narrow-window result captured above.
+            inventory = result.data.get("presentDemands") or []
         if result.auth_failure or result.org_failure:
             _LOGGER.debug(
                 "InfluxDB snapshot attempt stopped for org %s at %s due to %s",
@@ -1209,6 +1710,14 @@ async def fetch_influx_snapshot_with_backfill(
         influx_org or "<unset>",
         ", ".join(backfill_windows),
     )
+    if first_live_result is not None:
+        status = first_live_result.data.setdefault("circuit_map_status", {})
+        status["inventory_status"] = "partial"
+        status["identity_inventory_status"] = "partial"
+        status["inventory_authoritative"] = False
+        status["inventory_authority"] = "live_snapshot_only"
+        first_live_result.data["inventoryDemands"] = list(inventory_union.values())
+        return first_live_result
     return last_empty_result or InfluxFetchResult(
         success=False,
         error_type="empty_response",
@@ -1221,6 +1730,60 @@ async def fetch_influx_snapshot_with_backfill(
     )
 
 
+def build_measurement_bootstrap_inventory(
+    snapshot_data: dict[str, Any] | None,
+    circuit_map: dict[str, dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Return stable identity shells for measurement entities only.
+
+    Stored circuit-map identities restore entities removed during a transient
+    partial inventory. Historical `inventoryDemands` may supplement them, but
+    no historical value fields are ever copied into live measurements.
+    """
+    identities: dict[str, dict[str, Any]] = {}
+    for circuit_key, metadata in sorted((circuit_map or {}).items()):
+        if not isinstance(metadata, dict):
+            continue
+        uid = str(metadata.get("circuit_key") or circuit_key).strip()
+        if not uid:
+            continue
+        identities[uid] = {
+            "uid": uid,
+            "circuit_key": uid,
+            "base_uid": str(
+                metadata.get("source_uid") or metadata.get("savant_uuid") or uid
+            ),
+            "name": metadata.get("display_name") or metadata.get("influx_name") or f"Circuit {metadata.get('channel', '?')}",
+            "influx_name": metadata.get("influx_name", ""),
+            "channel": metadata.get("channel", ""),
+            "classification": metadata.get("classification", ""),
+            "type": metadata.get("type", ""),
+            "role": metadata.get("role", "ct_sensor"),
+            "relay_uid": metadata.get("relay_uid", ""),
+            "has_relay": False,  # historical identities never authorize control
+            "capacity": metadata.get("capacity", 0),
+            "legacy_uid": metadata.get("legacy_uid", uid),
+            "legacy_base_uid": metadata.get("legacy_base_uid")
+            or metadata.get("source_uid")
+            or metadata.get("savant_uuid")
+            or uid,
+        }
+    for item in (snapshot_data or {}).get("inventoryDemands") or []:
+        if not isinstance(item, dict):
+            continue
+        uid = str(item.get("uid") or item.get("circuit_key") or "").strip()
+        if not uid:
+            continue
+        shell = {key: value for key, value in item.items() if key not in {
+            "power", "current", "voltage", "energy", "energy_raw", "percentCommanded", "flags",
+            "energy_scale_divisor", "energy_scale_confidence", "energy_scale_status",
+        }}
+        shell["uid"] = uid
+        shell["has_relay"] = False
+        identities.setdefault(uid, shell)
+    return list(identities.values())
+
+
 async def discover_circuit_metadata(
     influx_url: str,
     influx_token: str,
@@ -1229,17 +1792,21 @@ async def discover_circuit_metadata(
     sem_port: int = 8644,
     pbc_websocket_port: int = 8480,
     range_start: str = "-2m",
+    influx_bucket: str = DEFAULT_INFLUX_BUCKET,
+    host_load_identifiers: tuple[dict[str, str], ...] = (),
 ) -> CircuitDiscoveryResult:
     """Resolve relay/CT identity once during setup or reconfigure."""
     try:
         async with aiohttp.ClientSession() as session:
-            ok, circuit_text, err, auth_failure, org_failure = await _post_flux(
+            circuit_result = _coerce_query_result(await _post_flux(
                 session,
                 influx_url,
                 influx_token,
                 influx_org,
-                _CIRCUIT_QUERY.format(range_start=range_start),
-            )
+                _CIRCUIT_QUERY.format(range_start=range_start, bucket=_flux_string(influx_bucket)),
+            ))
+            ok, circuit_text, err = circuit_result.success, circuit_result.body_text, circuit_result.error_message
+            auth_failure, org_failure = circuit_result.auth_failure, circuit_result.org_failure
     except Exception as exc:  # pragma: no cover
         return CircuitDiscoveryResult(
             success=False,
@@ -1251,14 +1818,10 @@ async def discover_circuit_metadata(
     if not ok:
         return CircuitDiscoveryResult(
             success=False,
-            error_key=(
-                "org_auth_failed"
-                if auth_failure
-                else "org_discovery_failed"
-                if org_failure
-                else "circuit_discovery_failed"
-            ),
+            error_key=_query_error_key(circuit_result),
             error_message=err,
+            failure_class=circuit_result.failure_class,
+            http_status=circuit_result.http_status,
             query_window=range_start,
         )
 
@@ -1301,6 +1864,7 @@ async def discover_circuit_metadata(
         downgraded_from_relay: bool = False,
     ) -> dict[str, Any]:
         savant_uuid = str(circuit.get("savantUUID", "")).strip()
+        source_uid = str(circuit.get("source_uid", "")).strip() or savant_uuid
         relay_uid = matched_device.get("uid", "") if matched_device and role == "relay" else ""
         relay_match_name = None
         if matched_device and role == "relay":
@@ -1316,6 +1880,7 @@ async def discover_circuit_metadata(
         return {
             "circuit_key": circuit_key,
             "savant_uuid": savant_uuid,
+            "source_uid": source_uid,
             "channel": str(circuit.get("channel", "")).strip(),
             "type": str(circuit.get("type", "")).strip(),
             "role": role,
@@ -1420,10 +1985,55 @@ async def discover_circuit_metadata(
             }
         )
 
+    # The raw localHub bucket retains only seven days and may temporarily stop
+    # publishing detailed relay rows. Savant's loadIdentifiers.json is the
+    # authoritative identity bridge: UUID -> BLE/SEM UID -> state channel.
+    # Seed omitted relays without synthesizing a UUID from a mutable name.
+    sem_by_uid = {str(device.get("uid") or "").strip(): device for device in sem_devices}
+    mapped_savant_uuids = {
+        str(metadata.get("savant_uuid") or "").strip()
+        for metadata in circuit_map.values()
+        if metadata.get("savant_uuid")
+    }
+    for identifier in host_load_identifiers:
+        savant_uuid = str(identifier.get("savant_uuid") or "").strip()
+        relay_uid = str(identifier.get("relay_uid") or "").strip()
+        channel = str(identifier.get("state_channel") or "").strip()
+        if not savant_uuid or not relay_uid or savant_uuid in mapped_savant_uuids:
+            continue
+        matched_device = sem_by_uid.get(relay_uid)
+        if matched_device is None:
+            warnings.append(
+                f"Host identity {savant_uuid} references relay {relay_uid}, which is absent from current SEM inventory."
+            )
+            continue
+        circuit_key = build_circuit_key(savant_uuid, channel or "0")
+        circuit = {
+            "savantUUID": savant_uuid,
+            "source_uid": savant_uuid,
+            "channel": channel or "0",
+            "name": str(identifier.get("name") or "").strip(),
+            "classification": "consumer",
+            "type": "host_load_identifier",
+        }
+        circuit_map[circuit_key] = _build_circuit_metadata_entry(
+            circuit_key=circuit_key,
+            circuit=circuit,
+            role="relay",
+            role_source="host_load_identifier",
+            matched_device=matched_device,
+            match_source="uid",
+        )
+        # The host label is a telemetry alias only. Identity stays on UUID/UID.
+        circuit_map[circuit_key]["influx_name"] = circuit["name"]
+        circuit_map[circuit_key]["relay_match_name"] = circuit["name"]
+        resolution_sources[circuit_key] = "host_load_identifier"
+        mapped_savant_uuids.add(savant_uuid)
+
     websocket_devices: list[dict[str, Any]] = []
     if unresolved_relay_candidates:
         ws_ok, websocket_devices = await fetch_pbc_websocket_devices(
-            sem_host=sem_host,
+            pbc_host=sem_host,
             pbc_port=pbc_websocket_port,
             pbc_device_id=_pbc_device_id,
         )
@@ -1489,6 +2099,8 @@ async def discover_circuit_metadata_with_backfill(
     sem_port: int = 8644,
     pbc_websocket_port: int = 8480,
     backfill_windows: tuple[str, ...] = _BACKFILL_WINDOWS,
+    influx_bucket: str = DEFAULT_INFLUX_BUCKET,
+    host_load_identifiers: tuple[dict[str, str], ...] = (),
 ) -> CircuitDiscoveryResult:
     """Resolve the persisted circuit map, widening the lookback window before failing."""
     last_result: CircuitDiscoveryResult | None = None
@@ -1501,11 +2113,23 @@ async def discover_circuit_metadata_with_backfill(
             sem_port=sem_port,
             pbc_websocket_port=pbc_websocket_port,
             range_start=range_start,
+            influx_bucket=influx_bucket,
+            host_load_identifiers=host_load_identifiers,
         )
         if result.success and result.circuit_map:
             return result
         last_result = result
-        if result.error_key in {"org_auth_failed", "org_discovery_failed", "sem_companion_failed"}:
+        if result.error_key in {
+            "org_auth_failed",
+            "org_discovery_failed",
+            "influx_auth_failed",
+            "influx_permission_denied",
+            "influx_org_invalid",
+            "influx_bucket_invalid",
+            "influx_unreachable",
+            "influx_query_failed",
+            "sem_companion_failed",
+        }:
             return result
     return last_result or CircuitDiscoveryResult(
         success=False,

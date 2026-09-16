@@ -28,6 +28,82 @@ def _circuit_csv() -> str:
 
 
 class InfluxClientBackfillTests(unittest.IsolatedAsyncioTestCase):
+    def test_bootstrap_inventory_uses_identity_only_and_never_measurements(self):
+        influx_client = _load_influx_client_module()
+        shells = influx_client.build_measurement_bootstrap_inventory(
+            {"inventoryDemands": [{"uid": "historical::1", "name": "Historical", "power": 999, "energy": 42}]},
+            {"stored::1": {"circuit_key": "stored::1", "display_name": "Stored", "legacy_uid": "relay.0"}},
+        )
+        self.assertEqual({item["uid"] for item in shells}, {"stored::1", "historical::1"})
+        self.assertFalse(any("power" in item or "energy" in item for item in shells))
+        self.assertTrue(all(item["has_relay"] is False for item in shells))
+
+    async def test_historical_complete_inventory_does_not_make_partial_live_authoritative(self):
+        influx_client = _load_influx_client_module()
+        partial = influx_client.InfluxFetchResult(
+            success=True,
+            data={"presentDemands": [{"uid": "live::1", "power": 1}], "circuit_map_status": {"missing_circuit_keys": ["lost::2"], "inventory_status": "partial", "inventory_authoritative": False}},
+            query_window="-2m",
+        )
+        historical = influx_client.InfluxFetchResult(
+            success=True,
+            data={"presentDemands": [{"uid": "live::1", "power": 999}, {"uid": "lost::2", "power": 888}], "circuit_map_status": {"missing_circuit_keys": [], "inventory_status": "complete", "inventory_authoritative": True}},
+            query_window="-15m",
+        )
+        with mock.patch.object(influx_client, "fetch_influx_snapshot", new=mock.AsyncMock(side_effect=[partial, historical])):
+            result = await influx_client.fetch_influx_snapshot_with_backfill("url", "token", "org", backfill_windows=("-2m", "-15m"))
+        self.assertEqual(result.data["presentDemands"], partial.data["presentDemands"])
+        self.assertEqual(result.data["circuit_map_status"]["inventory_status"], "partial")
+        self.assertEqual(result.data["circuit_map_status"]["identity_inventory_status"], "complete")
+        self.assertFalse(result.data["circuit_map_status"]["inventory_authoritative"])
+
+    def test_query_result_classifies_auth_and_is_legacy_unpackable(self):
+        influx_client = _load_influx_client_module()
+
+        result = influx_client.InfluxQueryResult(
+            False, error_message="Unauthorized (401)", failure_class="unauthorized_401"
+        )
+
+        self.assertEqual(result.status, "unauthorized_401")
+        self.assertTrue(result.auth_failure)
+        self.assertEqual(tuple(result), (False, "", "Unauthorized (401)", True, False))
+
+    def test_query_result_distinguishes_permission_failure(self):
+        influx_client = _load_influx_client_module()
+
+        result = influx_client.InfluxQueryResult(
+            False,
+            error_message="Forbidden (403)",
+            failure_class="forbidden_403",
+            http_status=403,
+        )
+
+        self.assertFalse(result.auth_failure)
+        self.assertTrue(result.permission_failure)
+        self.assertEqual(result.http_status, 403)
+        self.assertEqual(influx_client._query_error_key(result), "influx_permission_denied")
+
+    def test_query_error_keys_are_specific(self):
+        influx_client = _load_influx_client_module()
+
+        expected = {
+            "unauthorized_401": "influx_auth_failed",
+            "forbidden_403": "influx_permission_denied",
+            "invalid_org": "influx_org_invalid",
+            "invalid_bucket": "influx_bucket_invalid",
+            "unreachable": "influx_unreachable",
+            "other_query": "influx_query_failed",
+        }
+        for failure_class, error_key in expected.items():
+            with self.subTest(failure_class=failure_class):
+                result = influx_client.InfluxQueryResult(False, failure_class=failure_class)
+                self.assertEqual(influx_client._query_error_key(result), error_key)
+
+    def test_flux_bucket_is_encoded_as_a_string_literal(self):
+        influx_client = _load_influx_client_module()
+
+        self.assertEqual(influx_client._flux_string('hub"west'), '"hub\\\"west"')
+
     async def test_fetch_influx_snapshot_backfills_to_a_wider_window(self):
         influx_client = _load_influx_client_module()
 

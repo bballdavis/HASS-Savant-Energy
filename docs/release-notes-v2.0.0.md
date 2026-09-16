@@ -19,6 +19,7 @@ Savant threw us for a loop with firmware 11.2. The old PBC snapshot path was no 
 - Added per-circuit energy scale detection, confidence reporting, and guards against implausible CT energy jumps.
 - Added clearer setup and runtime errors for SSH, Influx authentication, organization discovery, circuit discovery, and relay mapping.
 - Added persistent notifications for recovery and reconfigure actions.
+- Circuit inventory mismatches now produce one aggregated reconfigure warning instead of repeating one warning per circuit on every polling cycle.
 - Added config storage normalization so stale options do not override fresh connection data.
 - Added cleanup for old DMX entities and orphaned circuit devices left by earlier identity schemes.
 - Kept legacy mode available and added Auto mode behavior that chooses legacy or current setup based on the available Savant feed.
