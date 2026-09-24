@@ -87,7 +87,13 @@ The relay control side got cleaned up too. Instead of routing commands through t
 
 If Current-mode setup fails, use the [SSH troubleshooting guide](docs/troubleshooting-ssh.md) to capture focused Home Assistant logs and check the host connection.
 
-InfluxDB uses a token-based auth model, but normal setup retrieves the read token over SSH rather than asking you to copy it. During setup, enter the `RPM` user's password. The integration reads the token from the host, validates a candidate against real Savant circuit data, installs a refresh key, and then creates the entry. Your password is used only for that bootstrap operation and is never stored. The generated SSH private key and validated InfluxDB token are stored in Home Assistant's encrypted config storage.
+InfluxDB uses a token-based auth model, but normal setup retrieves the read token over SSH rather than asking you to copy it. During setup, enter the `RPM` user's password. The integration reads the token from the host, validates a candidate against real Savant telemetry, installs a refresh key, and then creates the entry. Your password is used only for that bootstrap operation and is never stored. The generated SSH private key and validated InfluxDB token are stored in Home Assistant's encrypted config storage.
+
+### Channel-only telemetry fallback
+
+Current mode prefers UUID-backed circuit records. If a host supplies no usable UUID circuit records, setup checks recent, known system channels instead. A valid channel-only host can expose system sensors such as total consumption, solar, battery, grid, and group power in **read-only** mode. Unknown channel labels do not create load entities or relay identities.
+
+In read-only mode, the integration keeps any existing circuit map and may show measurements matched to those existing loads, but it does not create new per-load identities or send relay, scene, or All Loads commands. Missing UUID rows do not cause a circuit-map reconfigure warning or entity cleanup. Reconfigure after a UUID-backed source becomes available to restore relay control. The Home Assistant log records the selected telemetry schema and channel count without recording token contents.
 
 That SSH key is not just for first setup. If InfluxDB later rejects the token with an auth failure, the integration uses the stored key to fetch a fresh token automatically, so normal token rotation or host restarts do not require re-entering the SSH password.
 

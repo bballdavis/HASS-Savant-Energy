@@ -28,6 +28,7 @@ from .const import (
     CONF_HOST,
     CONF_INFLUX_AUTH_METHOD,
     CONF_INFLUX_BUCKET,
+    CONF_INFLUX_SCHEMA_MODE,
     CONF_MODE,
     CONF_OLA_PORT,
     CONF_SCAN_INTERVAL,
@@ -45,6 +46,8 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_INFLUX_ORG,
     DEFAULT_INFLUX_BUCKET,
+    INFLUX_SCHEMA_CHANNEL_READ_ONLY,
+    INFLUX_SCHEMA_UUID,
 )
 from .current.influx_client import (
     InfluxFetchResult,
@@ -107,6 +110,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self.influx_token = entry.data.get(CONF_INFLUX_TOKEN, "")
         self.influx_org = entry.data.get(CONF_INFLUX_ORG, DEFAULT_INFLUX_ORG)
         self.influx_bucket = entry.data.get(CONF_INFLUX_BUCKET, DEFAULT_INFLUX_BUCKET) or DEFAULT_INFLUX_BUCKET
+        self.influx_schema_mode = entry.data.get(CONF_INFLUX_SCHEMA_MODE, INFLUX_SCHEMA_UUID)
         self.circuit_map = entry.data.get(CONF_CIRCUIT_MAP, {})
         self.influx_host_metadata: InfluxHostMetadata | None = None
         self.config_entry = entry
@@ -121,6 +125,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
         self._zero_relay_power_pending_since: datetime | None = None
         self._zero_relay_power_notification_active = False
         self._zero_relay_power_recovery_checked = False
+        self._last_telemetry_schema_mode: str | None = None
         self.energy_scale_state: dict[str, dict] = {}
 
         self.ssh_private_key = entry.data.get(CONF_SSH_PRIVATE_KEY, "")
@@ -135,7 +140,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             self.sem_companion_port = DEFAULT_SEM_COMPANION_PORT
 
         self.relay_controller: SavantRelayController | None = None
-        if self.mode == MODE_CURRENT:
+        if self.mode == MODE_CURRENT and self.influx_schema_mode != INFLUX_SCHEMA_CHANNEL_READ_ONLY:
             # Relay control only applies to current mode.
             self.relay_controller = SavantRelayController(
                 sem_host=self.sem_host,
@@ -483,18 +488,33 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
                 )
                 if not discovery.selected_org_id:
                     continue
-                circuit_result = await discover_circuit_metadata_with_backfill(
-                    self.influx_url,
-                    candidate.token,
-                    discovery.selected_org_id,
-                    sem_host=self.sem_host,
-                    influx_bucket=discovery.selected_bucket or DEFAULT_INFLUX_BUCKET,
-                    host_load_identifiers=(
-                        candidate.metadata.load_identifiers if candidate.metadata else ()
-                    ),
-                )
-                if not (circuit_result.success and circuit_result.circuit_map):
-                    continue
+                if (
+                    self.influx_schema_mode == INFLUX_SCHEMA_CHANNEL_READ_ONLY
+                    or getattr(discovery, "schema_mode", INFLUX_SCHEMA_UUID) == INFLUX_SCHEMA_CHANNEL_READ_ONLY
+                ):
+                    snapshot = await fetch_influx_snapshot_with_backfill(
+                        self.influx_url,
+                        candidate.token,
+                        discovery.selected_org_id,
+                        circuit_metadata=self.circuit_map,
+                        influx_bucket=discovery.selected_bucket or DEFAULT_INFLUX_BUCKET,
+                        schema_mode=INFLUX_SCHEMA_CHANNEL_READ_ONLY,
+                    )
+                    if not (snapshot.success and (snapshot.data or {}).get("system_data")):
+                        continue
+                else:
+                    circuit_result = await discover_circuit_metadata_with_backfill(
+                        self.influx_url,
+                        candidate.token,
+                        discovery.selected_org_id,
+                        sem_host=self.sem_host,
+                        influx_bucket=discovery.selected_bucket or DEFAULT_INFLUX_BUCKET,
+                        host_load_identifiers=(
+                            candidate.metadata.load_identifiers if candidate.metadata else ()
+                        ),
+                    )
+                    if not (circuit_result.success and circuit_result.circuit_map):
+                        continue
                 # All three values change together only after the candidate
                 # has passed host metadata, Influx org/bucket, and circuit
                 # discovery. A failed candidate leaves current state intact.
@@ -527,6 +547,7 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             circuit_metadata=self.circuit_map,
             sample_seconds=float(self.update_interval.total_seconds()),
             influx_bucket=self.influx_bucket,
+            schema_mode=self.influx_schema_mode,
         )
         if result.success and result.data is not None and result.query_window and result.query_window != _BACKFILL_WINDOWS[0]:
             _LOGGER.info(
@@ -745,6 +766,16 @@ class SavantEnergyCoordinator(DataUpdateCoordinator):
             return _failure_payload(result)
 
         snapshot_data = result.data
+        observed_schema = snapshot_data.get("telemetry_schema_mode", INFLUX_SCHEMA_UUID)
+        if observed_schema != self._last_telemetry_schema_mode:
+            _LOGGER.info(
+                "Influx telemetry schema=%s, configured_schema=%s, live_system_channels=%d, stored_circuits=%d",
+                observed_schema,
+                self.influx_schema_mode,
+                len(snapshot_data.get("system_data") or {}),
+                len(self.circuit_map),
+            )
+            self._last_telemetry_schema_mode = observed_schema
         self._adjust_interval(success=True)
         self.last_fetch_error = None
         await self._async_handle_zero_relay_power(snapshot_data, result.query_window)

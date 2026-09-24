@@ -140,7 +140,245 @@ def _named_uuidless_ct_csv() -> str:
     return "\n".join(rows)
 
 
+def _channel_only_system_csv() -> str:
+    """Issue #17 shape: type=0000 channels with no savantUUID tags."""
+    return "\n".join(
+        [
+            "result,table,_measurement,type,channel,_field,_value",
+            ",_result,hub,0000,Energy.Total.Consumption.Power,power,321.5",
+            ",_result,hub,0000,Energy.Group.Garage.Power,power,12.0",
+            ",_result,hub,0000,Energy.Circuit.Unknown Load.Power,power,99.0",
+        ]
+    )
+
+
+def _hub_measurement_csv(name: str = "Circuit 1", power: float = 44.0) -> str:
+    return "\n".join(
+        [
+            "result,table,_measurement,type,channel,_field,_value",
+            f",_result,hub,0000,Energy.Circuit.{name}.Power,power,{power}",
+            f",_result,hub,0000,Energy.Circuit.{name}.Energy,energy,1250",
+        ]
+    )
+
+
 class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_channel_only_issue_shape_is_read_only_system_snapshot(self):
+        module = _load_influx_client_module()
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                return True, _channel_only_system_csv(), "", False, False
+            return True, "", "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example",
+                "token",
+                "org-1",
+                circuit_metadata={},
+                scale_state={},
+                schema_mode="channel_read_only",
+            )
+
+        self.assertTrue(snapshot.success)
+        assert snapshot.data is not None
+        self.assertEqual(snapshot.data["telemetry_schema_mode"], "channel_read_only")
+        self.assertEqual(snapshot.data["presentDemands"], [])
+        self.assertEqual(snapshot.data["system_data"]["Energy.Total.Consumption.Power"], 321.5)
+        self.assertNotIn("Energy.Circuit.Unknown Load.Power", snapshot.data["system_data"])
+        status = snapshot.data["circuit_map_status"]
+        self.assertFalse(status["inventory_authoritative"])
+        self.assertFalse(status["reconfigure_required"])
+        self.assertEqual(status["missing_circuit_keys"], [])
+
+    async def test_channel_only_mode_ignores_uuid_rows_and_keeps_existing_hub_match_read_only(self):
+        module = _load_influx_client_module()
+        circuit_text = _single_circuit_csv(name="Circuit 1", savant_uuid="uuid-live")
+        system_text = "\n".join(
+            [_channel_only_system_csv(), *_hub_measurement_csv().splitlines()[1:]]
+        )
+        metadata = {
+            "uuid-live::1": {
+                "circuit_key": "uuid-live::1",
+                "savant_uuid": "uuid-live",
+                "channel": "1",
+                "role": "relay",
+                "relay_uid": "relay-1",
+                "display_name": "Circuit 1",
+                "influx_name": "Circuit 1",
+            }
+        }
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                return True, system_text, "", False, False
+            return True, circuit_text, "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example",
+                "token",
+                "org-1",
+                circuit_metadata=metadata,
+                scale_state={},
+                schema_mode="channel_read_only",
+            )
+
+        self.assertTrue(snapshot.success)
+        assert snapshot.data is not None
+        demands = snapshot.data["presentDemands"]
+        self.assertEqual(len(demands), 1)
+        self.assertEqual(demands[0]["circuit_key"], "uuid-live::1")
+        self.assertFalse(demands[0]["has_relay"])
+        self.assertNotIn("relay_uid", demands[0])
+        self.assertNotIn("percentCommanded", demands[0])
+
+    async def test_uuid_mode_prefers_detailed_rows_over_hub_measurements(self):
+        module = _load_influx_client_module()
+        circuit_text = _single_circuit_csv(name="Circuit 1", savant_uuid="uuid-live")
+        system_text = _hub_measurement_csv()
+        metadata = {
+            "uuid-live::1": {
+                "circuit_key": "uuid-live::1",
+                "savant_uuid": "uuid-live",
+                "channel": "1",
+                "role": "relay",
+                "relay_uid": "relay-1",
+                "display_name": "Circuit 1",
+                "influx_name": "Circuit 1",
+            }
+        }
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                return True, system_text, "", False, False
+            return True, circuit_text, "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example",
+                "token",
+                "org-1",
+                circuit_metadata=metadata,
+                scale_state={},
+            )
+
+        self.assertTrue(snapshot.success)
+        assert snapshot.data is not None
+        self.assertEqual(len(snapshot.data["presentDemands"]), 1)
+        self.assertNotIn("measurement_source", snapshot.data["presentDemands"][0])
+        self.assertEqual(snapshot.data["presentDemands"][0]["power"], 123.4)
+
+    async def test_uuid_mode_downgrades_hub_only_snapshot_to_read_only_fallback(self):
+        module = _load_influx_client_module()
+        system_text = "\n".join(
+            [_channel_only_system_csv(), *_hub_measurement_csv().splitlines()[1:]]
+        )
+        metadata = {
+            "uuid-live::1": {
+                "circuit_key": "uuid-live::1",
+                "savant_uuid": "uuid-live",
+                "channel": "1",
+                "role": "relay",
+                "relay_uid": "relay-1",
+                "display_name": "Circuit 1",
+                "influx_name": "Circuit 1",
+            }
+        }
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                return True, system_text, "", False, False
+            return True, "", "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example",
+                "token",
+                "org-1",
+                circuit_metadata=metadata,
+                scale_state={},
+            )
+
+        self.assertTrue(snapshot.success)
+        assert snapshot.data is not None
+        self.assertEqual(snapshot.data["telemetry_schema_mode"], "channel_read_only")
+        self.assertFalse(snapshot.data["circuit_map_status"]["inventory_authoritative"])
+        self.assertFalse(snapshot.data["circuit_map_status"]["reconfigure_required"])
+        self.assertEqual(snapshot.data["circuit_map_status"]["missing_circuit_keys"], [])
+
+    async def test_hub_circuit_rows_alone_never_claim_complete_uuid_inventory(self):
+        module = _load_influx_client_module()
+        metadata = {
+            "uuid-live::1": {
+                "circuit_key": "uuid-live::1", "savant_uuid": "uuid-live",
+                "channel": "1", "role": "relay", "relay_uid": "relay-1",
+                "display_name": "Circuit 1", "influx_name": "Circuit 1",
+            }
+        }
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                return True, _hub_measurement_csv(), "", False, False
+            return True, "", "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example", "token", "org-1", circuit_metadata=metadata, scale_state={}
+            )
+
+        self.assertTrue(snapshot.success)
+        assert snapshot.data is not None
+        self.assertEqual(snapshot.data["telemetry_schema_mode"], "channel_read_only")
+        self.assertFalse(snapshot.data["circuit_map_status"]["inventory_authoritative"])
+        self.assertEqual(len(snapshot.data["presentDemands"]), 1)
+        self.assertFalse(snapshot.data["presentDemands"][0]["has_relay"])
+        self.assertNotIn("relay_uid", snapshot.data["presentDemands"][0])
+
+    async def test_unknown_system_channel_cannot_validate_fallback(self):
+        module = _load_influx_client_module()
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                return True, "\n".join(
+                    [
+                        "result,table,_measurement,type,channel,_field,_value",
+                        ",_result,hub,0000,Energy.Total.Fake.Power,power,99",
+                    ]
+                ), "", False, False
+            return True, "", "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example", "token", "org-1", schema_mode="channel_read_only"
+            )
+
+        self.assertFalse(snapshot.success)
+        self.assertEqual(snapshot.error_type, "empty_response")
+
+    async def test_channel_only_zero_or_invalid_system_values_fail(self):
+        module = _load_influx_client_module()
+
+        async def fake_post_flux(session, base_url, token, org, query):
+            if 'r.type == "0000"' in query:
+                return True, "\n".join(
+                    [
+                        "result,table,_measurement,type,channel,_field,_value",
+                        ",_result,hub,0000,Energy.Total.Consumption.Power,power,0",
+                        ",_result,hub,0000,Energy.Total.Fake.Power,power,99",
+                    ]
+                ), "", False, False
+            return True, "", "", False, False
+
+        with mock.patch.object(module, "_post_flux", side_effect=fake_post_flux):
+            snapshot = await module.fetch_influx_snapshot(
+                "http://example", "token", "org-1", schema_mode="channel_read_only"
+            )
+
+        self.assertFalse(snapshot.success)
+        self.assertEqual(snapshot.error_type, "empty_response")
+
     async def test_hub_circuit_rows_ignore_zero_filled_placeholders(self):
         module = _load_influx_client_module()
         system_text = "\n".join(
@@ -796,8 +1034,10 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(snapshot.success)
         assert snapshot.data is not None
         self.assertEqual(snapshot.data["presentDemands"], [])
-        self.assertEqual(snapshot.data["circuit_map_status"]["missing_circuit_keys"], [circuit_key])
-        self.assertTrue(snapshot.data["circuit_map_status"]["reconfigure_required"])
+        self.assertEqual(snapshot.data["telemetry_schema_mode"], "channel_read_only")
+        self.assertEqual(snapshot.data["circuit_map_status"]["missing_circuit_keys"], [])
+        self.assertFalse(snapshot.data["circuit_map_status"]["inventory_authoritative"])
+        self.assertFalse(snapshot.data["circuit_map_status"]["reconfigure_required"])
 
     def test_hub_matcher_recovers_known_label_variants_but_rejects_ambiguous_fuzzy_match(self):
         module = _load_influx_client_module()

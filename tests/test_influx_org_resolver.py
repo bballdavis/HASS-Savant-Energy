@@ -3,6 +3,7 @@ import sys
 import types
 from pathlib import Path
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 
@@ -65,6 +66,19 @@ def _build_circuit_csv(org_prefix: str, circuit_count: int) -> str:
     return "\r\n".join([header, *rows])
 
 
+def _build_system_csv(*, primary_power: str = "1250", other_power: str = "25", include_other: bool = True, timestamp: str | None = None) -> str:
+    header = "result,table,_time,_measurement,savantUUID,name,channel,type,_field,_value"
+    timestamp = timestamp or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    rows = [
+        ",".join(["", "_result", timestamp, "hub", "", "", "Energy.Total.Consumption.Power", "0000", "power", primary_power]),
+    ]
+    if include_other:
+        rows.append(
+            ",".join(["", "_result", timestamp, "hub", "", "", "Energy.Total.Feed.Power", "0000", "power", other_power])
+        )
+    return "\r\n".join([header, *rows])
+
+
 class _FakeResponse:
     def __init__(self, status: int, payload=None, text: str = "") -> None:
         self.status = status
@@ -102,6 +116,49 @@ class _FakeClientSession:
 
 
 class InfluxOrgResolverTests(unittest.IsolatedAsyncioTestCase):
+    def test_channel_fallback_requires_recent_nonzero_primary_and_known_peer(self):
+        resolver = _load_resolver_module()
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        candidate = resolver._build_channel_candidate(
+            "org-1", "Org 1", resolver._parse_influx_csv(_build_system_csv(timestamp=now)),
+            source="org_list", query_window="-15m", bucket_names=("localHub",),
+        )
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.schema_mode, "channel_read_only")
+        self.assertEqual(candidate.circuit_count, 0)
+        self.assertGreaterEqual(candidate.system_channel_count, 2)
+        self.assertIsNone(resolver._build_channel_candidate(
+            "org-1", "Org 1", resolver._parse_influx_csv(_build_system_csv(primary_power="0", timestamp=now)),
+            source="org_list", query_window="-15m", bucket_names=("localHub",),
+        ))
+        self.assertIsNone(resolver._build_channel_candidate(
+            "org-1", "Org 1", resolver._parse_influx_csv(_build_system_csv(include_other=False, timestamp=now)),
+            source="org_list", query_window="-15m", bucket_names=("localHub",),
+        ))
+        self.assertIsNone(resolver._build_channel_candidate(
+            "org-1", "Org 1", resolver._parse_influx_csv(_build_system_csv(other_power="not-a-number", timestamp=now)),
+            source="org_list", query_window="-15m", bucket_names=("localHub",),
+        ))
+
+    def test_channel_fallback_rejects_stale_rows_and_arbitrary_channels(self):
+        resolver = _load_resolver_module()
+        self.assertIsNone(resolver._build_channel_candidate(
+            "org-1", "Org 1", resolver._parse_influx_csv(_build_system_csv(timestamp="2020-01-01T00:00:00Z")),
+            source="org_list", query_window="-15m", bucket_names=("localHub",),
+        ))
+        rows = resolver._parse_influx_csv(_build_system_csv())
+        rows[1]["channel"] = "Energy.UserDefined.Power"
+        self.assertIsNone(resolver._build_channel_candidate(
+            "org-1", "Org 1", rows,
+            source="org_list", query_window="-15m", bucket_names=("localHub",),
+        ))
+
+    def test_naive_timestamps_are_treated_as_utc(self):
+        resolver = _load_resolver_module()
+        parsed = resolver._parse_time("2026-09-24T12:00:00")
+        self.assertIsNotNone(parsed)
+        self.assertIsNotNone(parsed.tzinfo)
+
     def test_pick_clear_winner_prefers_the_stronger_candidate(self):
         resolver = _load_resolver_module()
         winner = resolver._pick_clear_winner(

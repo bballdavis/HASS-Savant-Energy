@@ -21,6 +21,7 @@ from .const import (
     CONF_HOST,
     CONF_INFLUX_AUTH_METHOD,
     CONF_INFLUX_BUCKET,
+    CONF_INFLUX_SCHEMA_MODE,
     CONF_INFLUX_ORG,
     CONF_INFLUX_TOKEN,
     CONF_INFLUX_URL,
@@ -35,6 +36,8 @@ from .const import (
     DEFAULT_DISABLE_SCENE_BUILDER,
     DEFAULT_INFLUX_AUTH_METHOD,
     DEFAULT_INFLUX_BUCKET,
+    INFLUX_SCHEMA_CHANNEL_READ_ONLY,
+    INFLUX_SCHEMA_UUID,
     DEFAULT_INFLUX_ORG,
     DEFAULT_MODE,
     DEFAULT_OLA_PORT,
@@ -49,7 +52,7 @@ from .const import (
     MODE_LEGACY,
     SCAN_INTERVAL_OPTIONS,
 )
-from .influx_client import discover_circuit_metadata_with_backfill
+from .influx_client import discover_circuit_metadata_with_backfill, fetch_influx_snapshot_with_backfill
 from .influx_org_resolver import InfluxOrgCandidate, async_discover_influx_org
 from .ssh_helper import (
     InfluxHostMetadata,
@@ -287,6 +290,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_INFLUX_BUCKET,
                 current.get(CONF_INFLUX_BUCKET, DEFAULT_INFLUX_BUCKET),
             ),
+            CONF_INFLUX_SCHEMA_MODE: self._pending.get(
+                CONF_INFLUX_SCHEMA_MODE,
+                current.get(CONF_INFLUX_SCHEMA_MODE, INFLUX_SCHEMA_UUID),
+            ),
             CONF_CIRCUIT_MAP: self._pending.get(
                 CONF_CIRCUIT_MAP,
                 current.get(CONF_CIRCUIT_MAP, {}),
@@ -338,7 +345,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     def _reset_stale_direct_token_pending(self) -> None:
         """Discard resumable direct-token flow state before restarting SSH."""
-        for key in (CONF_INFLUX_TOKEN, CONF_INFLUX_ORG, CONF_INFLUX_BUCKET, CONF_CIRCUIT_MAP):
+        for key in (CONF_INFLUX_TOKEN, CONF_INFLUX_ORG, CONF_INFLUX_BUCKET, CONF_INFLUX_SCHEMA_MODE, CONF_CIRCUIT_MAP):
             self._pending.pop(key, None)
         self._pending_org_candidates = {}
         self._pending_ssh_bootstrap = None
@@ -370,6 +377,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
             self._pending[CONF_INFLUX_ORG] = result.selected_org_id
             self._pending[CONF_INFLUX_BUCKET] = result.selected_bucket or DEFAULT_INFLUX_BUCKET
+            self._pending[CONF_INFLUX_SCHEMA_MODE] = getattr(result, "schema_mode", INFLUX_SCHEMA_UUID)
             self._pending_org_candidates = {}
             return result.selected_org_id, None
         if result.candidates:
@@ -411,14 +419,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """
         original = {
             key: self._pending.get(key)
-            for key in (CONF_INFLUX_TOKEN, CONF_INFLUX_ORG, CONF_INFLUX_BUCKET, CONF_CIRCUIT_MAP)
+            for key in (CONF_INFLUX_TOKEN, CONF_INFLUX_ORG, CONF_INFLUX_BUCKET, CONF_INFLUX_SCHEMA_MODE, CONF_CIRCUIT_MAP)
         }
         original_host_metadata = self._pending_host_metadata
         last_error = "ssh_token_empty"
         for candidate in candidates:
             self._pending_host_metadata = candidate.metadata
             self._pending[CONF_INFLUX_TOKEN] = candidate.token
-            for key in (CONF_INFLUX_ORG, CONF_INFLUX_BUCKET, CONF_CIRCUIT_MAP):
+            for key in (CONF_INFLUX_ORG, CONF_INFLUX_BUCKET, CONF_INFLUX_SCHEMA_MODE, CONF_CIRCUIT_MAP):
                 self._pending.pop(key, None)
             _org, outcome = await self._async_safe_discover_pending_org(candidate.metadata)
             if outcome == "select":
@@ -458,6 +466,28 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> str | None:
         """Resolve the persisted circuit map for the pending current-mode config."""
         self._pending_circuit_map_warnings = []
+        if self._pending.get(CONF_INFLUX_SCHEMA_MODE) == INFLUX_SCHEMA_CHANNEL_READ_ONLY:
+            result = await fetch_influx_snapshot_with_backfill(
+                self._resolve_pending_influx_url(),
+                self._pending[CONF_INFLUX_TOKEN],
+                self._pending[CONF_INFLUX_ORG],
+                influx_bucket=self._pending.get(CONF_INFLUX_BUCKET, DEFAULT_INFLUX_BUCKET),
+                schema_mode=INFLUX_SCHEMA_CHANNEL_READ_ONLY,
+            )
+            if not result.success or not (result.data or {}).get("system_data"):
+                _LOGGER.warning(
+                    "Channel read-only setup validation failed: %s",
+                    result.error_type or "no_live_system_channels",
+                )
+                return result.error_type or "circuit_discovery_failed"
+            entry = self._get_reconfigure_entry() if self.context.get("entry_id") else None
+            self._pending[CONF_CIRCUIT_MAP] = dict((entry.data if entry else {}).get(CONF_CIRCUIT_MAP, {}) or {})
+            _LOGGER.info(
+                "Channel read-only setup validated %d system channels; existing circuit identities preserved=%d",
+                len(result.data["system_data"]),
+                len(self._pending[CONF_CIRCUIT_MAP]),
+            )
+            return None
         try:
             result = await discover_circuit_metadata_with_backfill(
                 self._resolve_pending_influx_url(),
@@ -514,6 +544,22 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def _async_update_circuit_map_warning_notification(self) -> None:
         """Create or clear the reconfigure warning notification."""
+        if self._pending.get(CONF_INFLUX_SCHEMA_MODE) == INFLUX_SCHEMA_CHANNEL_READ_ONLY:
+            await self.hass.services.async_call(
+                "persistent_notification", "create",
+                {
+                    "title": "Savant Energy Read-Only Telemetry",
+                    "message": (
+                        "This host supplies channel-based Influx telemetry without a verified "
+                        "circuit UUID map. System sensors are available, but relay control and "
+                        "new per-load entities are disabled. Reconfigure after a UUID-backed "
+                        "identity source becomes available."
+                    ),
+                    "notification_id": _CIRCUIT_MAP_WARNING_NOTIFICATION_ID,
+                },
+                blocking=True,
+            )
+            return
         warnings = self._pending_circuit_map_warnings
         if warnings:
             await self.hass.services.async_call(
@@ -704,6 +750,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 candidate = self._pending_org_candidates[candidate_key]
                 self._pending[CONF_INFLUX_ORG] = candidate.org_id
                 self._pending[CONF_INFLUX_BUCKET] = candidate.selected_bucket or DEFAULT_INFLUX_BUCKET
+                self._pending[CONF_INFLUX_SCHEMA_MODE] = candidate.schema_mode
                 circuit_error = await self._async_discover_pending_circuit_map()
                 if circuit_error is None:
                     install_error = await self._async_install_pending_ssh_key()
@@ -937,6 +984,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 candidate = self._pending_org_candidates[candidate_key]
                 self._pending[CONF_INFLUX_ORG] = candidate.org_id
                 self._pending[CONF_INFLUX_BUCKET] = candidate.selected_bucket or DEFAULT_INFLUX_BUCKET
+                self._pending[CONF_INFLUX_SCHEMA_MODE] = candidate.schema_mode
                 circuit_error = await self._async_discover_pending_circuit_map()
                 if circuit_error is None:
                     install_error = await self._async_install_pending_ssh_key()
@@ -1058,6 +1106,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         selected = None
                         chosen_org = None
                         chosen_bucket = None
+                        chosen_schema = INFLUX_SCHEMA_UUID
                         last_error = "org_discovery_failed"
                         url = self.config_entry.data.get(CONF_INFLUX_URL, _derive_influx_url(host))
                         current_org = self.config_entry.data.get(CONF_INFLUX_ORG, "")
@@ -1069,28 +1118,47 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                                 continue
                             candidate_org = result.selected_org_id
                             candidate_bucket = result.selected_bucket
+                            candidate_schema = getattr(result, "schema_mode", INFLUX_SCHEMA_UUID)
                             if candidate_org is None and result.candidates and current_org:
                                 matching = [candidate for candidate in result.candidates if candidate.org_id == current_org]
                                 if matching:
                                     match = max(matching, key=lambda item: item.score)
                                     candidate_org, candidate_bucket = current_org, match.selected_bucket
+                                    candidate_schema = match.schema_mode
                             if not candidate_org:
                                 last_error = "org_reconfigure_required" if result.candidates else (result.error_key or last_error)
                                 continue
-                            circuit_result = await discover_circuit_metadata_with_backfill(
-                                url, candidate_token.token, candidate_org,
-                                sem_host=self.config_entry.data.get(CONF_ADDRESS, ""),
-                                influx_bucket=candidate_bucket or DEFAULT_INFLUX_BUCKET,
-                                host_load_identifiers=(
-                                    candidate_token.metadata.load_identifiers
-                                    if candidate_token.metadata
-                                    else ()
-                                ),
-                            )
-                            if circuit_result.success and circuit_result.circuit_map:
-                                selected, chosen_org, chosen_bucket = candidate_token, candidate_org, candidate_bucket
-                                break
-                            last_error = circuit_result.error_key or "circuit_discovery_failed"
+                            if (
+                                self.config_entry.data.get(CONF_INFLUX_SCHEMA_MODE) == INFLUX_SCHEMA_CHANNEL_READ_ONLY
+                                or candidate_schema == INFLUX_SCHEMA_CHANNEL_READ_ONLY
+                            ):
+                                snapshot = await fetch_influx_snapshot_with_backfill(
+                                    url, candidate_token.token, candidate_org,
+                                    circuit_metadata=self.config_entry.data.get(CONF_CIRCUIT_MAP, {}),
+                                    influx_bucket=candidate_bucket or DEFAULT_INFLUX_BUCKET,
+                                    schema_mode=INFLUX_SCHEMA_CHANNEL_READ_ONLY,
+                                )
+                                if snapshot.success and (snapshot.data or {}).get("system_data"):
+                                    selected, chosen_org, chosen_bucket = candidate_token, candidate_org, candidate_bucket
+                                    chosen_schema = INFLUX_SCHEMA_CHANNEL_READ_ONLY
+                                    break
+                                last_error = snapshot.error_type or "circuit_discovery_failed"
+                            else:
+                                circuit_result = await discover_circuit_metadata_with_backfill(
+                                    url, candidate_token.token, candidate_org,
+                                    sem_host=self.config_entry.data.get(CONF_ADDRESS, ""),
+                                    influx_bucket=candidate_bucket or DEFAULT_INFLUX_BUCKET,
+                                    host_load_identifiers=(
+                                        candidate_token.metadata.load_identifiers
+                                        if candidate_token.metadata
+                                        else ()
+                                    ),
+                                )
+                                if circuit_result.success and circuit_result.circuit_map:
+                                    selected, chosen_org, chosen_bucket = candidate_token, candidate_org, candidate_bucket
+                                    chosen_schema = candidate_schema
+                                    break
+                                last_error = circuit_result.error_key or "circuit_discovery_failed"
                         if selected is None:
                             errors["base"] = last_error
                         else:
@@ -1118,6 +1186,12 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                                 chosen_bucket
                                 or data.get(CONF_INFLUX_BUCKET)
                                 or DEFAULT_INFLUX_BUCKET
+                            )
+                            data[CONF_INFLUX_SCHEMA_MODE] = (
+                                INFLUX_SCHEMA_CHANNEL_READ_ONLY
+                                if data.get(CONF_INFLUX_SCHEMA_MODE) == INFLUX_SCHEMA_CHANNEL_READ_ONLY
+                                or chosen_schema == INFLUX_SCHEMA_CHANNEL_READ_ONLY
+                                else INFLUX_SCHEMA_UUID
                             )
                             self.hass.config_entries.async_update_entry(
                                 self.config_entry,

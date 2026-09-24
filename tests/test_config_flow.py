@@ -147,6 +147,65 @@ class _FakeHass:
 
 
 class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_channel_only_setup_accepts_system_data_without_creating_circuit_identities(self):
+        module = _load_config_flow_module()
+        entry = types.SimpleNamespace(entry_id="entry", data={})
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(entry)
+        flow.context = {}
+        flow._pending = {
+            module.CONF_ADDRESS: "pbc",
+            module.CONF_HOST: "host",
+            module.CONF_INFLUX_TOKEN: "token",
+        }
+        discovered = types.SimpleNamespace(
+            selected_org_id="org", selected_bucket="localHub", schema_mode=module.INFLUX_SCHEMA_CHANNEL_READ_ONLY,
+            candidates=[],
+        )
+        snapshot = types.SimpleNamespace(
+            success=True, data={"system_data": {"Energy.Total.Consumption.Power": 123.0}}, error_type=None,
+        )
+        with mock.patch.object(module, "async_discover_influx_org", new=mock.AsyncMock(return_value=discovered)), mock.patch.object(
+            module, "fetch_influx_snapshot_with_backfill", new=mock.AsyncMock(return_value=snapshot),
+        ) as fetch, mock.patch.object(
+            module, "discover_circuit_metadata_with_backfill", new=mock.AsyncMock(),
+        ) as circuit_discovery:
+            org, error = await flow._async_discover_pending_org()
+            circuit_error = await flow._async_discover_pending_circuit_map()
+
+        self.assertEqual((org, error, circuit_error), ("org", None, None))
+        self.assertEqual(flow._pending[module.CONF_INFLUX_SCHEMA_MODE], module.INFLUX_SCHEMA_CHANNEL_READ_ONLY)
+        self.assertEqual(flow._pending[module.CONF_CIRCUIT_MAP], {})
+        self.assertEqual(flow._build_current_data()[module.CONF_INFLUX_SCHEMA_MODE], module.INFLUX_SCHEMA_CHANNEL_READ_ONLY)
+        self.assertEqual(fetch.await_args.kwargs["schema_mode"], module.INFLUX_SCHEMA_CHANNEL_READ_ONLY)
+        circuit_discovery.assert_not_awaited()
+
+    async def test_channel_only_reconfigure_preserves_existing_map_and_rejects_empty_snapshot(self):
+        module = _load_config_flow_module()
+        existing_map = {"uuid::1": {"role": "relay", "legacy_uid": "SEM.1"}}
+        entry = types.SimpleNamespace(entry_id="entry", data={module.CONF_CIRCUIT_MAP: existing_map})
+        flow = module.ConfigFlow()
+        flow.hass = _FakeHass(entry)
+        flow.context = {"entry_id": "entry"}
+        flow._pending = {
+            module.CONF_ADDRESS: "pbc",
+            module.CONF_HOST: "host",
+            module.CONF_INFLUX_TOKEN: "token",
+            module.CONF_INFLUX_ORG: "org",
+            module.CONF_INFLUX_SCHEMA_MODE: module.INFLUX_SCHEMA_CHANNEL_READ_ONLY,
+        }
+        empty = types.SimpleNamespace(success=True, data={"system_data": {}}, error_type=None)
+        with mock.patch.object(module, "fetch_influx_snapshot_with_backfill", new=mock.AsyncMock(return_value=empty)):
+            error = await flow._async_discover_pending_circuit_map()
+        self.assertEqual(error, "circuit_discovery_failed")
+        self.assertNotIn(module.CONF_CIRCUIT_MAP, flow._pending)
+
+        valid = types.SimpleNamespace(success=True, data={"system_data": {"Energy.Total.Consumption.Power": 123.0}}, error_type=None)
+        with mock.patch.object(module, "fetch_influx_snapshot_with_backfill", new=mock.AsyncMock(return_value=valid)):
+            self.assertIsNone(await flow._async_discover_pending_circuit_map())
+        self.assertEqual(flow._pending[module.CONF_CIRCUIT_MAP], existing_map)
+        self.assertEqual(flow._build_current_data(entry.data)[module.CONF_CIRCUIT_MAP], existing_map)
+
     async def test_stale_current_token_step_redirects_to_ssh_without_retaining_submitted_token(self):
         module = _load_config_flow_module()
         flow = module.ConfigFlow()
@@ -373,6 +432,46 @@ class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
         ) as prepare:
             await reprovision.async_step_reprovision_ssh({module.CONF_SSH_PASSWORD: password})
         prepare.assert_awaited_once_with(reprovision.hass, "reprovision-host", module.DEFAULT_SSH_USERNAME, password)
+
+    async def test_reprovision_preserves_channel_only_mode_and_circuit_map(self):
+        module = _load_config_flow_module()
+        original_map = {"uuid::1": {"role": "relay", "relay_uid": "SEM.1"}}
+        entry = types.SimpleNamespace(data={
+            module.CONF_HOST: "host",
+            module.CONF_ADDRESS: "pbc",
+            module.CONF_INFLUX_ORG: "org",
+            module.CONF_CIRCUIT_MAP: original_map,
+            module.CONF_INFLUX_SCHEMA_MODE: module.INFLUX_SCHEMA_CHANNEL_READ_ONLY,
+        }, options={})
+        flow = module.OptionsFlowHandler()
+        flow.hass = _FakeHass(entry)
+        flow.config_entry = entry
+        candidate = types.SimpleNamespace(token="new-token", metadata=None)
+        discovered = types.SimpleNamespace(
+            selected_org_id="org", selected_bucket="localHub",
+            schema_mode=module.INFLUX_SCHEMA_UUID, candidates=[],
+        )
+        snapshot = types.SimpleNamespace(success=True, data={"system_data": {"Energy.Total.Consumption.Power": 123}})
+        with mock.patch.object(
+            module, "_async_safe_ssh_prepare_bootstrap_candidates",
+            new=mock.AsyncMock(return_value=("private", "public", [candidate], None)),
+        ), mock.patch.object(
+            module, "async_discover_influx_org", new=mock.AsyncMock(return_value=discovered),
+        ), mock.patch.object(
+            module, "fetch_influx_snapshot_with_backfill", new=mock.AsyncMock(return_value=snapshot),
+        ) as fetch, mock.patch.object(
+            module, "discover_circuit_metadata_with_backfill", new=mock.AsyncMock(),
+        ) as circuits, mock.patch.object(
+            module, "_async_safe_ssh_install_and_verify_key", new=mock.AsyncMock(return_value=None),
+        ):
+            result = await flow.async_step_reprovision_ssh({module.CONF_SSH_PASSWORD: "password"})
+
+        self.assertEqual(result["type"], "create_entry")
+        updated = flow.hass.config_entries.updated_entry.data
+        self.assertEqual(updated[module.CONF_INFLUX_SCHEMA_MODE], module.INFLUX_SCHEMA_CHANNEL_READ_ONLY)
+        self.assertEqual(updated[module.CONF_CIRCUIT_MAP], original_map)
+        self.assertEqual(fetch.await_args.kwargs["schema_mode"], module.INFLUX_SCHEMA_CHANNEL_READ_ONLY)
+        circuits.assert_not_awaited()
 
     async def test_ssh_candidate_exception_log_redacts_connection_secrets(self):
         module = _load_config_flow_module()

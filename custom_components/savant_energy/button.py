@@ -16,7 +16,10 @@ from homeassistant.helpers.entity import DeviceInfo  # type: ignore
 from homeassistant.helpers.entity_platform import AddEntitiesCallback  # type: ignore
 from homeassistant.helpers.event import async_track_time_interval  # type: ignore
 
-from .const import DOMAIN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE, MODE_CURRENT
+from .const import (
+    DOMAIN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE, MODE_CURRENT,
+    CONF_INFLUX_SCHEMA_MODE, INFLUX_SCHEMA_CHANNEL_READ_ONLY, INFLUX_SCHEMA_UUID,
+)
 from .utils import (
     async_build_all_loads_dmx_values,
     async_build_managed_dmx_values,
@@ -64,10 +67,30 @@ class SavantSceneButton(ButtonEntity):
 
     @property
     def available(self):
-        return self._scene_id in self._scene_manager.storage.scenes
+        if self._scene_id not in self._scene_manager.storage.scenes:
+            return False
+        coordinator = self._scene_manager.coordinator
+        if getattr(coordinator, "mode", None) == MODE_CURRENT:
+            coordinator_data = coordinator.data or {}
+            snapshot = coordinator_data.get("snapshot_data") or {}
+            return (
+                (coordinator_data.get("snapshot_status") or {}).get("ok") is not False
+                and coordinator.config_entry.data.get(CONF_INFLUX_SCHEMA_MODE) != INFLUX_SCHEMA_CHANNEL_READ_ONLY
+                and snapshot.get("telemetry_schema_mode", INFLUX_SCHEMA_UUID) == INFLUX_SCHEMA_UUID
+            )
+        return True
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self._scene_manager.coordinator.async_add_listener(self.async_write_ha_state)
+        )
 
     async def async_press(self):
         """Execute the scene through the scene manager (handles mode routing internally)."""
+        if not self.available:
+            _LOGGER.warning("Scene command refused because its relay telemetry is unavailable")
+            return
         if self._scene_id not in self._scene_manager.storage.scenes:
             _LOGGER.warning("Scene %s not found in storage when button pressed", self._scene_id)
             return
@@ -203,6 +226,29 @@ class SavantAllLoadsButton(ButtonEntity):
             manufacturer=MANUFACTURER,
         )
 
+    @property
+    def available(self) -> bool:
+        if getattr(self.coordinator, "mode", None) != MODE_CURRENT:
+            return True
+        coordinator_data = self.coordinator.data or {}
+        snapshot = coordinator_data.get("snapshot_data") or {}
+        return (
+            (coordinator_data.get("snapshot_status") or {}).get("ok") is not False
+            and self.coordinator.config_entry.data.get(CONF_INFLUX_SCHEMA_MODE) != INFLUX_SCHEMA_CHANNEL_READ_ONLY
+            and snapshot.get("telemetry_schema_mode", INFLUX_SCHEMA_UUID) == INFLUX_SCHEMA_UUID
+            and any(
+                demand.get("role") == "relay" and demand.get("has_relay") is True
+                and demand.get("relay_uid") and "percentCommanded" in demand
+                for demand in snapshot.get("presentDemands") or []
+            )
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.coordinator.async_add_listener(self.async_write_ha_state)
+        )
+
     async def async_press(self) -> None:
         """Handle the button press — turn on all loads (mode-aware)."""
         if getattr(self.coordinator, "mode", None) == MODE_CURRENT:
@@ -212,18 +258,26 @@ class SavantAllLoadsButton(ButtonEntity):
 
     async def _press_current(self) -> None:
         """Turn on all loads via the SEM relay controller (current mode >=11.2)."""
+        coordinator_data = self.coordinator.data or {}
+        snapshot = coordinator_data.get("snapshot_data") or {}
+        if (
+            (coordinator_data.get("snapshot_status") or {}).get("ok") is False
+            or self.coordinator.config_entry.data.get(CONF_INFLUX_SCHEMA_MODE) == INFLUX_SCHEMA_CHANNEL_READ_ONLY
+            or snapshot.get("telemetry_schema_mode", INFLUX_SCHEMA_UUID) != INFLUX_SCHEMA_UUID
+        ):
+            _LOGGER.warning("All-loads command refused without current UUID-backed relay telemetry")
+            return
         relay_controller = getattr(self.coordinator, "relay_controller", None)
         if not relay_controller:
             _LOGGER.warning("Relay controller not available for all-loads command")
             return
 
-        present_demands = (
-            ((self.coordinator.data or {}).get("snapshot_data") or {}).get("presentDemands", [])
-        )
+        present_demands = snapshot.get("presentDemands", [])
         bulk_states = {
             d["relay_uid"]: 100
             for d in present_demands
-            if d.get("relay_uid")
+            if d.get("relay_uid") and d.get("role") == "relay" and d.get("has_relay") is True
+            and "percentCommanded" in d
         }
 
         if not bulk_states:

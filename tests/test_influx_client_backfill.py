@@ -28,6 +28,54 @@ def _circuit_csv() -> str:
 
 
 class InfluxClientBackfillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_channel_only_snapshot_is_not_completed_by_backfill(self):
+        influx_client = _load_influx_client_module()
+        channel_result = influx_client.InfluxFetchResult(
+            success=True,
+            data={
+                "presentDemands": [],
+                "telemetry_schema_mode": "channel_read_only",
+                "system_data": {"Energy.Total.Consumption.Power": 123.0},
+                "circuit_map_status": {
+                    "missing_circuit_keys": [],
+                    "inventory_status": "partial",
+                    "inventory_authoritative": False,
+                },
+            },
+            query_window="-2m",
+        )
+        historical_result = influx_client.InfluxFetchResult(
+            success=True,
+            data={
+                "presentDemands": [{"uid": "historical::1", "power": 999}],
+                "telemetry_schema_mode": "uuid",
+                "circuit_map_status": {
+                    "missing_circuit_keys": [],
+                    "inventory_status": "complete",
+                    "inventory_authoritative": True,
+                },
+            },
+            query_window="-15m",
+        )
+        with mock.patch.object(
+            influx_client,
+            "fetch_influx_snapshot",
+            new=mock.AsyncMock(side_effect=[channel_result, historical_result]),
+        ) as fetch_snapshot:
+            result = await influx_client.fetch_influx_snapshot_with_backfill(
+                "url",
+                "token",
+                "org",
+                backfill_windows=("-2m", "-15m"),
+                schema_mode="channel_read_only",
+            )
+
+        self.assertEqual(fetch_snapshot.await_count, 1)
+        self.assertEqual(result.data["presentDemands"], [])
+        self.assertEqual(result.data["telemetry_schema_mode"], "channel_read_only")
+        self.assertFalse(result.data["circuit_map_status"]["inventory_authoritative"])
+        self.assertEqual(result.data["circuit_map_status"]["inventory_status"], "partial")
+
     def test_bootstrap_inventory_uses_identity_only_and_never_measurements(self):
         influx_client = _load_influx_client_module()
         shells = influx_client.build_measurement_bootstrap_inventory(
