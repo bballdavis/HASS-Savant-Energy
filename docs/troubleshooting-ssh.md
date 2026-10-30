@@ -1,3 +1,7 @@
+---
+title: SSH setup and recovery
+---
+
 # Troubleshooting Current-mode SSH setup
 
 This guide is for Savant Energy Current mode (Savant firmware 11.2 or later),
@@ -95,10 +99,7 @@ Interpret the result without sharing secrets:
   discovering circuits. Capture the focused Home Assistant log so the exact
   stage is visible.
 
-Paramiko already attempts password authentication and the host's
-keyboard-interactive fallback. Beta9 improves the error classification and
-preserves the password exactly as entered; it does not add a new SSH
-authentication method.
+The integration attempts password authentication and the host's keyboard-interactive fallback. It preserves the password exactly as entered. Error classification distinguishes connection, authentication, key installation, and data-validation stages.
 
 Never send the RPM password, an InfluxDB token, a private key, or the contents
 of secret files. Do not run commands that print token files. Stop the test if

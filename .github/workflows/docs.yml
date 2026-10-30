@@ -1,0 +1,65 @@
+name: Documentation
+
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and validate docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: website/requirements-docs.txt
+      - run: python3 -m pip install -r website/requirements-docs.txt
+      - run: npm ci --prefix website
+      - run: npm --prefix website run docs:check
+      - run: npm --prefix website run docs:test
+      - run: npm --prefix website run readme:check
+      - run: npm --prefix website run typecheck
+      - run: npm --prefix website run build
+      - run: npm --prefix website run links:check
+      - name: Save reviewable site
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation-site
+          path: website/build
+      - name: Package Pages site
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/build
+
+  deploy:
+    name: Deploy GitHub Pages
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

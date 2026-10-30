@@ -1,5 +1,7 @@
 # Savant Energy 2.0.0
 
+> Historical release notes. For current instructions, use the [installation guide](get-started/installation.md) and [setup guide](connect/current.md).
+
 Savant threw us for a loop with firmware 11.2. The old PBC snapshot path was no longer enough, so this release moves current-mode telemetry to InfluxDB and keeps relay control on the SEM interfaces. In the end, I think it is better. The protocol change took work, but it also gave us more data and some useful recovery features.
 
 ## What changed

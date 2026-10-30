@@ -1,5 +1,7 @@
 # Savant Energy v2.0.1-beta7
 
+> Historical release notes. For current instructions, use the [installation guide](get-started/installation.md) and [setup guide](connect/current.md).
+
 ## Status
 
 These are the beta7 prerelease notes. Installing beta7 still requires verification against a running Home Assistant instance.

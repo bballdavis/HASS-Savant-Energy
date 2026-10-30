@@ -1,0 +1,16 @@
+{
+  "origin": "Original browser-rendered illustrative UI; no vendor artwork, live data, or AI-generated UI text",
+  "source": "website/demo/",
+  "fixtures": "website/demo/fixtures.json",
+  "command": "cd website && npm run demo:capture",
+  "images": [
+    "overview.png",
+    "setup.png",
+    "entities.png",
+    "energy.png",
+    "scenes.png",
+    "options.png"
+  ],
+  "labels": "custom_components/savant_energy/translations/en.json",
+  "disclaimer": "Synthetic documentation examples; not proof of live integration behavior"
+}
