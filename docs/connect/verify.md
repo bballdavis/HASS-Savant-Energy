@@ -12,9 +12,7 @@ Complete [Current setup](current.md) or [Legacy setup](../legacy/README.md). Ver
 
 Open **Settings → Devices & services → Savant Energy**, then open its devices and entities. You should see devices for the circuits discovered on your system and applicable hub/system entities.
 
-![Illustrative discovered circuit device with power and energy entities](../assets/entities.png)
-
-*Demo device and readings. Names and available entities vary by system.*
+The [companion breaker board](../usage/companion-card.md) provides a dashboard view of discovered loads. Use the integration’s device pages when inspecting the underlying entities.
 
 ## 2. Check live data
 
@@ -37,4 +35,4 @@ If several readings remain unavailable, follow [telemetry troubleshooting](../tr
 - Review [relay controls](../usage/controls.md) before switching a load.
 - Add the [scenes card](../usage/scenes.md).
 
-Demo images illustrate the interface; they do not establish live hardware verification. Maintainers doing a telemetry release should also follow [live diagnostics](../live-diagnostics.md).
+Documentation screenshots show the interface at capture time; they do not establish live verification of a particular release. Maintainers doing a telemetry release should also follow [live diagnostics](../live-diagnostics.md).

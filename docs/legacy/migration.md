@@ -20,6 +20,10 @@ Keep the existing integration entry. Removing it and starting again is not the i
 6. Select an Influx organization if prompted, then review any circuit-map warnings.
 7. Follow [verification](../connect/verify.md) and check your automations and Energy dashboard selections.
 
+![The real Reconfigure mode selector with Current mode selected](../assets/setup-mode.jpg)
+
+![The actual Reconfigure SSH Bootstrap form before entering a password](../assets/setup-ssh.jpg)
+
 **Expected result:** the same entry uses Current mode and discovers applicable Current-only channels. Failed validation or key installation keeps saved authentication state rather than overwriting it with an unverified candidate.
 
 ## What can change

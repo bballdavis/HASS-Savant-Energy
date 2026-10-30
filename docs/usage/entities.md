@@ -17,9 +17,7 @@ Entities depend on discovered equipment, connection mode, and the fields Savant 
 
 Current mode includes CT-monitored loads as well as relay circuits. Multi-leg CTs can expose diagnostic leg readings and an aggregate; avoid adding both the aggregate and its legs to totals. Energy availability differs between modes and firmware. Missing source fields remain unavailable rather than being synthesized as zero.
 
-![Illustrative device page showing a named circuit and its measurements](../assets/entities.png)
-
-*Demo circuit, entity names, and measurements.*
+See [the companion breaker board](companion-card.md) for real Home Assistant captures of circuit tiles and responsive layouts.
 
 ## Controls and status
 

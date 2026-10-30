@@ -14,10 +14,6 @@ title: Energy dashboard
 2. Under **Individual devices**, add the circuit’s eligible kWh energy sensor.
 3. Save and allow Home Assistant time to collect statistics. Energy charts are not expected to populate immediately after installation.
 
-![Illustrative energy view with daily consumption and individual circuit totals](../assets/energy.png)
-
-*Demo Energy view. Chart values and device totals are synthetic.*
-
 **Expected result:** the supported counter appears as an individual device and begins contributing energy statistics. See [Home Assistant’s Energy documentation](https://www.home-assistant.io/docs/energy/) for its configuration and statistics requirements.
 
 ## Avoid counting a load twice

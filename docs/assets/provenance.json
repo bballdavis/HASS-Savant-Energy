@@ -1,16 +1,125 @@
 {
-  "origin": "Original browser-rendered illustrative UI; no vendor artwork, live data, or AI-generated UI text",
-  "source": "website/demo/",
-  "fixtures": "website/demo/fixtures.json",
-  "command": "cd website && npm run demo:capture",
-  "images": [
-    "overview.png",
-    "setup.png",
-    "entities.png",
-    "energy.png",
-    "scenes.png",
-    "options.png"
-  ],
-  "labels": "custom_components/savant_energy/translations/en.json",
-  "disclaimer": "Synthetic documentation examples; not proof of live integration behavior"
+  "origin": "Real screenshots of Home Assistant and the installed Savant Energy companion breaker-board card",
+  "capture_date": "2026-10-29",
+  "companion_repository": "https://github.com/bballdavis/Savant-Card",
+  "card_type": "custom:savant-energy-breaker-board-card",
+  "processing": "Cropped screenshot excerpts only; no interface recreation, generative editing, or synthetic readings",
+  "privacy": "Browser chrome, account/sidebar context, and personally named circuit rows excluded from public excerpts. No credentials captured.",
+  "images": {
+    "breaker-board-desktop.jpg": {
+      "view": "Live desktop grid",
+      "source_window": [
+        1920,
+        1050
+      ],
+      "crop_xywh": [
+        306,
+        96,
+        1608,
+        602
+      ]
+    },
+    "breaker-board-mobile.jpg": {
+      "view": "Standard narrow layout",
+      "viewport": [
+        390,
+        844
+      ],
+      "source_window": [
+        1920,
+        1050
+      ],
+      "crop_xywh": [
+        798,
+        81,
+        390,
+        844
+      ]
+    },
+    "breaker-board-compact.jpg": {
+      "view": "Ultra-compact narrow layout",
+      "viewport": [
+        390,
+        844
+      ],
+      "source_window": [
+        1920,
+        1050
+      ],
+      "crop_xywh": [
+        798,
+        81,
+        390,
+        760
+      ]
+    },
+    "companion-scenes.jpg": {
+      "view": "Saved scene list",
+      "source_window": [
+        1920,
+        1050
+      ],
+      "crop_xywh": [
+        306,
+        96,
+        1608,
+        480
+      ]
+    },
+    "companion-scene-editor.jpg": {
+      "view": "Saved scene editor inspected without saving",
+      "source_window": [
+        1920,
+        1050
+      ],
+      "crop_xywh": [
+        306,
+        96,
+        1608,
+        300
+      ]
+    },
+    "setup-mode.jpg": {
+      "view": "Reconfigure mode selection",
+      "source_window": [
+        1920,
+        1050
+      ],
+      "crop_xywh": [
+        696,
+        413,
+        580,
+        304
+      ]
+    },
+    "setup-addresses.jpg": {
+      "view": "Reconfigure PBC and Host addresses",
+      "source_window": [
+        1920,
+        1050
+      ],
+      "crop_xywh": [
+        696,
+        363,
+        580,
+        404
+      ],
+      "note": "Real local addresses visible; not credentials. Captions instruct readers to use their own."
+    },
+    "setup-ssh.jpg": {
+      "view": "Reconfigure SSH Bootstrap",
+      "source_window": [
+        1920,
+        1050
+      ],
+      "crop_xywh": [
+        696,
+        387,
+        580,
+        356
+      ],
+      "note": "Captured before password entry; no credential submitted."
+    }
+  },
+  "operational_changes": "Frontend navigation, filtering/sort inspection, responsive viewport and local mobile-view preference only. No relay toggles, scene execution/saves, dashboard saves, or submitted credential changes."
 }

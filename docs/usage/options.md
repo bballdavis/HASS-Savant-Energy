@@ -6,10 +6,6 @@ title: Options and reconfiguration
 
 Open **Settings → Devices & services → Savant Energy → Configure** (the options action may have a different label in your Home Assistant version).
 
-![Illustrative options form showing polling interval, cooldown, and scene builder controls](../assets/options.png)
-
-*Demo form. Values shown are the source defaults.*
-
 | Setting | How to use it |
 |---|---|
 | Scan Interval | Choose 5, 10, 15, or 30 seconds. More frequent polling does not make the source publish data faster. |

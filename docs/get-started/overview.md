@@ -6,9 +6,9 @@ title: How it works
 
 The community **Savant Energy** integration connects Home Assistant to supported Savant energy equipment on your local network. It creates devices and entities you can use in dashboards and automations.
 
-![Illustrative dashboard with circuit readings and energy scenes](../assets/overview.png)
+![The companion breaker-board card displaying live circuit readings in Home Assistant](../assets/breaker-board-desktop.jpg)
 
-*Illustrative dashboard. All names, values, and devices in documentation images are synthetic.*
+*Real Home Assistant capture. The [companion breaker-board card](../usage/companion-card.md) is installed separately from the backend integration.*
 
 ## Monitoring and control are separate
 

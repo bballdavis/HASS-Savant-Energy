@@ -13,8 +13,6 @@
     "docs:check": "node scripts/run-python.mjs scripts/generate_reference.py --check",
     "docs:test": "node scripts/run-python.mjs -m unittest discover -s scripts -p test_*.py",
     "links:check": "node scripts/check-links.mjs",
-    "demo:serve": "node scripts/serve-demo.mjs",
-    "demo:capture": "node scripts/capture-demo.mjs",
     "readme:check": "node scripts/check-readme.mjs"
   },
   "dependencies": {
@@ -34,8 +32,7 @@
     "@docusaurus/types": "3.10.2",
     "@types/react": "19.3.0",
     "@types/node": "22.19.11",
-    "typescript": "5.9.3",
-    "playwright": "1.64.1"
+    "typescript": "5.9.3"
   },
   "engines": {
     "node": ">=22.0"

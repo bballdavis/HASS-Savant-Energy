@@ -2,7 +2,13 @@
 title: Scenes card does not load
 ---
 
-# Fix a missing scenes card
+# Fix a missing dashboard card
+
+## Companion breaker board
+
+For `custom:savant-energy-breaker-board-card`, install the separate [Savant-Card Dashboard repository](https://github.com/bballdavis/Savant-Card), verify `/hacsfiles/Savant-Card/Savant-Card.js` is registered as a module, and refresh the frontend. See [companion setup](../usage/companion-card.md).
+
+The steps below apply to the older scenes-only card bundled with this integration.
 
 ## Check setup first
 

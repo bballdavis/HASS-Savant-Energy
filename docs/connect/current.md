@@ -18,11 +18,15 @@ Open **Settings → Devices & services → Add integration → Savant Energy**.
 - **Current** is the direct path for firmware 11.2 or later. Enter both **PBC IP Address** and **Host IP Address**.
 - For older firmware, follow the complete [Legacy guide](../legacy/README.md).
 
-![Illustrative Current setup form with separate PBC and Host fields](../assets/setup.png)
+![The live Home Assistant Reconfigure mode-selection form](../assets/setup-mode.jpg)
 
-*Demo form using the integration’s English labels. Addresses are synthetic; enter your own.*
+*Real Home Assistant Reconfigure capture. Initial setup also offers Auto; Reconfigure offers explicit Legacy and Current choices.*
 
 **Expected result:** Current setup reaches **SSH Bootstrap**. Auto may instead finish as Legacy if it finds the original feed. A failed Legacy probe alone does not establish that your firmware is Current.
+
+![The actual Home Assistant Reconfigure form with separate PBC and Host address fields](../assets/setup-addresses.jpg)
+
+*Real Reconfigure capture. The addresses shown belong to the capture installation; use your own PBC and Host addresses.*
 
 ## 2. Complete SSH bootstrap
 
@@ -35,6 +39,10 @@ You do not need to locate or paste a token. Old token and manual-organization ro
 The password is used for bootstrap and is not saved in the config entry. The validated token and private SSH refresh key are saved there. Home Assistant storage and backups should be protected; this guide does not claim they are encrypted.
 
 **Expected result:** Home Assistant creates the **Savant Energy** entry and starts discovery/polling. A mapping warning can leave an uncertain circuit read-only instead of assigning relay control.
+
+![The actual SSH Bootstrap form in Home Assistant, captured with the password field empty](../assets/setup-ssh.jpg)
+
+*Real Reconfigure capture, before entering credentials. Initial Current setup uses the same RPM-password bootstrap step.*
 
 ## 3. Verify before using controls
 

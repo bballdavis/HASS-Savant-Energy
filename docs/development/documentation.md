@@ -38,22 +38,17 @@ The generator parses Python syntax with `ast`, reads English JSON labels, and pa
 
 Examples and behavioral explanations, especially REST limitations, need human/source review when runtime behavior changes; static field extraction does not prove runtime correctness.
 
-## Reproduce demo images
+## Capture real Home Assistant images
 
-Documentation images are original illustrative browser renders, not live Home Assistant captures. Fixtures use synthetic devices, readings, and reserved documentation IP addresses. No credentials or live hardware are needed.
+Documentation images must come from the actual Home Assistant interface and installed companion card. The previous mock interface and capture harness have been removed.
 
-```bash
-npx playwright install chromium
-npm run demo:capture
-```
+- Open the real companion breaker board and capture its desktop grid, standard mobile layout, ultra-compact mobile layout, and scene editor as needed. Firefox responsive mode can render a narrow viewport without editing the dashboard configuration.
+- Change display/navigation state only. Do not toggle a relay, activate a scene, create/delete scene data, or save dashboard changes for a screenshot.
+- Capture setup through the real **Reconfigure** flow. Pause before entering credentials; never include passwords, tokens, private keys, browser tabs, account details, or unrelated dashboards.
+- Crop the capture to the relevant card or form. Keep the interface text, measurements, and controls intact; do not recreate them, generate replacement UI, or substitute synthetic values.
+- Keep raw captures outside the public repository. Commit only reviewed excerpts and record their origin, viewport, and cropping in `docs/assets/provenance.json`.
 
-For an interactive local preview:
-
-```bash
-npm run demo:serve
-```
-
-Open `http://127.0.0.1:4174/?view=setup` (or `overview`, `entities`, `energy`, `scenes`, `options`). The isolated capture server exposes only demo files and the integration’s public English labels. Capture blocks non-local requests. Edit `website/demo/fixtures.json` and the mock layout to update examples. Do not present these images as proof of live integration behavior. Source/provenance is recorded beside the images.
+The breaker board comes from the separate [Savant-Card repository](https://github.com/bballdavis/Savant-Card). Do not describe it as the older bundled `savant-energy-scenes-card`. Screenshots show the installed interface at capture time, not live release acceptance evidence.
 
 ## GitHub Pages rollout
 
