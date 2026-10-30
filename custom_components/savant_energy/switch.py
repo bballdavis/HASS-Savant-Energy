@@ -1,4 +1,4 @@
-﻿"""
+"""
 Switch platform for Savant Energy.
 Provides relay (breaker) switch entities for each device, with cooldown logic to prevent rapid toggling.
 

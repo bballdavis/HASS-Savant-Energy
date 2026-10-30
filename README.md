@@ -1,5 +1,10 @@
 # Savant Energy Home Assistant Integration
 
+[![Latest release](https://img.shields.io/github/v/release/bballdavis/HASS-Savant-Energy)](https://github.com/bballdavis/HASS-Savant-Energy/releases/latest)
+[![HACS validation](https://github.com/bballdavis/HASS-Savant-Energy/actions/workflows/hacs.yml/badge.svg)](https://github.com/bballdavis/HASS-Savant-Energy/actions/workflows/hacs.yml)
+[![Hassfest](https://github.com/bballdavis/HASS-Savant-Energy/actions/workflows/hassfest.yml/badge.svg)](https://github.com/bballdavis/HASS-Savant-Energy/actions/workflows/hassfest.yml)
+[![Open in Home Assistant](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=bballdavis&repository=HASS-Savant-Energy&category=integration)
+
 Welcome to the **Savant Energy** integration for Home Assistant! This project brings Savant relay and energy monitoring devices into your smart home, providing real-time power, voltage, relay control, and more, all with a beautiful, open-source touch.
 
 For the current protocol migration and the 2.0.0 release details, see [the current API workflow](docs/current-api-workflow.md) and [the release notes](docs/release-notes-v2.0.0.md).
@@ -23,15 +28,14 @@ For the current protocol migration and the 2.0.0 release details, see [the curre
 
 ---
 
-## Installation (via HACS)
+## Installation
 
-1. **Add the repository to HACS**
-   - In Home Assistant, go to **HACS > Integrations > Custom repositories**
-   - Add: `https://github.com/bballdavis/HASS-Savant-Energy`
-   - Set category to **Integration**
+1. **Open the repository in Home Assistant** using the badge above. If prompted, add it as a custom integration repository.
+
+   Alternatively, in HACS or Marketplace, add `https://github.com/bballdavis/HASS-Savant-Energy` as a custom repository with category **Integration**. Once the repository is included in the default catalog, you can search for **Savant Energy** without adding it first.
 
 2. **Install the integration**
-   - Search for **Savant Energy** in HACS and click **Install**
+   - Open **Savant Energy** in HACS or Marketplace and download it.
 
 3. **Restart Home Assistant**
 
