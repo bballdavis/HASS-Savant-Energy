@@ -1,12 +1,12 @@
 {
   "domain": "savant_energy",
   "name": "Savant Energy",
-  "version": "2.1.0",
-  "documentation": "https://github.com/bballdavis/HASS-Savant-Energy",
-  "requirements": ["paramiko>=3.4.0"],
-  "dependencies": ["frontend", "lovelace"],
   "codeowners": ["@bballdavis"],
   "config_flow": true,
+  "dependencies": ["frontend", "http", "lovelace"],
+  "documentation": "https://github.com/bballdavis/HASS-Savant-Energy",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/bballdavis/HASS-Savant-Energy/issues"
+  "issue_tracker": "https://github.com/bballdavis/HASS-Savant-Energy/issues",
+  "requirements": ["paramiko>=3.4.0"],
+  "version": "2.1.0"
 }
