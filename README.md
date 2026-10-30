@@ -203,8 +203,12 @@ See `INTEGRATION_API.md` for full documentation.
 | SSH Bootstrap | (required for Current) | One-time RPM password; retrieves and manages the validated InfluxDB read token |
 | Scan Interval | 5 s | How often to poll for new data |
 | Breaker Cooldown | 15 s | Minimum seconds between relay toggles |
-| Pending Confirm Multiplier | 2x | Coordinator cycles to wait for relay confirmation |
-| DMX Testing Mode | Off | Log DMX commands without sending (legacy, diagnostic) |
+| Breaker Confirmation Wait | 2 intervals | Scan intervals to wait for the reported relay state to confirm a command (1–10) |
+| Disable Scene Support | Off | Disables scene storage and the scene API, including scene support in the companion card |
+| DMX Testing Mode | Off | Legacy mode only: log DMX commands without sending them |
+| Refresh SSH Key And Token | Off | Current mode only: use the RPM password to provision a new SSH key and refresh the Influx token |
+
+Runtime options are available under the integration's **Configure** action. Use **Reconfigure** to change hosts or modes. Saved mode-specific options are retained when switching modes.
 
 ---
 

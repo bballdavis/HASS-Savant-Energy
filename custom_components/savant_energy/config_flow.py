@@ -976,7 +976,9 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
 
     async def async_step_init(self, user_input=None):
         errors = {}
+        current_mode = self.config_entry.data.get(CONF_MODE, DEFAULT_MODE) == MODE_CURRENT
         if user_input is not None:
+            user_input = dict(user_input)
             try:
                 pcm = int(
                     user_input.get(
@@ -990,47 +992,51 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 errors[CONF_PENDING_CONFIRM_MULTIPLIER] = "invalid_value"
 
             if not errors:
-                reprovision = user_input.pop("reprovision_ssh_key", False)
+                reprovision = user_input.pop("reprovision_ssh_key", False) and current_mode
+                # OptionsFlow replaces the whole options mapping on save. Keep
+                # values hidden for the other mode and any future options intact.
+                if current_mode:
+                    user_input.pop(CONF_DMX_TESTING_MODE, None)
+                options = {**self.config_entry.options, **user_input}
                 if reprovision:
-                    self._pending_options = user_input
+                    self._pending_options = options
                     return await self.async_step_reprovision_ssh()
-                return self.async_create_entry(title="", data=user_input)
+                return self.async_create_entry(title="", data=options)
 
         def _opt(key, default):
             return self.config_entry.options.get(key, self.config_entry.data.get(key, default))
 
         has_key = bool(self.config_entry.data.get(CONF_SSH_PRIVATE_KEY, ""))
 
+        fields = {
+            vol.Optional(
+                CONF_SCAN_INTERVAL,
+                default=_opt(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+            ): vol.In(SCAN_INTERVAL_OPTIONS),
+            vol.Optional(
+                CONF_SWITCH_COOLDOWN,
+                default=_opt(CONF_SWITCH_COOLDOWN, DEFAULT_SWITCH_COOLDOWN),
+            ): int,
+            vol.Required(
+                CONF_PENDING_CONFIRM_MULTIPLIER,
+                default=_opt(CONF_PENDING_CONFIRM_MULTIPLIER, DEFAULT_PENDING_CONFIRM_MULTIPLIER),
+            ): vol.Coerce(int),
+            vol.Optional(
+                "disable_scene_builder",
+                default=_opt("disable_scene_builder", DEFAULT_DISABLE_SCENE_BUILDER),
+            ): bool,
+        }
+        if current_mode:
+            fields[vol.Optional("reprovision_ssh_key", default=False)] = bool
+        else:
+            fields[vol.Optional(
+                CONF_DMX_TESTING_MODE,
+                default=_opt(CONF_DMX_TESTING_MODE, DEFAULT_DMX_TESTING_MODE),
+            )] = bool
+
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Optional(
-                        CONF_SCAN_INTERVAL,
-                        default=_opt(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
-                    ): vol.In(SCAN_INTERVAL_OPTIONS),
-                    vol.Optional(
-                        CONF_SWITCH_COOLDOWN,
-                        default=_opt(CONF_SWITCH_COOLDOWN, DEFAULT_SWITCH_COOLDOWN),
-                    ): int,
-                    vol.Required(
-                        CONF_PENDING_CONFIRM_MULTIPLIER,
-                        default=_opt(
-                            CONF_PENDING_CONFIRM_MULTIPLIER,
-                            DEFAULT_PENDING_CONFIRM_MULTIPLIER,
-                        ),
-                    ): vol.Coerce(int),
-                    vol.Optional(
-                        CONF_DMX_TESTING_MODE,
-                        default=_opt(CONF_DMX_TESTING_MODE, DEFAULT_DMX_TESTING_MODE),
-                    ): bool,
-                    vol.Optional(
-                        "disable_scene_builder",
-                        default=_opt("disable_scene_builder", DEFAULT_DISABLE_SCENE_BUILDER),
-                    ): bool,
-                    vol.Optional("reprovision_ssh_key", default=False): bool,
-                }
-            ),
+            data_schema=vol.Schema(fields),
             description_placeholders={
                 "ssh_key_status": "installed" if has_key else "not configured",
             },
