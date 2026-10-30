@@ -1,0 +1,79 @@
+/* Documentation identity: independent typography, no vendor marks. */
+:root {
+  --ifm-color-primary: #12654f;
+  --ifm-color-primary-dark: #105b47;
+  --ifm-color-primary-darker: #0f5643;
+  --ifm-color-primary-darkest: #0c4737;
+  --ifm-color-primary-light: #147058;
+  --ifm-color-primary-lighter: #15765c;
+  --ifm-color-primary-lightest: #188269;
+  --ifm-font-family-base: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --ifm-heading-font-weight: 650;
+  --ifm-background-color: #fafbf9;
+  --ifm-font-color-base: #202c28;
+  --ifm-line-height-base: 1.7;
+  --ifm-code-font-size: 90%;
+  --ifm-global-radius: 0.5rem;
+  --ifm-navbar-shadow: none;
+  --ifm-footer-background-color: #eef2ed;
+  --doc-sidebar-width: 280px;
+}
+[data-theme='dark'] {
+  --ifm-color-primary: #8cdbb8;
+  --ifm-color-primary-dark: #70d3a6;
+  --ifm-color-primary-darker: #62cf9d;
+  --ifm-color-primary-darkest: #3bc083;
+  --ifm-color-primary-light: #a8e3ca;
+  --ifm-color-primary-lighter: #b6e7d3;
+  --ifm-color-primary-lightest: #dff6eb;
+  --ifm-background-color: #151c19;
+  --ifm-background-surface-color: #1c2621;
+  --ifm-font-color-base: #e6eee9;
+  --ifm-footer-background-color: #1c2621;
+  --ifm-navbar-background-color: #151c19;
+}
+::selection { background: #b9e3d2; color: #153a2d; }
+:focus-visible { outline: 3px solid var(--ifm-color-primary); outline-offset: 4px; }
+a { text-underline-offset: 0.2em; }
+input { caret-color: var(--ifm-color-primary); }
+.navbar { border-bottom: 1px solid var(--ifm-color-emphasis-200); }
+.navbar__title { letter-spacing: -0.035em; font-weight: 750; }
+.navbar__title::after { content: ' / HA'; color: var(--ifm-color-primary); font-weight: 500; }
+.markdown { max-width: 74ch; }
+.markdown h2 { margin-top: 2.5rem; }
+.markdown img { border-radius: 12px; }
+.markdown table { font-variant-numeric: tabular-nums; }
+.markdown blockquote { border-inline-start-width: 1px; }
+.alert { border-left-width: 1px; }
+.showcase { display: block; padding-top: 3.5rem; padding-bottom: 3rem; }
+.showcase-copy { max-width: 920px; }
+.showcase-image { margin-top: 2.5rem; }
+.showcase h1 { font-size: clamp(2.6rem, 4.2vw, 4.3rem); line-height: 1.09; letter-spacing: -0.035em; margin-bottom: 1.5rem; }
+.showcase h1 span { color: var(--ifm-color-primary); }
+.showcase-copy > p { max-width: 70ch; font-size: 1.1rem; }
+.showcase-actions { display: flex; flex-wrap: wrap; gap: 1rem 1.5rem; align-items: center; margin-top: 1.8rem; }
+.showcase-actions .button { font-size: 1rem; }
+.text-link { font-weight: 600; }
+.showcase-copy .community-note { color: var(--ifm-color-emphasis-700); font-size: 0.82rem; margin-top: 1.5rem; }
+.showcase-image { margin: 2.5rem 0 0; }
+.showcase-image img { display: block; width: 100%; height: auto; border-radius: 12px; box-shadow: 0 18px 45px #102b1e1c; }
+figcaption { font-size: 0.8rem; color: var(--ifm-color-emphasis-700); margin-top: 0.75rem; }
+.capabilities { padding-top: 2.5rem; padding-bottom: 4rem; }
+.capabilities h2, .setup-path h2 { font-size: 2rem; letter-spacing: -0.025em; }
+.capability-list { display: grid; grid-template-columns: repeat(3, 1fr); gap: 2.5rem; margin-top: 2rem; }
+.capability-list article { border-top: 1px solid var(--ifm-color-emphasis-300); padding-top: 1.4rem; }
+.capability-list h3 { font-size: 1.2rem; }
+.capability-list a { font-weight: 600; }
+.setup-path { display: grid; grid-template-columns: 1fr 1fr; gap: 5rem; padding-top: 2.5rem; padding-bottom: 5rem; }
+.path-links a { display: flex; flex-direction: column; padding: 1rem 0; border-bottom: 1px solid var(--ifm-color-emphasis-300); }
+.path-links a:first-child { padding-top: 0; }
+.path-links span { color: var(--ifm-font-color-base); font-size: 0.95rem; }
+.footer__copyright { font-size: 0.85rem; max-width: 76ch; margin: 1.5rem auto 0; }
+@media (max-width: 996px) {
+  .showcase { grid-template-columns: 1fr; gap: 2rem; padding-top: 3rem; }
+  .showcase h1 { font-size: clamp(2.6rem, 7vw, 4rem); }
+  .showcase-image { max-width: 720px; }
+  .capability-list { grid-template-columns: 1fr; gap: 1.5rem; }
+  .setup-path { grid-template-columns: 1fr; gap: 1.5rem; }
+}
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }

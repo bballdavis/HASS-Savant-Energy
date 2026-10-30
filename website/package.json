@@ -1,0 +1,40 @@
+{
+  "name": "savant-energy-docs",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "docusaurus start --host 127.0.0.1",
+    "prestart": "npm run docs:generate",
+    "build": "docusaurus build",
+    "prebuild": "npm run docs:generate",
+    "serve": "docusaurus serve --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "docs:generate": "node scripts/run-python.mjs scripts/generate_reference.py",
+    "docs:check": "node scripts/run-python.mjs scripts/generate_reference.py --check",
+    "docs:test": "node scripts/run-python.mjs -m unittest discover -s scripts -p test_*.py",
+    "links:check": "node scripts/check-links.mjs",
+    "readme:check": "node scripts/check-readme.mjs"
+  },
+  "dependencies": {
+    "@docusaurus/core": "3.10.2",
+    "@docusaurus/preset-classic": "3.10.2",
+    "@docusaurus/plugin-client-redirects": "3.10.2",
+    "@easyops-cn/docusaurus-search-local": "0.55.3",
+    "@mdx-js/react": "3.1.1",
+    "clsx": "2.1.1",
+    "prism-react-renderer": "2.4.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@docusaurus/module-type-aliases": "3.10.2",
+    "@docusaurus/tsconfig": "3.10.2",
+    "@docusaurus/types": "3.10.2",
+    "@types/react": "19.3.0",
+    "@types/node": "22.19.11",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=22.0"
+  }
+}

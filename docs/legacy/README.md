@@ -1,43 +1,38 @@
-# Savant Energy Legacy Mode (<11.2)
+---
+title: Legacy setup
+slug: /legacy/
+---
 
-This document describes legacy mode behavior and setup details that are specific to older Savant systems.
+# Set up Legacy mode
 
-## When To Use Legacy Mode
+Use this path for older Savant firmware that still provides the original activity/snapshot feed. Firmware 11.2 or later generally uses [Current setup](../connect/current.md).
 
-Use legacy mode when your system still provides the legacy activity/snapshot feed over the PBC endpoint.
+## Before you start
 
-## Setup Inputs
+[Install the integration](../get-started/installation.md), restart Home Assistant, and identify the **PBC address**. Home Assistant must reach the PBC’s snapshot feed on TCP 2000 and its DMX/OLA API on port 9090. Legacy setup does not ask for a Host address or SSH password.
 
-Legacy mode setup asks for:
+## Connect
 
-- PBC IP address
+1. Open **Settings → Devices & services → Add integration → Savant Energy**.
+2. Choose **Legacy**.
+3. Enter the **PBC IP Address** and submit.
+4. Open the created entry’s devices and [verify the first readings](../connect/verify.md).
 
-Ports are fixed in code by default:
+Auto mode can also select Legacy when it finds a usable snapshot feed. Explicit Legacy setup creates the entry after address validation; reaching the end of the form does not prove the feed is healthy.
 
-- Legacy snapshot feed: TCP 2000
-- OLA/DMX API: 9090
+**Expected result:** the entry uses the original snapshot data and DMX/OLA control path. Applicable relay devices have breaker switches, relay status, and DMX address entities. Measurements depend on what the Legacy snapshot supplies; do not expect every Current-mode system or CT channel.
 
-## Legacy Runtime Path
+## Check a known relay
 
-Legacy mode keeps the historical integration path:
+Confirm the physical load, request one state change, and wait for subsequent snapshot updates. Relay confirmation is inferred through polling. The default cooldown is 15 seconds. **DMX Testing Mode** should be off for normal control; it logs commands without sending them when enabled.
 
-1. Read snapshot payload from TCP port 2000.
-2. Decode base64 `SET_ENERGY` payload.
-3. Build `presentDemands` entities from snapshot data.
-4. Use DMX/OLA command path for breaker control.
+## If readings or control fail
 
-## Legacy-Specific Notes
+- Check the PBC address and network access separately for the snapshot and OLA endpoints.
+- Confirm the firmware still provides the original feed.
+- Review the integration’s notifications and [focused logs](../troubleshooting/logs.md).
+- If firmware was upgraded, use [Legacy-to-Current migration](migration.md).
 
-- Relay command confirmation is inferred via subsequent snapshot updates.
-- DMX writes should preserve managed channel state to avoid clobbering unrelated channels.
-- Existing upgraded users default to legacy mode unless they explicitly reconfigure to current mode.
+## Technical background
 
-## Upgrading To Current Mode
-
-From integration reconfigure:
-
-1. Change mode to Current (>=11.2).
-2. Provide host IP.
-3. Provide the RPM SSH password so SSH bootstrap can fetch and validate the managed Influx token.
-
-See [docs/current-api-workflow.md](../current-api-workflow.md) for the current-mode architecture and data/control paths.
+Legacy reads TCP snapshots, decodes the base64 `SET_ENERGY` payload, and shapes `presentDemands` into entities. Relay commands use DMX/OLA and preserve managed channel state. Current mode instead separates InfluxDB telemetry from SEM relay control; see [architecture](../current-api-workflow.md).

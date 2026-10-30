@@ -1,5 +1,7 @@
 # Savant Energy v2.0.1-beta9
 
+> Historical release notes. For current instructions, use the [installation guide](get-started/installation.md) and [setup guide](connect/current.md).
+
 Beta9 contains the setup and diagnostics fixes for issue #14. It is a
 prerelease: install it, reproduce the affected setup path, and confirm the
 result on the target Savant host before treating it as resolved.

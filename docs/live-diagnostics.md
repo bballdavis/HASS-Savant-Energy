@@ -1,3 +1,7 @@
+---
+title: Maintainer live diagnostics
+---
+
 # Live Savant and Home Assistant diagnostics
 
 Unit tests are not evidence that an installed Home Assistant entry is healthy. Use both read-only probes below before calling a telemetry change fixed.
