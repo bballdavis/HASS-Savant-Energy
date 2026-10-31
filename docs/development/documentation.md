@@ -48,7 +48,7 @@ Documentation images must come from the actual Home Assistant interface and inst
 - Crop the capture to the relevant card or form. Keep the interface text, measurements, and controls intact; do not recreate them, generate replacement UI, or substitute synthetic values.
 - Keep raw captures outside the public repository. Commit only reviewed excerpts and record their origin, viewport, and cropping in `docs/assets/provenance.json`.
 
-The breaker board comes from the separate [Savant-Card repository](https://github.com/bballdavis/Savant-Card). Do not describe it as the older bundled `savant-energy-scenes-card`. Screenshots show the installed interface at capture time, not live release acceptance evidence.
+The breaker board is built from [Savant-Card](https://github.com/bballdavis/Savant-Card) and bundled with this integration. See [companion builds](companion-build.md) for provenance and update PRs. The old `savant-energy-scenes-card` type now aliases the new board. Screenshots show the installed interface at capture time, not live release acceptance evidence.
 
 ## GitHub Pages rollout
 
@@ -62,4 +62,4 @@ Repository **Settings → Pages → Build and deployment → Source** must use *
 
 After merge, verify homepage, installation, Legacy, generated reference, images, search, and direct deep links on the public URL. Only after the site is live, update `custom_components/savant_energy/manifest.json`’s `documentation` URL to the public site in a follow-up change. The branch deliberately retains the existing URL until that verification is possible.
 
-For failures, inspect the Actions build/deploy logs. Revert the faulty documentation commit on `main` and let the same workflow republish the previous content. No integration runtime rollback is required for documentation-only changes.
+For failures, inspect the Actions build/deploy logs. Revert the faulty documentation commit on `main` and let the same workflow republish the previous content. For card regressions, revert the companion pin and its artifacts together; documentation-only rollbacks do not change the runtime.

@@ -9,7 +9,7 @@ Home Assistant users installing, configuring, using, or migrating the community 
 ## Product Purpose
 Replace a long README with a compact showcase and accurate, task-oriented documentation.
 ## Capabilities and Constraints
-Current-first guides; complete Legacy instructions; generated reference from static source; real captures of the companion card and Home Assistant setup, taken without changing hardware state. No integration runtime or packaged branding changes.
+Current-first guides; complete Legacy instructions; generated reference from static source; real captures of the companion card and Home Assistant setup, taken without changing hardware state. The companion card is bundled from a reviewed upstream commit. Packaged integration branding and backend APIs remain unchanged.
 ## Brand Commitments
 Plain descriptive title: Savant Energy for Home Assistant. Original system-font typography and restrained accent. No vendor marks. State that the project is independent and unaffiliated with Savant.
 ## Evidence on Hand

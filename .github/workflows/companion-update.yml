@@ -1,0 +1,121 @@
+name: Check upstream companion updates
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: companion-upstream-update
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.bundle.outputs.changed }}
+      base: ${{ steps.base.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - id: base
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        with:
+          repository: bballdavis/Savant-Card
+          ref: main
+          fetch-depth: 0
+          path: _upstream/Savant-Card
+          persist-credentials: false
+      - id: candidate
+        name: Check history against the existing pin
+        run: |
+          pin=$(python3 -c "import json; print(json.load(open('custom_components/savant_energy/www/bundle.json'))['commit'])")
+          git -C _upstream/Savant-Card fetch origin "$pin"
+          echo "needed=$(python3 tools/companion_update.py --source _upstream/Savant-Card)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        if: steps.candidate.outputs.needed == 'true'
+        with:
+          node-version: '22'
+      - name: Build and test upstream without write credentials
+        if: steps.candidate.outputs.needed == 'true'
+        working-directory: _upstream/Savant-Card
+        run: |
+          npm ci
+          npm run check
+      - id: bundle
+        if: steps.candidate.outputs.needed == 'true'
+        name: Import only a changed runtime artifact
+        run: |
+          changed=$(python3 tools/companion_update.py --source _upstream/Savant-Card --after-build)
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          if [ "$changed" = true ]; then
+            python3 tools/bundle_companion.py --source _upstream/Savant-Card
+            python3 tools/bundle_companion.py --check
+            node tools/test_companion.mjs _upstream/Savant-Card
+          fi
+      - uses: actions/upload-artifact@v4
+        if: steps.bundle.outputs.changed == 'true'
+        with:
+          name: companion-update
+          path: |
+            custom_components/savant_energy/www/
+            custom_components/savant_energy/card_version.py
+
+  propose:
+    needs: build
+    if: needs.build.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # No upstream scripts run in this job, which alone can push a review branch.
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+      - name: Reject a stale main build
+        env:
+          BUILT_BASE: ${{ needs.build.outputs.base }}
+        run: test "$(git rev-parse HEAD)" = "$BUILT_BASE"
+      - uses: actions/download-artifact@v4
+        with:
+          name: companion-update
+          path: custom_components/savant_energy
+      - name: Open or refresh the review PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          branch=upstream/companion-card
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          previous=$(git ls-remote origin "refs/heads/$branch" | cut -f1)
+          git checkout -b "$branch"
+          git add custom_components/savant_energy/www custom_components/savant_energy/card_version.py
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'build: update pinned companion card'
+          git push --force-with-lease="refs/heads/$branch:$previous" origin "HEAD:refs/heads/$branch"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          pin = json.loads(Path('custom_components/savant_energy/www/bundle.json').read_text())
+          Path('/tmp/companion-pr.md').write_text(
+              'Update the bundled companion to [' + pin['commit'][:7] + '](' + pin['repository'] + '/commit/' + pin['commit'] + ').\n\n'
+              'The upstream lint, tests, TypeScript/build checks, bundle hashes and compatibility checks passed before this PR was opened. '
+              'Review the card changes before merging. Main continues shipping its existing pinned artifact until merge.\n\n'
+              'GitHub may require **Approve workflows to run** for PR checks created by GITHUB_TOKEN. '
+              'No automatic merge or live Home Assistant update is performed.\n')
+          PY
+          number=$(gh pr list --head "$branch" --base main --state open --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --title 'Update bundled Savant companion card' --body-file /tmp/companion-pr.md
+          else
+            gh pr create --head "$branch" --base main --title 'Update bundled Savant companion card' --body-file /tmp/companion-pr.md
+          fi

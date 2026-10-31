@@ -13,7 +13,7 @@ track energy, control relays, and organize energy scenes from your own dashboard
 
 ![The companion breaker-board card running in Home Assistant, with real circuit readings and history graphs.](docs/assets/breaker-board-desktop.jpg)
 
-*Real Home Assistant capture using the [companion breaker-board card](docs/usage/companion-card.md). Available measurements depend on your hardware and firmware.*
+*Real Home Assistant capture using the included [companion breaker-board card](docs/usage/companion-card.md). Available measurements depend on your hardware and firmware.*
 
 ## What you can do
 
@@ -21,8 +21,8 @@ track energy, control relays, and organize energy scenes from your own dashboard
 - **Track energy:** use supported hardware kWh counters in Home Assistant’s Energy dashboard.
 - **See the wider picture:** CT-monitored loads and available grid, solar, battery, and load-group readings in Current mode.
 - **Control supported relays:** breaker switches, relay status, cooldown settings, and All Loads On.
-- **See your loads:** use the [companion breaker-board card](docs/usage/companion-card.md) for circuit tiles, history graphs, and compact mobile views.
-- **Build energy scenes:** manage saved relay states in the companion editor or the bundled scenes-only card.
+- **See your loads:** use the included [companion breaker-board card](docs/usage/companion-card.md) for circuit tiles, history graphs, and compact mobile views.
+- **Build energy scenes:** manage saved relay states in the included companion card’s editor.
 - **Automate:** use Home Assistant entities and scene-management services.
 
 ## Choose your setup

@@ -8,7 +8,7 @@ The community **Savant Energy** integration connects Home Assistant to supported
 
 ![The companion breaker-board card displaying live circuit readings in Home Assistant](../assets/breaker-board-desktop.jpg)
 
-*Real Home Assistant capture. The [companion breaker-board card](../usage/companion-card.md) is installed separately from the backend integration.*
+*Real Home Assistant capture. The [companion breaker-board card](../usage/companion-card.md) is included with the integration.*
 
 ## Monitoring and control are separate
 

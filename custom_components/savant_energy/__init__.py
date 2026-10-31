@@ -18,7 +18,6 @@ from homeassistant.config_entries import ConfigEntry  # type: ignore
 from homeassistant.core import HomeAssistant  # type: ignore
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator  # type: ignore
 from homeassistant.helpers.translation import async_get_translations  # type: ignore
-from homeassistant.components import frontend  # type: ignore
 
 from .const import (
     DOMAIN,
@@ -53,6 +52,7 @@ from .current.influx_client import (
 from .influx_client import discover_circuit_metadata_with_backfill
 from .current.relay_control import SavantRelayController
 from .config_storage import normalize_entry_storage
+from .frontend import async_register_frontend_resource as _async_register_frontend_resource
 from .influx_org_resolver import InfluxOrgCandidate, async_discover_influx_org
 from .legacy.snapshot_data import fetch_current_energy_snapshot
 from .ssh_helper import InfluxHostMetadata
@@ -71,7 +71,6 @@ CONFIG_SCHEMA = vol.Schema(
     extra=vol.ALLOW_EXTRA,
 )
 
-LOVELACE_CARD_FILENAME = "savant-energy-scenes-card.js"
 LEGACY_FEED_NOTIFICATION_ID = f"{DOMAIN}_legacy_feed_unavailable"
 INFLUX_ORG_NOTIFICATION_ID = f"{DOMAIN}_influx_org_selection_required"
 CIRCUIT_MAP_NOTIFICATION_ID = f"{DOMAIN}_circuit_map_reconfigure_required"
@@ -1027,27 +1026,6 @@ async def _async_remove_stale_circuit_entities(
                     "Removed orphaned device: %s (identifier=%s)", device.name or device.id, identifier
                 )
             break
-
-
-async def _async_register_frontend_resource(hass: HomeAssistant) -> None:
-    """Register the custom Lovelace card with Home Assistant's frontend."""
-    try:
-        local_path = f"/local/{DOMAIN}"
-
-        try:
-            from homeassistant.components.http import StaticPathConfig  # type: ignore
-
-            await hass.http.async_register_static_paths(
-                [StaticPathConfig(local_path, os.path.dirname(__file__), True)]
-            )
-        except (ImportError, AttributeError):
-            hass.http.register_static_path(local_path, os.path.dirname(__file__), True)
-
-        resource_url = f"{local_path}/{LOVELACE_CARD_FILENAME}"
-        frontend.add_extra_js_url(hass, resource_url)
-        _LOGGER.info("Registered Lovelace card: %s", resource_url)
-    except Exception as exc:
-        _LOGGER.error("Failed to register frontend resource: %s", exc, exc_info=True)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:

@@ -34,6 +34,10 @@ Read [requirements](requirements.md). Have access to Home Assistant administrati
 
 **Expected result:** the same mode-selection form as the HACS installation. Manual installations require manual file updates and a restart when upgrading.
 
+## Add your dashboard
+
+The companion breaker-board card is included with the integration. After setup and restart, [add it to a dashboard](../usage/companion-card.md). Existing standalone HACS card users should follow the migration steps on that page to avoid duplicate resources.
+
 ## If it does not appear
 
 Confirm the folder path, restart completion, and Home Assistant logs. A browser refresh may be needed after restart. See [installation troubleshooting](../troubleshooting/overview.md#integration-not-found).

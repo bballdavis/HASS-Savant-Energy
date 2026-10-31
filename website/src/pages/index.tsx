@@ -26,7 +26,7 @@ export default function Home(): React.JSX.Element {
         <div className="capability-list">
           <article><h3>See what each circuit uses</h3><p>Power and hardware energy counters for supported loads, plus current, voltage, and system readings where your firmware provides them.</p><Link to="/docs/usage/entities">Explore devices and entities →</Link></article>
           <article><h3>Bring energy into focus</h3><p>Add eligible cumulative energy sensors to Home Assistant’s Energy dashboard. Understand which readings are available on your system.</p><Link to="/docs/usage/energy-dashboard">Set up energy monitoring →</Link></article>
-          <article><h3>Make controls part of your day</h3><p>Pair the integration with the companion breaker board for circuit tiles and compact mobile views. Review saved relay states in its scene editor.</p><Link to="/docs/usage/scenes">Build your first scene →</Link></article>
+          <article><h3>Make controls part of your day</h3><p>Use the included companion breaker board for circuit tiles and compact mobile views. Review saved relay states in its scene editor.</p><Link to="/docs/usage/scenes">Build your first scene →</Link></article>
         </div>
       </section>
       <section className="setup-path container" aria-labelledby="setup-title">

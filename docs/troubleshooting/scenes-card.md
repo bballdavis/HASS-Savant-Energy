@@ -4,36 +4,35 @@ title: Scenes card does not load
 
 # Fix a missing dashboard card
 
-## Companion breaker board
-
-For `custom:savant-energy-breaker-board-card`, install the separate [Savant-Card Dashboard repository](https://github.com/bballdavis/Savant-Card), verify `/hacsfiles/Savant-Card/Savant-Card.js` is registered as a module, and refresh the frontend. See [companion setup](../usage/companion-card.md).
-
-The steps below apply to the older scenes-only card bundled with this integration.
-
 ## Check setup first
 
 1. Confirm the integration is set up and Home Assistant restarted after installation/update.
-2. Check that **Disable Scene Builder** is off in [options](../usage/options.md).
-3. Confirm your manual dashboard card contains:
+2. Leave **Disable Scene Builder** off in [options](../usage/options.md). It controls scene-backend and frontend setup.
+3. Refresh the browser, then add **Savant Energy Card** or use:
 
    ```yaml
-   type: custom:savant-energy-scenes-card
+   type: custom:savant-energy-breaker-board-card
    ```
+
+Existing `custom:savant-energy-scenes-card` YAML is an alias for this board. The older scenes-only implementation is no longer shipped.
 
 ## Check the frontend resource
 
-The integration registers this resource as extra frontend JavaScript:
+The integration automatically loads these files with a version query:
 
 ```text
+/local/savant_energy/Savant-Card.js
 /local/savant_energy/savant-energy-scenes-card.js
 ```
 
-This includes the `savant_energy` directory. The older README path `/local/savant-energy-scenes-card.js` omitted it.
+The second file is only the old-type compatibility alias. Open these paths on your Home Assistant origin and check for successful responses. Do not add duplicate resources to fix a failed load. Capture a browser-console error and focused Home Assistant log if loading fails.
 
-Open the current path on your Home Assistant origin and check for a successful response. If automatic loading has failed, add the current URL under **Settings → Dashboards → Resources** as a **JavaScript module** (advanced mode may be needed). Avoid adding duplicate registrations. Reload the browser or clear its cached frontend files.
+If a standalone Savant-Card resource is already installed, the integration logs that it is leaving that copy in charge. Follow [the migration steps](../usage/companion-card.md#separate-savant-card-hacs-installation) to remove the standalone resource, reload the integration, and refresh the browser. Remove custom-path copies too; only the documented standalone paths can be detected automatically.
 
-**Expected result:** the custom element loads and the card can read its scene list. If the JavaScript loads but the card still fails, capture the browser-console error and a focused Home Assistant log; do not assume a resource-path fix resolves every frontend exception.
+For `already been used with this registry` or `already defined` console errors, remove duplicate/manual Dashboard resources and refresh all Home Assistant tabs. A stale browser may retain the old implementation until refreshed. The old README URL `/local/savant-energy-scenes-card.js` was incorrect; the correct path includes `/savant_energy/`.
+
+**Expected result:** the new board loads and can read its scene list. An HTTP success alone does not prove every card feature works.
 
 ## Scene data or API errors
 
-Confirm the backend initialized its scene manager and views. See [REST API](../reference/rest-api.md) for authentication and payload expectations. Report the exact error with versions and sanitized logs. Do not post an access token.
+Confirm the scene manager and views initialized. See [REST API](../reference/rest-api.md) for authentication, required fields, and current limitations. Report exact errors with versions and sanitized logs. Do not post access tokens.
