@@ -7,11 +7,19 @@
           "scan_interval": "Scan Interval",
           "switch_cooldown": "Breaker Cooldown",
           "dmx_testing_mode": "DMX Testing Mode",
-          "pending_confirm_multiplier": "Breaker Switch Debounce Delay (scan intervals)",
-          "disable_scene_builder": "Disable Scene Builder",
+          "pending_confirm_multiplier": "Breaker Confirmation Wait (scan intervals)",
+          "disable_scene_builder": "Disable Scene Support",
           "reprovision_ssh_key": "Refresh SSH Key And Token"
         },
-        "description": "Configure runtime options here. Use Reconfigure to update hosts or run SSH bootstrap again."
+        "data_description": {
+          "scan_interval": "How often to poll for updated data, in seconds.",
+          "switch_cooldown": "Minimum seconds between commands to the same breaker switch.",
+          "pending_confirm_multiplier": "Number of scan intervals to wait for the reported breaker state to confirm a command (1–10).",
+          "dmx_testing_mode": "Log legacy DMX commands without sending them.",
+          "disable_scene_builder": "Disable the integration's scene storage and API, including scene support in the companion card.",
+          "reprovision_ssh_key": "Use the RPM password to provision a new SSH key and refresh the Influx token."
+        },
+        "description": "Configure runtime options here. Use Reconfigure to update hosts or change modes."
       },
       "reprovision_ssh": {
         "title": "Re-provision SSH Key",

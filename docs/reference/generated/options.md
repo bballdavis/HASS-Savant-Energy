@@ -6,13 +6,13 @@ title: Option defaults
 
 Generated from `config_flow.py`, `const.py`, `translations/en.json`. Edit the source, then run `npm run docs:generate` in `website/`.
 
-Defaults below apply when no saved value exists. Host and authentication settings belong in **Reconfigure**, not runtime options. See [Options](../../usage/options.md) for guidance.
+Defaults below apply when no saved value exists. Mode-specific fields are hidden in the other mode; saved values are retained. Host and authentication settings belong in **Reconfigure**, not runtime options. See [Options](../../usage/options.md) for guidance.
 
-| Key | UI label | Default | Type / choices |
-| --- | --- | --- | --- |
-| `scan_interval` | Scan Interval | `5` | One of: 5, 10, 15, 30 |
-| `switch_cooldown` | Breaker Cooldown | `15` | Integer |
-| `pending_confirm_multiplier` | Breaker Switch Debounce Delay (scan intervals) | `2` | Integer |
-| `dmx_testing_mode` | DMX Testing Mode | `false` | Boolean |
-| `disable_scene_builder` | Disable Scene Builder | `false` | Boolean |
-| `reprovision_ssh_key` | Refresh SSH Key And Token | `false` | Boolean |
+| Key | UI label | Default | Type / choices | Mode |
+| --- | --- | --- | --- | --- |
+| `scan_interval` | Scan Interval | `5` | One of: 5, 10, 15, 30 | All |
+| `switch_cooldown` | Breaker Cooldown | `15` | Integer | All |
+| `pending_confirm_multiplier` | Breaker Confirmation Wait (scan intervals) | `2` | Integer | All |
+| `disable_scene_builder` | Disable Scene Support | `false` | Boolean | All |
+| `reprovision_ssh_key` | Refresh SSH Key And Token | `false` | Boolean | Current |
+| `dmx_testing_mode` | DMX Testing Mode | `false` | Boolean | Legacy |

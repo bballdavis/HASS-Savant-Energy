@@ -10,10 +10,12 @@ Open **Settings → Devices & services → Savant Energy → Configure** (the op
 |---|---|
 | Scan Interval | Choose 5, 10, 15, or 30 seconds. More frequent polling does not make the source publish data faster. |
 | Breaker Cooldown | Minimum interval between relay toggles; default 15 seconds. |
-| Breaker Switch Debounce Delay | Confirmation allowance in scan intervals; default 2. The form accepts 1–10. |
-| DMX Testing Mode | Legacy diagnostic mode: log DMX commands without sending them. Leave off for normal operation. |
-| Disable Scene Builder | Skip scene-backend and bundled frontend setup. Leave off to use the included companion card; restart after changing it. |
-| Refresh SSH Key And Token | Starts the RPM-password flow to provision a new key and retrieve/validate a fresh token. |
+| Breaker Confirmation Wait | Confirmation allowance in scan intervals; default 2. The form accepts 1–10. |
+| DMX Testing Mode | **Legacy only.** Diagnostic mode: log DMX commands without sending them. Leave off for normal operation. |
+| Disable Scene Support | Skip scene-backend and bundled frontend setup. Leave off to use the included companion card; restart after changing it. |
+| Refresh SSH Key And Token | **Current only.** Starts the RPM-password flow to provision a new key and retrieve/validate a fresh token. |
+
+Options specific to the other mode are hidden, and their saved values are retained when switching modes.
 
 See [generated option defaults](../reference/generated/options.md) for the exact labels, keys, and source defaults.
 

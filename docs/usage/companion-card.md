@@ -12,7 +12,7 @@ The screenshots below show the actual card running in Home Assistant. Readings v
 
 ## Add the included card
 
-**Before you start:** install this integration version, restart Home Assistant, [verify its readings](../connect/verify.md), and leave **Disable Scene Builder** off in [options](options.md).
+**Before you start:** install this integration version, restart Home Assistant, [verify its readings](../connect/verify.md), and leave **Disable Scene Support** off in [options](options.md).
 
 1. Refresh the Home Assistant browser after restart.
 2. Edit a dashboard, choose **Add card**, and select **Savant Energy Card**.

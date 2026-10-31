@@ -8,7 +8,7 @@ The included companion breaker board provides the scene editor. It replaces the 
 
 ## Inspect a saved scene
 
-**Before you start:** connect the integration, leave **Disable Scene Builder** off, and [add the included card](companion-card.md).
+**Before you start:** connect the integration, leave **Disable Scene Support** off, and [add the included card](companion-card.md).
 
 1. Open the card’s **Scenes** toolbar action.
 2. Select a saved scene to inspect its members and planned on/off states.

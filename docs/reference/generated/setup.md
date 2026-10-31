@@ -196,16 +196,16 @@ This token cannot list Influx organizations. Enter the organization ID from the 
 
 `options.init` · Form present in source
 
-Configure runtime options here. Use Reconfigure to update hosts or run SSH bootstrap again.
+Configure runtime options here. Use Reconfigure to update hosts or change modes.
 
 | Field | Label | Help |
 | --- | --- | --- |
-| `scan_interval` | Scan Interval | — |
-| `switch_cooldown` | Breaker Cooldown | — |
-| `dmx_testing_mode` | DMX Testing Mode | — |
-| `pending_confirm_multiplier` | Breaker Switch Debounce Delay (scan intervals) | — |
-| `disable_scene_builder` | Disable Scene Builder | — |
-| `reprovision_ssh_key` | Refresh SSH Key And Token | — |
+| `scan_interval` | Scan Interval | How often to poll for updated data, in seconds. |
+| `switch_cooldown` | Breaker Cooldown | Minimum seconds between commands to the same breaker switch. |
+| `dmx_testing_mode` | DMX Testing Mode | Log legacy DMX commands without sending them. |
+| `pending_confirm_multiplier` | Breaker Confirmation Wait (scan intervals) | Number of scan intervals to wait for the reported breaker state to confirm a command (1–10). |
+| `disable_scene_builder` | Disable Scene Support | Disable the integration's scene storage and API, including scene support in the companion card. |
+| `reprovision_ssh_key` | Refresh SSH Key And Token | Use the RPM password to provision a new SSH key and refresh the Influx token. |
 
 ## Re-provision SSH Key
 

@@ -7,7 +7,7 @@ title: Scenes card does not load
 ## Check setup first
 
 1. Confirm the integration is set up and Home Assistant restarted after installation/update.
-2. Leave **Disable Scene Builder** off in [options](../usage/options.md). It controls scene-backend and frontend setup.
+2. Leave **Disable Scene Support** off in [options](../usage/options.md). It controls scene-backend and frontend setup.
 3. Refresh the browser, then add **Savant Energy Card** or use:
 
    ```yaml

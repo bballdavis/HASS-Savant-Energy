@@ -65,6 +65,23 @@ class ReferenceTests(unittest.TestCase):
     def test_generation_is_deterministic(self):
         self.assertEqual(generate(self.root), generate(self.root))
 
+    def test_mode_specific_options_are_labeled(self):
+        options = generate(self.root)['options.md']
+        self.assertIn('| `dmx_testing_mode` | DMX Testing Mode | `false` | Boolean | Legacy |', options)
+        self.assertIn('| `reprovision_ssh_key` | Refresh SSH Key And Token | `false` | Boolean | Current |', options)
+
+    def test_changed_mode_condition_fails(self):
+        source = self.root / 'custom_components/savant_energy/config_flow.py'
+        source.write_text(source.read_text().replace('if current_mode:\n            fields', 'if has_key:\n            fields'))
+        with self.assertRaisesRegex(ExtractionError, 'Unsupported options field composition'):
+            run(self.root)
+
+    def test_unreviewed_fields_mutation_fails(self):
+        source = self.root / 'custom_components/savant_energy/config_flow.py'
+        source.write_text(source.read_text().replace('        if current_mode:\n            fields', '        fields.update(extra_fields())\n        if current_mode:\n            fields'))
+        with self.assertRaisesRegex(ExtractionError, 'Unsupported options field composition'):
+            run(self.root)
+
 
 if __name__ == '__main__':
     unittest.main()

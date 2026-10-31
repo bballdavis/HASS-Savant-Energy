@@ -56,14 +56,59 @@ def schema_fields(schema, constants):
             isinstance(schema.func.value, ast.Name) and schema.func.value.id == 'vol' and
             schema.func.attr == 'Schema' and len(schema.args) == 1 and isinstance(schema.args[0], ast.Dict)):
         raise ExtractionError('Expected a literal vol.Schema dictionary')
+    return dict_fields(schema.args[0], constants)
+
+
+def dict_fields(dictionary, constants):
     fields = []
-    for key, value in zip(schema.args[0].keys, schema.args[0].values):
+    for key, value in zip(dictionary.keys, dictionary.values):
         if not (isinstance(key, ast.Call) and isinstance(key.func, ast.Attribute) and
                 isinstance(key.func.value, ast.Name) and key.func.value.id == 'vol' and
                 key.func.attr in ('Required', 'Optional') and len(key.args) == 1):
             raise ExtractionError('Unsupported schema field')
         fields.append((literal(key.args[0], constants), key.func.attr == 'Required', key, value))
     return fields
+
+
+def option_fields(method, schema, constants):
+    """Accept literal forms or the reviewed Current/Legacy field composition."""
+    if isinstance(schema, ast.Call) and len(schema.args) == 1 and isinstance(schema.args[0], ast.Dict):
+        return [(*field, 'All') for field in schema_fields(schema, constants)]
+    if not (isinstance(schema, ast.Call) and isinstance(schema.func, ast.Attribute) and
+            isinstance(schema.func.value, ast.Name) and schema.func.value.id == 'vol' and
+            schema.func.attr == 'Schema' and len(schema.args) == 1 and
+            isinstance(schema.args[0], ast.Name) and schema.args[0].id == 'fields'):
+        raise ExtractionError('Unsupported composed options schema')
+    declarations = [n for n in method.body if isinstance(n, ast.Assign) and
+                    len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and n.targets[0].id == 'fields']
+    expected_mode = ast.parse('self.config_entry.data.get(CONF_MODE, DEFAULT_MODE) == MODE_CURRENT', mode='eval').body
+    modes = [n.value for n in method.body if isinstance(n, ast.Assign) and
+             len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and n.targets[0].id == 'current_mode']
+    if len(modes) != 1 or ast.dump(modes[0]) != ast.dump(expected_mode):
+        raise ExtractionError('Unsupported options mode selection')
+    if len(declarations) != 1 or not isinstance(declarations[0].value, ast.Dict):
+        raise ExtractionError('Expected one literal options fields declaration')
+    tail = method.body[method.body.index(declarations[0]) + 1:]
+    if not (len(tail) == 2 and isinstance(tail[0], ast.If) and
+            isinstance(tail[0].test, ast.Name) and tail[0].test.id == 'current_mode' and
+            isinstance(tail[1], ast.Return)):
+        raise ExtractionError('Unsupported options field composition')
+    rows = [(*field, 'All') for field in dict_fields(declarations[0].value, constants)]
+    allowed_fields_names = {id(declarations[0].targets[0]), id(schema.args[0])}
+    for statements, mode in ((tail[0].body, 'Current'), (tail[0].orelse, 'Legacy')):
+        if len(statements) != 1 or not isinstance(statements[0], ast.Assign) or len(statements[0].targets) != 1:
+            raise ExtractionError('Unsupported mode-specific options fields')
+        assignment = statements[0]
+        target = assignment.targets[0]
+        if not (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name) and target.value.id == 'fields'):
+            raise ExtractionError('Expected a mode-specific field assignment')
+        allowed_fields_names.add(id(target.value))
+        rows.extend((*field, mode) for field in dict_fields(ast.Dict(keys=[target.slice], values=[assignment.value]), constants))
+    if any(isinstance(n, ast.Name) and n.id == 'fields' and id(n) not in allowed_fields_names for n in ast.walk(method)):
+        raise ExtractionError('Unsupported options fields access or mutation')
+    if len({row[0] for row in rows}) != len(rows):
+        raise ExtractionError('Duplicate options fields')
+    return rows
 
 
 def extract_options(tree, constants, labels):
@@ -80,7 +125,7 @@ def extract_options(tree, constants, labels):
     if len(schemas) != 1:
         raise ExtractionError('Options schema missing')
     rows = []
-    for name, required, key, validator in schema_fields(schemas[0], constants):
+    for name, required, key, validator, mode in option_fields(methods[0], schemas[0], constants):
         if name not in labels:
             raise ExtractionError('Missing option label: ' + name)
         defaults = [k.value for k in key.keywords if k.arg == 'default']
@@ -103,7 +148,7 @@ def extract_options(tree, constants, labels):
                 raise ExtractionError('Unsupported option validator: ' + name)
         else:
             raise ExtractionError('Unsupported option validator: ' + name)
-        rows.append(('`' + name + '`', labels[name], '`' + json.dumps(default) + '`', kind))
+        rows.append(('`' + name + '`', labels[name], '`' + json.dumps(default) + '`', kind, mode))
     if {r[0].strip('`') for r in rows} != set(labels):
         raise ExtractionError('Options labels and form fields differ')
     return rows
@@ -166,7 +211,7 @@ def generate(root):
         'services.md': page('Service fields', ['services.yaml', 'api.py'],
                             'These are Home Assistant service fields. For HTTP requests, see the [REST API](../rest-api.md). Handler return dictionaries do not by themselves guarantee Home Assistant service response support. Use switch entity IDs in relay-state mappings; review the REST guide for the existing create/update behavior and defaults.\n\n' + extract_services(api, constants, services)),
         'options.md': page('Option defaults', ['config_flow.py', 'const.py', 'translations/en.json'],
-                           'Defaults below apply when no saved value exists. Host and authentication settings belong in **Reconfigure**, not runtime options. See [Options](../../usage/options.md) for guidance.\n\n' + table(['Key', 'UI label', 'Default', 'Type / choices'], options)),
+                           'Defaults below apply when no saved value exists. Mode-specific fields are hidden in the other mode; saved values are retained. Host and authentication settings belong in **Reconfigure**, not runtime options. See [Options](../../usage/options.md) for guidance.\n\n' + table(['Key', 'UI label', 'Default', 'Type / choices', 'Mode'], options)),
         'setup.md': page('Setup labels', ['config_flow.py', 'translations/en.json'], '\n'.join(setup)),
         'errors.md': page('Error messages', ['translations/en.json'], '\n'.join(errors)),
     }
