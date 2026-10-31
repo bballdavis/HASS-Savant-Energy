@@ -31,6 +31,7 @@
   --ifm-font-color-base: #e6eee9;
   --ifm-footer-background-color: #1c2621;
   --ifm-navbar-background-color: #151c19;
+  --search-local-hit-active-color: var(--ifm-background-color);
 }
 ::selection { background: #b9e3d2; color: #153a2d; }
 :focus-visible { outline: 3px solid var(--ifm-color-primary); outline-offset: 4px; }
