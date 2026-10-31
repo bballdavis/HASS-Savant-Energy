@@ -7,7 +7,7 @@ from unittest import mock
 
 
 def _install_homeassistant_stubs() -> None:
-    if "voluptuous" not in sys.modules:
+    if "voluptuous" not in sys.modules or not hasattr(sys.modules["voluptuous"], "In"):
         voluptuous = types.ModuleType("voluptuous")
 
         def _schema(value):
@@ -21,7 +21,9 @@ def _install_homeassistant_stubs() -> None:
 
         voluptuous.Schema = _schema
         voluptuous.Required = _required
+        voluptuous.Optional = _required
         voluptuous.In = _in
+        voluptuous.Coerce = lambda value: value
         sys.modules["voluptuous"] = voluptuous
 
     homeassistant = types.ModuleType("homeassistant")
@@ -147,6 +149,47 @@ class _FakeHass:
 
 
 class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_options_are_mode_specific_and_preserve_hidden_values(self):
+        module = _load_config_flow_module()
+        for mode in (module.MODE_CURRENT, module.MODE_LEGACY, module.MODE_AUTO):
+            with self.subTest(mode=mode):
+                flow = module.OptionsFlowHandler()
+                flow.config_entry = types.SimpleNamespace(
+                    data={module.CONF_MODE: mode},
+                    options={module.CONF_DMX_TESTING_MODE: True, "future_option": 7},
+                )
+                form = await flow.async_step_init()
+                fields = form["data_schema"]
+                self.assertEqual("reprovision_ssh_key" in fields, mode == module.MODE_CURRENT)
+                self.assertEqual(module.CONF_DMX_TESTING_MODE in fields, mode != module.MODE_CURRENT)
+                for key in (module.CONF_SCAN_INTERVAL, module.CONF_SWITCH_COOLDOWN,
+                            module.CONF_PENDING_CONFIRM_MULTIPLIER, "disable_scene_builder"):
+                    self.assertIn(key, fields)
+                result = await flow.async_step_init({
+                    module.CONF_SCAN_INTERVAL: 10,
+                    module.CONF_PENDING_CONFIRM_MULTIPLIER: 3,
+                })
+                self.assertTrue(result["data"][module.CONF_DMX_TESTING_MODE])
+                self.assertEqual(result["data"]["future_option"], 7)
+
+    async def test_reprovision_keeps_hidden_options_and_validates_wait(self):
+        module = _load_config_flow_module()
+        flow = module.OptionsFlowHandler()
+        flow.config_entry = types.SimpleNamespace(
+            data={module.CONF_MODE: module.MODE_CURRENT},
+            options={module.CONF_DMX_TESTING_MODE: True, "future_option": 7},
+        )
+        invalid = await flow.async_step_init({module.CONF_PENDING_CONFIRM_MULTIPLIER: 11})
+        self.assertEqual(invalid["errors"][module.CONF_PENDING_CONFIRM_MULTIPLIER], "out_of_range")
+        result = await flow.async_step_init({
+            module.CONF_PENDING_CONFIRM_MULTIPLIER: 4,
+            "reprovision_ssh_key": True,
+        })
+        self.assertEqual(result["step_id"], "reprovision_ssh")
+        self.assertEqual(flow._pending_options["future_option"], 7)
+        self.assertTrue(flow._pending_options[module.CONF_DMX_TESTING_MODE])
+        self.assertNotIn("reprovision_ssh_key", flow._pending_options)
+
     async def test_stale_current_token_step_redirects_to_ssh_without_retaining_submitted_token(self):
         module = _load_config_flow_module()
         flow = module.ConfigFlow()
