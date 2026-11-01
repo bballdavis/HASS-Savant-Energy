@@ -4,11 +4,11 @@ import Link from '@docusaurus/Link';
 import overview from '@site/../docs/assets/breaker-board-desktop.jpg';
 
 export default function Home(): React.JSX.Element {
-  return <Layout title="Your energy, in Home Assistant" description="Independent community integration for Savant energy systems. Installation, setup, energy monitoring, scenes, and Legacy guides.">
+  return <Layout title="Your system. Your data." description="Independent community integration for Savant energy systems. Installation, setup, energy monitoring, scenes, and Legacy guides.">
     <main>
       <section className="showcase container">
         <div className="showcase-copy">
-          <h1>Your circuits. Your energy.<br /><span>In Home Assistant.</span></h1>
+          <h1>Your system. Your data.<br /><span>In Home Assistant.</span></h1>
           <p>Bring your Savant energy system into the home you already manage. See supported circuit readings, monitor energy, and run relay scenes from Home Assistant.</p>
           <div className="showcase-actions">
             <Link className="button button--primary button--lg" to="/docs/get-started/installation">Install the integration</Link>
