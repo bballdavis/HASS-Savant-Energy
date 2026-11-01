@@ -7,7 +7,7 @@ const sidebars: SidebarsConfig = {
     {type: 'category', label: 'Legacy and migration', items: ['legacy/README', 'legacy/migration']},
     {type: 'category', label: 'Troubleshooting', items: ['troubleshooting/overview', 'troubleshooting-ssh', 'troubleshooting/telemetry', 'troubleshooting/scenes-card', 'troubleshooting/logs']},
     {type: 'category', label: 'Reference', items: ['reference/generated/services', 'reference/generated/options', 'reference/generated/setup', 'reference/generated/errors', 'reference/rest-api', 'current-api-workflow']},
-    {type: 'category', label: 'Development', items: ['development/contributing', 'development/documentation', 'development/companion-build', 'live-diagnostics', 'development/releases', 'release-notes-v2.0.0', 'release-notes-v2.0.1-beta7', 'release-notes-v2.0.1-beta8', 'release-notes-v2.0.1-beta9']},
+    {type: 'category', label: 'Development', items: ['development/contributing', 'development/documentation', 'development/companion-build', 'live-diagnostics', 'development/releases', 'release-notes-v2.2.0', 'release-notes-v2.0.0', 'release-notes-v2.0.1-beta7', 'release-notes-v2.0.1-beta8', 'release-notes-v2.0.1-beta9']},
   ],
 };
 export default sidebars;
