@@ -3,7 +3,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
   title: 'Savant Energy for Home Assistant',
-  tagline: 'Your circuits. Your energy. In Home Assistant.',
+  tagline: 'Your system. Your data. In Home Assistant.',
   favicon: 'img/favicon.svg',
   url: 'https://bballdavis.github.io',
   baseUrl: '/HASS-Savant-Energy/',
