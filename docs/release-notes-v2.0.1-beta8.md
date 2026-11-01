@@ -1,5 +1,7 @@
 # Savant Energy v2.0.1-beta8
 
+> Historical release notes. For current instructions, use the [installation guide](get-started/installation.md) and [setup guide](connect/current.md).
+
 ## Status
 
 These are prerelease notes. Beta8 has direct-host and automated-test evidence, but it is not considered live-verified until the tagged build is installed in Home Assistant and its entity values are compared with the host across multiple polls.

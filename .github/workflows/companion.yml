@@ -1,0 +1,53 @@
+name: Companion card
+
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate pinned companion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python3 tools/bundle_companion.py --check
+      - id: pin
+        run: |
+          python3 - <<'PY'
+          import json, os
+          pin = json.load(open('custom_components/savant_energy/www/bundle.json'))['commit']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('commit=' + pin + '\n')
+          PY
+      - uses: actions/checkout@v6
+        with:
+          repository: bballdavis/Savant-Card
+          ref: ${{ steps.pin.outputs.commit }}
+          path: _upstream/Savant-Card
+          persist-credentials: false
+      - run: npm ci
+        working-directory: _upstream/Savant-Card
+      - run: npm run check
+        working-directory: _upstream/Savant-Card
+      - name: Verify reproducible bundle and compatibility
+        run: |
+          python3 tools/bundle_companion.py --source _upstream/Savant-Card
+          git diff --exit-code -- custom_components/savant_energy/www custom_components/savant_energy/card_version.py
+          node tools/test_companion.mjs _upstream/Savant-Card
+      - name: Integration regression tests
+        run: |
+          python3 -m pip install 'aiohttp==3.13.2' 'paramiko==3.5.1'
+          python3 -m unittest discover -s tests

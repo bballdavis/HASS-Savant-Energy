@@ -1,3 +1,7 @@
+---
+title: Current architecture
+---
+
 # Savant Energy Current API Workflow (>=11.2)
 
 This document describes the implemented current-mode workflow for Savant firmware >=11.2. Current mode uses InfluxDB for telemetry and the SEM interfaces for relay identity and control. Legacy mode remains available for older firmware.
@@ -21,7 +25,7 @@ The integration uses these default endpoints:
 - InfluxDB API: `http://<host_ip>:8086`
 - SEM companion status API: `http://<pbc_ip>:8644/companion/status`
 - SEM relay command socket: `<pbc_ip>:2000` over TCP
-- PBC inventory websocket: the configured PBC host and its current-mode inventory service
+- PBC inventory websocket fallback: the Savant host on TCP 8480, with the discovered PBC device ID
 
 The port values remain internal defaults. The config flow asks for the PBC IP and, for current mode, the host IP. It does not ask users to enter ports.
 
@@ -48,12 +52,12 @@ During SSH token bootstrap, the integration:
 
 1. Generates an Ed25519 key pair.
 2. Connects to the Savant host as `RPM` with the supplied password.
-3. Adds the public key to the host's authorized keys file idempotently.
-4. Reads the InfluxDB token from the current Savant status file.
-5. Reads available organization, bucket, and stable load-identity metadata from the host.
-6. Stores the private key and token in the Home Assistant config entry.
+3. Reads candidate tokens, organization/bucket metadata, and stable load identity from the host.
+4. Validates a candidate against Savant data and resolves its organization and circuit inventory.
+5. Installs and verifies the public refresh key on the host.
+6. Stores the private key and validated token in the Home Assistant config entry.
 
-The password is used only for bootstrap and is not persisted. The stored private key can later refresh the token after a 401 response without asking for the password again.
+The password is used only for bootstrap and is not persisted. The config entry holds the token and private key; protect Home Assistant storage and backups rather than assuming encryption. The stored private key can later refresh the token after a 401 response without asking for the password again.
 
 The primary token path is:
 
@@ -184,7 +188,7 @@ SSH refresh is staged as password connection, home/path resolution, append-and-r
 - A 401 normally means the token expired or rotated. With SSH bootstrap enabled, the stored key should refresh it automatically.
 - An organization selection prompt means more than one candidate matched Savant's expected data shape. Choose the candidate with current circuit data.
 - A circuit inventory warning means InfluxDB found a circuit absent from the saved relay/CT map. It is reported once for that inventory change, rather than on every poll. Mapped hub-only circuit measurements count as live measurements, but remain unavailable for relay status or control until detailed state telemetry returns.
-- Use `tools/live-savant-influx-diagnostic.py` for direct-host discovery/shaping evidence and `tools/live-ha-mcp-diagnostic.ps1` for installed-version, entity timestamp, and Home Assistant log evidence. The full procedure and release acceptance boundary are in `docs/live-diagnostics.md`.
+- Use `tools/live-savant-influx-diagnostic.py` for direct-host discovery/shaping evidence and `tools/live-ha-mcp-diagnostic.ps1` for installed-version, entity timestamp, and Home Assistant log evidence. The full procedure and release acceptance boundary are in [live diagnostics](live-diagnostics.md).
 - An empty snapshot can be a timing issue on the Savant host. The integration widens its lookback window before reporting failure.
 - Legacy installations should use Reconfigure after upgrading Savant to firmware 11.2 or later.
 

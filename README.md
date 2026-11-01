@@ -1,289 +1,65 @@
-# Savant Energy Home Assistant Integration
+![Savant Energy for Home Assistant — independent community integration](docs/assets/wordmark.svg)
 
 [![Latest release](https://img.shields.io/github/v/release/bballdavis/HASS-Savant-Energy)](https://github.com/bballdavis/HASS-Savant-Energy/releases/latest)
 [![HACS validation](https://github.com/bballdavis/HASS-Savant-Energy/actions/workflows/hacs.yml/badge.svg)](https://github.com/bballdavis/HASS-Savant-Energy/actions/workflows/hacs.yml)
 [![Hassfest](https://github.com/bballdavis/HASS-Savant-Energy/actions/workflows/hassfest.yml/badge.svg)](https://github.com/bballdavis/HASS-Savant-Energy/actions/workflows/hassfest.yml)
+
+Bring your Savant energy system into Home Assistant: monitor supported circuits,
+track energy, control relays, and organize energy scenes from your own dashboard.
+
+**[Install the integration](docs/get-started/installation.md)** ·
+**[Read the guides](https://bballdavis.github.io/HASS-Savant-Energy/)** ·
+**[Get help](docs/troubleshooting/overview.md)**
+
+![The companion breaker-board card running in Home Assistant, with real circuit readings and history graphs.](docs/assets/breaker-board-desktop.jpg)
+
+*Real Home Assistant capture using the included [companion breaker-board card](docs/usage/companion-card.md). Available measurements depend on your hardware and firmware.*
+
+## What you can do
+
+- **Monitor circuits:** power, current, voltage, and cumulative energy where supplied by your system.
+- **Track energy:** use supported hardware kWh counters in Home Assistant’s Energy dashboard.
+- **See the wider picture:** CT-monitored loads and available grid, solar, battery, and load-group readings in Current mode.
+- **Control supported relays:** breaker switches, relay status, cooldown settings, and All Loads On.
+- **See your loads:** use the included [companion breaker-board card](docs/usage/companion-card.md) for circuit tiles, history graphs, and compact mobile views.
+- **Build energy scenes:** manage saved relay states in the included companion card’s editor.
+- **Automate:** use Home Assistant entities and scene-management services.
+
+## Choose your setup
+
+| Your system | Start here | Have ready |
+|---|---|---|
+| New installation / unsure of firmware | [Auto or Current setup](docs/connect/current.md) | PBC address; Host address and RPM password if Current mode is needed |
+| Firmware 11.2 or later | [Current setup](docs/connect/current.md) | PBC address, Savant Host address, RPM password for SSH bootstrap |
+| Older firmware with the original snapshot feed | [Legacy setup](docs/legacy/README.md) | PBC address |
+| Existing Legacy entry after a firmware upgrade | [Migration guide](docs/legacy/migration.md) | Existing entry, Host address, RPM password |
+
+## Install
+
 [![Open in Home Assistant](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=bballdavis&repository=HASS-Savant-Energy&category=integration)
 
-Welcome to the **Savant Energy** integration for Home Assistant! This project brings Savant relay and energy monitoring devices into your smart home, providing real-time power, voltage, relay control, and more, all with a beautiful, open-source touch.
+1. Open this repository in HACS using the badge, or add it as a custom **Integration** repository.
+2. Download **Savant Energy** and restart Home Assistant.
+3. Open **Settings → Devices & services → Add integration**, then search for **Savant Energy**.
+4. Follow [setup](docs/connect/current.md), then [verify your first readings](docs/connect/verify.md).
 
-For the current protocol migration and the 2.0.0 release details, see [the current API workflow](docs/current-api-workflow.md) and [the release notes](docs/release-notes-v2.0.0.md).
+See the [full installation guide](docs/get-started/installation.md) for prerequisites and manual installation.
 
-## Features
+## Explore the documentation
 
-- **Automatic device discovery** from your Savant system
-- **Power, current, and voltage sensors** for each circuit
-- **Per-load cumulative energy sensors** in `kWh` sourced directly from SEM hardware counters, ready for the Home Assistant Energy dashboard
-- **CT-monitored load sensors** for non-switched loads (EV chargers, solar, etc.)
-- **Relay (breaker) switch control** with configurable cooldown
-- **Relay binary sensors** for relay status
-- **All Loads On button** to quickly turn all loads on
-- **Hub-level system sensors** for total consumption, solar, battery, grid, and load group totals
-- **DMX address sensors** for legacy relay control (legacy mode only)
-- **Custom Lovelace card** for managing energy scenes
-- **REST API** for programmatic control and monitoring of scenes
-- **Scene buttons** for quick activation of predefined scenes
-- **Integrated Scene Builder** within the Lovelace card
-- **Mode-based setup** for Legacy (<11.2), Current (>=11.2), and Auto detection
+- [Requirements and hardware terminology](docs/get-started/requirements.md)
+- [Devices and entities](docs/usage/entities.md) · [Energy dashboard](docs/usage/energy-dashboard.md)
+- [Relay controls](docs/usage/controls.md) · [Scenes card](docs/usage/scenes.md) · [Options](docs/usage/options.md)
+- [Troubleshooting](docs/troubleshooting/overview.md) · [SSH setup](docs/troubleshooting-ssh.md)
+- [Service reference](docs/reference/generated/services.md) · [REST API](docs/reference/rest-api.md)
+- [Contributing](docs/development/contributing.md) · [Release history](docs/development/releases.md)
 
----
+## Support and independence
 
-## Installation
+This is an independent community project and is not affiliated with, endorsed by, or supported by Savant.
+The descriptive product names identify compatibility; the documentation uses its own typography and artwork.
 
-1. **Open the repository in Home Assistant** using the badge above. If prompted, add it as a custom integration repository.
+For bugs and feature requests, [open a GitHub issue](https://github.com/bballdavis/HASS-Savant-Energy/issues).
+Include versions, the exact error, and a [focused, sanitized log](docs/troubleshooting/logs.md).
 
-   Alternatively, in HACS or Marketplace, add `https://github.com/bballdavis/HASS-Savant-Energy` as a custom repository with category **Integration**. Once the repository is included in the default catalog, you can search for **Savant Energy** without adding it first.
-
-2. **Install the integration**
-   - Open **Savant Energy** in HACS or Marketplace and download it.
-
-3. **Restart Home Assistant**
-
-4. **Add the integration**
-   - Go to **Settings > Devices & Services > Add Integration**
-   - Search for **Savant Energy** and follow the setup prompts
-
-### Choosing your setup mode
-
-| Mode | When to use | What you need |
-|---|---|---|
-| **Auto** *(recommended)* | New installs - the integration figures out which version you have | PBC IP address |
-| **Legacy (<11.2)** | Older Savant firmware, snapshot + DMX workflow | PBC IP address |
-| **Current (>=11.2)** | Savant firmware 11.2 or later | PBC IP, Host IP, RPM SSH password (one-time bootstrap) |
-
-In **Auto** mode, the integration first tries the legacy feed. If it doesn't find one, it prompts for the Host IP and continues to SSH bootstrap (see the Current mode section below).
-
-If you're on **Legacy** mode and the integration can no longer reach its data source, it will create a Home Assistant notification pointing you to the **Reconfigure** flow.
-
----
-
-## Upgrading from Legacy to Current Mode
-
-If you've been running the integration in Legacy mode and you've upgraded your Savant firmware to 11.2 or later, here's the clean migration path:
-
-1. **Go to Settings > Devices & Services** and find your Savant Energy integration entry
-2. Click the **three-dot menu > Reconfigure**
-3. Change the mode to **Current** (or leave it on **Auto** and let it detect)
-4. Provide your **Host IP** (the Savant host running InfluxDB, often a different IP from the PBC)
-5. Enter the **RPM SSH password** so the integration can validate and manage the InfluxDB token
-
-**What happens to your existing entities?**
-
-The integration is designed to migrate cleanly. Device and entity history, automations, and energy dashboard data are all tied to the underlying entity unique IDs, and those are preserved across the mode switch:
-
-- Relay-controlled circuits are matched by name through the SEM companion API, which provides the original MAC-based hardware identifiers. Your existing entities are updated in place with no orphaned duplicates.
-- CT-monitored loads (EV chargers, solar inverters) that didn't exist in legacy mode will appear as new sensor entities.
-- Any truly stale entities (circuits that no longer exist in the hardware inventory) are automatically cleaned up on the first load.
-
-You should end up with the same devices you had before, plus a handful of new system-level and CT-monitored sensors. Nothing gets recreated from scratch.
-
----
-
-## What Changed in Current Mode (>=11.2)
-
-Why all of this? - Savant completely overhauled how the Panel Bridge Controller and the Smart Energy Monitor communicate starting in firmware 11.2. The old integration worked by connecting directly to a TCP feed on the PBC and scraping a snapshot of the relay states. It was a bit of a hack, but it worked.
-
-In 11.2, Savant moved to a proper time-series architecture. The energy data now flows directly into an **InfluxDB 2** instance running on the Savant host. This is actually a huge upgrade - instead of a snapshot, we get rich historical data, real hardware energy counters (not integrated estimates), and access to a whole bunch of channels that the old TCP feed never exposed, like solar production, battery state, grid availability, and load group totals.
-
-The relay control side got cleaned up too. Instead of routing commands through the DMX/OLA layer, we talk directly to the SEM over a simple TCP protocol on port 2000. It's more reliable and noticeably faster.
-
-**The one setup requirement: SSH access to the Savant host.**
-
-If Current-mode setup fails, use the [SSH troubleshooting guide](docs/troubleshooting-ssh.md) to capture focused Home Assistant logs and check the host connection.
-
-InfluxDB uses a token-based auth model, but normal setup retrieves the read token over SSH rather than asking you to copy it. During setup, enter the `RPM` user's password. The integration reads the token from the host, validates a candidate against real Savant circuit data, installs a refresh key, and then creates the entry. Your password is used only for that bootstrap operation and is never stored. The generated SSH private key and validated InfluxDB token are stored in Home Assistant's encrypted config storage.
-
-That SSH key is not just for first setup. If InfluxDB later rejects the token with an auth failure, the integration uses the stored key to fetch a fresh token automatically, so normal token rotation or host restarts do not require re-entering the SSH password.
-
-**To find or set your SSH password:**
-- Try the default: **`RPM`**
-- If that doesn't work, and you have access to the **Savant Application Manager**, open the **System Monitor** app, right-click your host, and choose **Set Password** to assign a new one
-
-If SSH setup needs diagnosis, the host may store its token at either `/data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken` or `/data/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken`. Do not copy or share token contents; the integration checks both locations safely. The adjacent `.influxsetup` and `.influxtoken` metadata files help it resolve the organization and bucket.
-
-Existing token-only entries remain supported at runtime. Reconfigure moves them to the SSH bootstrap flow without changing the saved token, authentication provenance, or key until validation and key installation both succeed.
-
----
-
-## How to Use
-
-Once installed and configured, the integration automatically creates entities for each circuit it discovers.
-
-### Entity Breakdown
-
-**Per-circuit (all circuits):**
-- **Power Sensor** (`sensor.<device>_power`) - real-time power in Watts
-- **Current Sensor** (`sensor.<device>_current`) - Amperes
-- **Voltage Sensor** (`sensor.<device>_voltage`) - Volts
-- **Energy Sensor** (`sensor.<device>_energy`) - cumulative kWh from the SEM hardware counter; add this to the Home Assistant Energy dashboard under individual devices
-
-**Relay-controlled circuits only:**
-- **Breaker Switch** (`switch.<device>_breaker`) - turn the relay on/off; includes a configurable cooldown (default: 15 s) to protect hardware
-- **Relay Status Binary Sensor** (`binary_sensor.<device>_relay_status`) - whether the relay is commanded on or off
-- **DMX Address Sensor** (`sensor.<device>_dmx_address`) - legacy mode only
-
-**Hub-level system sensors:**
-- Total Consumption, Grid Feed, Net Power
-- Solar Power, Solar Producing
-- Battery Power, State of Charge, Time Remaining, Operating Mode
-- Grid Available
-- Load group totals: HVAC, Lighting, Appliances, Room, Outlet, Garage, Refrigerator, Microwave, Network
-
-**Control buttons:**
-- **All Loads On** - turns every relay on in one shot
-- **Scene Buttons** - one button per saved scene
-- **DMX API Command Log / DMX API Statistics** - diagnostic buttons (legacy mode)
-
----
-
-## Savant Energy Scenes Card
-
-The integration ships a custom Lovelace card for building and running scenes.
-
-**To add it to a dashboard:**
-1. Edit any dashboard > Add Card > Manual (at the bottom)
-2. Enter:
-```yaml
-type: custom:savant-energy-scenes-card
-```
-
-**Card features:**
-- Create, edit, and delete scenes
-- Set per-relay on/off state for each scene
-- One-press scene execution
-
-**If the card doesn't load** ("Custom element doesn't exist"):
-1. Confirm the integration is set up and HA has restarted
-2. Check **Settings > Dashboards > Resources** for `/local/savant-energy-scenes-card.js`
-3. If missing, add it manually as type `module`
-4. Clear browser cache and reload
-
----
-
-## REST API
-
-The integration exposes a REST API for scene management.
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/savant_energy/scenes` | List all scenes |
-| `GET` | `/api/savant_energy/scene_breakers/{scene_id}` | Get relay states for a scene |
-| `POST` | `/api/savant_energy/scenes` | Create a new scene |
-| `POST` | `/api/savant_energy/scenes/{scene_id}` | Update a scene |
-| `DELETE` | `/api/savant_energy/scenes/{scene_id}` | Delete a scene |
-
-**Create a scene:**
-```json
-POST /api/savant_energy/scenes
-{ "name": "Evening Wind Down" }
-```
-
-**Update relay states:**
-```json
-POST /api/savant_energy/scenes/savant_evening_wind_down_scene
-{
-  "relay_states": {
-    "switch.living_room_breaker": true,
-    "switch.patio_light_breaker": false
-  }
-}
-```
-
-See `INTEGRATION_API.md` for full documentation.
-
----
-
-## Configuration Options
-
-| Option | Default | Description |
-|---|---|---|
-| Mode | Auto | Auto, Legacy, or Current |
-| PBC IP Address | (required) | IP of the Panel Bridge Controller |
-| Host IP Address | (required for Current) | IP of the Savant host running InfluxDB |
-| SSH Bootstrap | (required for Current) | One-time RPM password; retrieves and manages the validated InfluxDB read token |
-| Scan Interval | 5 s | How often to poll for new data |
-| Breaker Cooldown | 15 s | Minimum seconds between relay toggles |
-| Breaker Confirmation Wait | 2 intervals | Scan intervals to wait for the reported relay state to confirm a command (1–10) |
-| Disable Scene Support | Off | Disables scene storage and the scene API, including scene support in the companion card |
-| DMX Testing Mode | Off | Legacy mode only: log DMX commands without sending them |
-| Refresh SSH Key And Token | Off | Current mode only: use the RPM password to provision a new SSH key and refresh the Influx token |
-
-Runtime options are available under the integration's **Configure** action. Use **Reconfigure** to change hosts or modes. Saved mode-specific options are retained when switching modes.
-
----
-
-## InfluxDB Discovery Tool
-
-A standalone discovery tool is included for exploring InfluxDB data on your Savant host, useful for understanding available measurements and diagnosing setup.
-
-**Setup:**
-```bash
-pip install -r tools/requirements-dev.txt
-cp .savant-local.env.example .savant-local.env
-# Edit .savant-local.env with your host IP and credentials
-```
-
-**Full discovery run:**
-```bash
-python3 tools/savant_influx_probe.py discover \
-  --ssh-host 192.168.1.14 \
-  --ssh-user RPM \
-  --cache-token
-```
-
-This prompts for your SSH password, retrieves and caches the InfluxDB token, then generates a full discovery report in `savant_influx_discovery/YYYYMMDD-HHMMSS/` covering measurements, fields, tags, and sample data.
-
----
-
-## File Structure
-
-| File | Purpose |
-|---|---|
-| `__init__.py` | Integration setup and coordinator |
-| `influx_client.py` | InfluxDB queries and circuit data parsing |
-| `relay_control.py` | Direct SEM TCP relay controller |
-| `sensor.py`, `power_device_sensor.py` | Circuit and system sensors |
-| `switch.py` | Breaker switch entities |
-| `binary_sensor.py` | Relay status sensors |
-| `button.py` | Control and diagnostic buttons, scene buttons |
-| `dmx_address_sensor.py` | DMX address sensors (legacy) |
-| `scene.py` | Scene storage, management, and execution |
-| `api.py` | HA service handlers and REST views |
-| `utils.py` | Shared utility functions |
-| `models.py` | Device model helpers |
-| `const.py` | All constants and defaults |
-| `savant-energy-scenes-card.js` | Lovelace scene builder card |
-
----
-
-## Contributing
-
-### Savant host token locations and recovery
-
-Current SavantOS releases may store the Influx read token under either layout:
-
-```text
-/data/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken
-/data/home/RPM/GNUstep/Library/ApplicationSupport/RacePointMedia/statusfiles/InfluxDB2/.influxReadtoken
-```
-
-Adjacent `.influxsetup` and `.influxtoken` files contain useful organization and bucket metadata. When diagnosing over SSH, inspect only paths and file sizes, for example `find /data -path '*/InfluxDB2/.influxReadtoken' -print` and `wc -c <path>`; never print token contents. `influxd` is the InfluxDB daemon, not the `influx` command-line client, and it may not be installed. The integration validates candidate tokens with a real query before saving one and retries after token rotation.
-
-SSH refresh appends the integration key to `authorized_keys`, verifies key login and token access, and rolls back only its exact appended byte suffix on failure. If the file changed concurrently, it leaves that content untouched. A historical backfill is identity inventory only: live availability and controls use fresh measurements, and partial inventory never removes existing entities.
-
-We love contributions! Please:
-- Open issues for bugs or feature requests
-- Submit pull requests with clear descriptions
-- Follow the code style
-
-This project uses AI coding agents during development, but all code changes are reviewed and tested before release.
-
-## License
-
-This project is licensed under the GNU GPL v3. See `LICENSE` for details.
-
----
-
-**Enjoy your smarter, more open Savant system!**
-
-For help, visit the [GitHub repo](https://github.com/bballdavis/HASS-Savant-Energy) or open an issue.
+Licensed under [GNU GPL v3](LICENSE).

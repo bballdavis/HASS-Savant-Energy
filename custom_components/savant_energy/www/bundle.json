@@ -1,0 +1,17 @@
+{
+  "repository": "https://github.com/bballdavis/Savant-Card",
+  "commit": "c2030b1a42e466bc5cccf69735eea0ca89c82c9e",
+  "package_version": "0.1.0",
+  "upstream_artifact_sha256": "965697bc3e7b2f36b161d4ced33ad1baf3f5ce9a127ae8e7cbc9735587525142",
+  "files": {
+    "Savant-Card.js": "5debd8caabfe045215c15a7d190555554b49a6d653192c72a7c30a5679a7de5b",
+    "savant-energy-scenes-card.js": "50ffce411bc03d9930c02d58b111f8b50254e632ca416ec4259ddce5db343b1e",
+    "Savant-Card.LICENSE": "1126322e2cc8d165adc4c792eeb195717de2bcc7b39be1ce77959d78e87ef685"
+  },
+  "adaptations": [
+    "Guard repeated loading of the complete bundle",
+    "Correct picker documentation URL",
+    "Remove unshipped source-map pointer",
+    "Replace legacy implementation with a type alias"
+  ]
+}
