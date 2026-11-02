@@ -4,7 +4,13 @@ title: Savant Energy 2.3.0
 
 # Savant Energy 2.3.0
 
-This release addresses all four requests from the HACS default-store review, with fixes for frontend resource ownership, SSH setup responsiveness, and scene cleanup.
+This release adds channel-only telemetry support for hosts affected by issue #17 and addresses all four requests from the HACS default-store review.
+
+## Channel-only telemetry support
+
+- Accept recent, recognized system channels when a Savant host has no usable UUID-backed circuit inventory, allowing setup and available system readings on these hosts.
+- Keep this fallback read-only: preserve existing circuit mappings, avoid creating circuit identities from arbitrary channel names, and block relay, scene, and All Loads commands without current UUID-backed relay evidence.
+- Keep UUID-backed discovery as the preferred path and avoid circuit-map cleanup based on incomplete channel-only data.
 
 ## Fixes and cleanup
 
@@ -21,6 +27,8 @@ The integration automatically loads the included card from `/savant_energy/Savan
 
 Separate Savant-Card installations continue to take precedence to avoid duplicate card registration. Follow the [card migration steps](https://bballdavis.github.io/HASS-Savant-Energy/docs/usage/companion-card/#separate-savant-card-hacs-installation) if you want to switch to the included copy.
 
-**Using v2.1.1-beta1 for missing telemetry?** Stay on that beta for now. Its experimental channel-only telemetry fallback is not included in this release.
+**Using v2.1.1-beta1 for channel-only telemetry?** Its fallback is now included. You can update to this release while retaining your integration entry and existing circuit mappings. Channel-only telemetry remains read-only.
+
+If you already installed the initial v2.3.0 publication, use HACS to redownload v2.3.0 after it is replaced, then restart Home Assistant. The replacement keeps the same version number.
 
 [Documentation](https://bballdavis.github.io/HASS-Savant-Energy/) · [Full changelog](https://github.com/bballdavis/HASS-Savant-Energy/compare/v2.2.0...v2.3.0)

@@ -23,6 +23,10 @@ from .const import (
     DEFAULT_OLA_PORT,
     CONF_DMX_TESTING_MODE,
     CONF_MODE,
+    CONF_INFLUX_SCHEMA_MODE,
+    INFLUX_SCHEMA_CHANNEL_READ_ONLY,
+    INFLUX_SCHEMA_UUID,
+    MODE_CURRENT,
     MODE_LEGACY,
     CONF_PENDING_CONFIRM_MULTIPLIER,
     DEFAULT_PENDING_CONFIRM_MULTIPLIER,
@@ -73,6 +77,15 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
                     not _is_relay_device(device)
                     or "percentCommanded" not in device
                     or not device.get("legacy_uid", device.get("uid"))
+                    or (
+                        coordinator.mode == MODE_CURRENT
+                        and (
+                            config_entry.data.get(CONF_INFLUX_SCHEMA_MODE) == INFLUX_SCHEMA_CHANNEL_READ_ONLY
+                            or snapshot_data.get("telemetry_schema_mode", INFLUX_SCHEMA_UUID) != INFLUX_SCHEMA_UUID
+                            or device.get("has_relay") is not True
+                            or not device.get("relay_uid")
+                        )
+                    )
                 ):
                     _LOGGER.debug(
                         "Skipping switch without current relay prerequisites: %s",
@@ -172,6 +185,28 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
                 break
         return None
 
+    def _current_live_relay(self) -> dict | None:
+        """Require a current UUID-backed relay row before using an SEM UID."""
+        coordinator_data = self.coordinator.data or {}
+        if (coordinator_data.get("snapshot_status") or {}).get("ok") is False:
+            return None
+        snapshot = coordinator_data.get("snapshot_data") or {}
+        if self.coordinator.config_entry.data.get(CONF_INFLUX_SCHEMA_MODE) == INFLUX_SCHEMA_CHANNEL_READ_ONLY:
+            return None
+        if snapshot.get("telemetry_schema_mode", INFLUX_SCHEMA_UUID) != INFLUX_SCHEMA_UUID:
+            return None
+        for device in snapshot.get("presentDemands") or []:
+            if (
+                device.get("uid") == self._device.get("uid")
+                and device.get("role") == "relay"
+                and device.get("has_relay") is True
+                and device.get("relay_uid")
+                and "percentCommanded" in device
+                and device.get("relay_uid") == self._device.get("relay_uid")
+            ):
+                return device
+        return None
+
     async def _send_relay_command(self, target_value: str) -> bool:
         """
         Send a relay control command to the SEM controller.
@@ -187,6 +222,11 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             _dmx_address, result = await self._send_full_dmx_command(target_value)
             return bool(result and result.get("success"))
 
+        live_relay = self._current_live_relay()
+        if live_relay is None:
+            _LOGGER.warning("Relay command refused because current UUID-backed identity is unavailable")
+            return False
+
         relay_controller: SavantRelayController | None = self.coordinator.relay_controller
         if relay_controller is None:
             _LOGGER.error("Relay controller is not initialized for current mode")
@@ -194,7 +234,7 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         
         # Get the legacy relay UID from device data, or use the InfluxDB UID if not set
         # The device dict should have 'relay_uid' field populated by influx_client
-        relay_uid = self._device.get("relay_uid") or self._device.get("uid")
+        relay_uid = live_relay["relay_uid"]
         
         if not relay_uid:
             _LOGGER.error(f"No relay UID available for {self.name}")
@@ -253,6 +293,9 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
         snapshot_data = (self.coordinator.data or {}).get("snapshot_data") or {}
         if not snapshot_data or "presentDemands" not in snapshot_data:
             return False
+        if self.coordinator.config_entry.data.get(CONF_MODE, MODE_LEGACY) == MODE_CURRENT:
+            if self._current_live_relay() is None:
+                return False
         relay_state = self._get_relay_status_state()
         if relay_state is None:
             return False

@@ -9,6 +9,7 @@ import csv
 import json
 import io
 import logging
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -73,10 +74,41 @@ _HUB_CIRCUIT_CHANNEL_RE = re.compile(
 _HUB_FUZZY_MIN_SCORE = 0.90
 _HUB_FUZZY_MIN_MARGIN = 0.08
 
+# These are the exact channels exposed by sensor.py's system entities.  A
+# channel-only snapshot may publish these values, but arbitrary channel labels
+# must never validate fallback or become synthetic per-load entities.
+_KNOWN_SYSTEM_CHANNELS = {
+    "Energy.Total.Consumption.Power",
+    "Energy.Total.Feed.Power",
+    "Energy.Total.Net.Power",
+    "Energy.Battery.Power",
+    "Energy.Battery.StateOfCharge",
+    "Energy.Battery.SecondsRemaining",
+    "Energy.Battery.OperatingMode",
+    "Energy.Circuit.Solar.Power",
+    "Energy.Solar.isProducingEnergy",
+    "Energy.Grid.IsAvailable",
+    "Energy.Group.HVAC.Power",
+    "Energy.Group.Lighting.Power",
+    "Energy.Group.Appliances.Power",
+    "Energy.Group.Room.Power",
+    "Energy.Group.Outlet.Power",
+    "Energy.Group.Garage.Power",
+    "Energy.Group.Refrigerator.Power",
+    "Energy.Group.Microwave.Power",
+    "Energy.Group.Network.Power",
+}
+
 
 def _flux_string(value: str) -> str:
     """Encode a bucket as a Flux string literal."""
     return json.dumps(str(value or DEFAULT_INFLUX_BUCKET).strip() or DEFAULT_INFLUX_BUCKET)
+
+
+def _is_known_system_channel(channel: str) -> bool:
+    """Return whether a hub channel has a corresponding system entity."""
+    value = str(channel or "").strip()
+    return value in _KNOWN_SYSTEM_CHANNELS
 
 
 @dataclass(slots=True)
@@ -1304,6 +1336,7 @@ async def fetch_influx_snapshot(
     sample_seconds: float = 5.0,
     range_start: str = "-2m",
     influx_bucket: str = DEFAULT_INFLUX_BUCKET,
+    schema_mode: str = "uuid",
 ) -> InfluxFetchResult:
     """Fetch the latest circuit and system data from InfluxDB.
 
@@ -1356,6 +1389,12 @@ async def fetch_influx_snapshot(
         )
 
     pbc_device_id, by_circuit_key = _build_circuit_rows(circuit_text)
+    requested_channel_only = str(schema_mode or "uuid").strip().lower() == "channel_read_only"
+    if requested_channel_only:
+        # A channel-only host can still return stale/partial UUID rows. Never
+        # let those rows create entities or control identities in fallback
+        # mode; only existing persisted identities may be matched to hub data.
+        by_circuit_key = {}
 
     if scale_state is None:
         scale_state = {}
@@ -1366,15 +1405,21 @@ async def fetch_influx_snapshot(
     # coordinator lifetime once that capability has been established.
     system_capabilities = scale_state.setdefault("__system_capabilities__", {})
     system_data: dict[str, float] = {}
+    system_nonzero_evidence = False
     if ok_sys:
         for row in _parse_influx_csv(system_text):
             channel = row.get("channel", "").strip()
             if channel:
                 value = _safe_float(row.get("_value"))
+                if not math.isfinite(value):
+                    continue
+                if _is_known_system_channel(channel) and abs(value) > 0.0:
+                    system_nonzero_evidence = True
                 if abs(value) > 0.0:
                     system_capabilities[channel] = True
                 if system_capabilities.get(channel):
-                    system_data[channel] = value
+                    if not requested_channel_only or _is_known_system_channel(channel):
+                        system_data[channel] = value
     hub_circuit_rows = _build_hub_circuit_rows(system_text) if ok_sys else {}
 
     stored_metadata = circuit_metadata or {}
@@ -1543,7 +1588,15 @@ async def fetch_influx_snapshot(
         present_demands.append(_build_hub_present_demand(circuit_key, metadata, hub_row))
         seen_circuit_keys.add(circuit_key)
 
-    if not by_circuit_key and not hub_circuit_rows:
+    # System or hub-only telemetry cannot prove a complete circuit inventory.
+    # Keep any surviving measurements read-only when detailed UUID rows vanish.
+    system_has_known_data = any(_is_known_system_channel(channel) for channel in system_data)
+    system_only_fallback = (
+        not by_circuit_key
+        and (hub_circuit_rows or system_nonzero_evidence or system_has_known_data)
+    )
+    effective_schema_mode = "channel_read_only" if requested_channel_only or system_only_fallback else "uuid"
+    if not by_circuit_key and not hub_circuit_rows and not (system_nonzero_evidence or system_has_known_data):
         return InfluxFetchResult(
             success=False,
             error_type="empty_response",
@@ -1581,7 +1634,7 @@ async def fetch_influx_snapshot(
     )
 
     missing_circuit_keys = sorted(set(stored_metadata) - seen_circuit_keys)
-    if missing_circuit_keys:
+    if missing_circuit_keys and effective_schema_mode != "channel_read_only":
         _LOGGER.warning(
             "Stored Savant circuits were not present in the latest Influx snapshot: %s",
             ", ".join(missing_circuit_keys[:10]),
@@ -1592,19 +1645,35 @@ async def fetch_influx_snapshot(
         data={
             "presentDemands": present_demands,
             "system_data": system_data,
+            "telemetry_schema_mode": effective_schema_mode,
             "pbc_device_id": pbc_device_id,  # PBC SignalR target device ID
             "circuit_map_status": {
-                "reconfigure_required": bool(unknown_circuit_keys or missing_circuit_keys),
-                "inventory_status": "partial" if missing_circuit_keys else "complete",
-                "identity_inventory_status": "partial" if missing_circuit_keys else "complete",
-                "inventory_authority": "live_snapshot",
-                "inventory_authoritative": not bool(missing_circuit_keys),
+                "reconfigure_required": (
+                    False if effective_schema_mode == "channel_read_only"
+                    else bool(unknown_circuit_keys or missing_circuit_keys)
+                ),
+                "inventory_status": (
+                    "partial" if effective_schema_mode == "channel_read_only" or missing_circuit_keys
+                    else "complete"
+                ),
+                "identity_inventory_status": (
+                    "partial" if effective_schema_mode == "channel_read_only" or missing_circuit_keys
+                    else "complete"
+                ),
+                "inventory_authority": (
+                    "read_only_system_snapshot" if effective_schema_mode == "channel_read_only"
+                    else "live_snapshot"
+                ),
+                "inventory_authoritative": (
+                    False if effective_schema_mode == "channel_read_only"
+                    else not bool(missing_circuit_keys)
+                ),
                 "unknown_circuit_keys": sorted(unknown_circuit_keys),
                 "unknown_circuits": sorted(
                     unknown_circuits,
                     key=lambda circuit: circuit["circuit_key"],
                 ),
-                "missing_circuit_keys": missing_circuit_keys,
+                "missing_circuit_keys": [] if effective_schema_mode == "channel_read_only" else missing_circuit_keys,
             },
         },
         query_window=range_start,
@@ -1622,6 +1691,7 @@ async def fetch_influx_snapshot_with_backfill(
     sample_seconds: float = 5.0,
     backfill_windows: tuple[str, ...] = _BACKFILL_WINDOWS,
     influx_bucket: str = DEFAULT_INFLUX_BUCKET,
+    schema_mode: str = "uuid",
 ) -> InfluxFetchResult:
     """Fetch a snapshot, widening the lookback window before failing."""
     last_empty_result: InfluxFetchResult | None = None
@@ -1655,6 +1725,7 @@ async def fetch_influx_snapshot_with_backfill(
             sample_seconds=sample_seconds,
             range_start=range_start,
             influx_bucket=influx_bucket,
+            schema_mode=schema_mode,
         )
         if result.success and result.data is not None:
             status = result.data.get("circuit_map_status", {})
@@ -1663,6 +1734,18 @@ async def fetch_influx_snapshot_with_backfill(
                 # measurements. Wider windows may fill identity inventory,
                 # but must never replace presentDemands values.
                 first_live_result = result
+            if result.data.get("telemetry_schema_mode") == "channel_read_only":
+                status = result.data.setdefault("circuit_map_status", {})
+                status["inventory_status"] = "partial"
+                status["identity_inventory_status"] = "partial"
+                status["inventory_authoritative"] = False
+                status["inventory_authority"] = "read_only_system_snapshot"
+                status["reconfigure_required"] = False
+                status["missing_circuit_keys"] = []
+                # A channel-only system result is telemetry, not historical
+                # circuit inventory. Do not let a wider window turn it into a
+                # complete map or add synthetic per-load entities.
+                return result
             for item in result.data.get("presentDemands") or []:
                 if isinstance(item, dict):
                     key = str(item.get("circuit_key") or item.get("uid") or "")

@@ -27,6 +27,7 @@ from homeassistant.exceptions import HomeAssistantError  # type: ignore
 from .const import (
     DOMAIN, MANUFACTURER, DEFAULT_OLA_PORT, CONF_DMX_TESTING_MODE,
     CONF_MODE, MODE_CURRENT, MODE_LEGACY,
+    CONF_INFLUX_SCHEMA_MODE, INFLUX_SCHEMA_CHANNEL_READ_ONLY, INFLUX_SCHEMA_UUID,
 )
 from .utils import async_build_managed_dmx_values, async_set_dmx_values, slugify
 
@@ -558,18 +559,26 @@ class SavantSceneManager:
 
     async def _execute_scene_current(self, scene: dict, relay_states: dict) -> bool:
         """Execute a scene via the SEM relay controller (current mode >=11.2)."""
+        coordinator_data = self.coordinator.data or {}
+        snapshot = coordinator_data.get("snapshot_data") or {}
+        if (
+            (coordinator_data.get("snapshot_status") or {}).get("ok") is False
+            or self.coordinator.config_entry.data.get(CONF_INFLUX_SCHEMA_MODE) == INFLUX_SCHEMA_CHANNEL_READ_ONLY
+            or snapshot.get("telemetry_schema_mode", INFLUX_SCHEMA_UUID) != INFLUX_SCHEMA_UUID
+        ):
+            _LOGGER.warning("Scene command refused without current UUID-backed relay telemetry")
+            return False
         relay_controller = getattr(self.coordinator, "relay_controller", None)
         if not relay_controller:
             _LOGGER.error("Relay controller not available for current mode scene execution")
             return False
 
-        present_demands = (
-            ((self.coordinator.data or {}).get("snapshot_data") or {}).get("presentDemands", [])
-        )
+        present_demands = snapshot.get("presentDemands", [])
         uid_to_relay_uid = {
             d["uid"]: d["relay_uid"]
             for d in present_demands
-            if d.get("uid") and d.get("relay_uid")
+            if d.get("uid") and d.get("relay_uid") and d.get("role") == "relay"
+            and d.get("has_relay") is True and "percentCommanded" in d
         }
 
         bulk_states: dict[str, int] = {}

@@ -30,6 +30,9 @@ CONF_INFLUX_URL = "influx_url"    # InfluxDB base URL, e.g. http://192.168.1.14:
 CONF_INFLUX_TOKEN = "influx_token"  # InfluxDB read token
 CONF_INFLUX_ORG = "influx_org"    # InfluxDB org ID
 CONF_INFLUX_BUCKET = "influx_bucket"  # InfluxDB bucket name
+CONF_INFLUX_SCHEMA_MODE = "influx_schema_mode"  # Validated telemetry identity shape
+INFLUX_SCHEMA_UUID = "uuid"
+INFLUX_SCHEMA_CHANNEL_READ_ONLY = "channel_read_only"
 CONF_CIRCUIT_MAP = "circuit_map"  # Persisted circuit classification and relay mapping
 
 # Default values
