@@ -34,7 +34,7 @@ track energy, control relays, and organize energy scenes from your own dashboard
 | Older firmware with the original snapshot feed | [Legacy setup](docs/legacy/README.md) | PBC address |
 | Existing Legacy entry after a firmware upgrade | [Migration guide](docs/legacy/migration.md) | Existing entry, Host address, RPM password |
 
-Current-mode hosts that provide recognized system channels without circuit UUIDs can use [read-only telemetry](docs/connect/current.md#hosts-with-channel-only-telemetry).
+Current-mode hosts that provide recognized system channels without circuit UUIDs can use [read-only telemetry](docs/connect/current.md).
 
 ## Install
 
