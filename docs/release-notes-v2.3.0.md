@@ -10,6 +10,7 @@ This release adds channel-only telemetry support for hosts affected by issue #17
 
 - Accept recent, recognized system channels when a Savant host has no usable UUID-backed circuit inventory, allowing setup and available system readings on these hosts.
 - Keep this fallback read-only: preserve existing circuit mappings, avoid creating circuit identities from arbitrary channel names, and block relay, scene, and All Loads commands without current UUID-backed relay evidence.
+- Require the recent UUID telemetry window for relay commands; older backfill readings cannot authorize control.
 - Keep UUID-backed discovery as the preferred path and avoid circuit-map cleanup based on incomplete channel-only data.
 
 ## Fixes and cleanup

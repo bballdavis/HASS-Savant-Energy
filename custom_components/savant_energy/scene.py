@@ -565,6 +565,7 @@ class SavantSceneManager:
             (coordinator_data.get("snapshot_status") or {}).get("ok") is False
             or self.coordinator.config_entry.data.get(CONF_INFLUX_SCHEMA_MODE) == INFLUX_SCHEMA_CHANNEL_READ_ONLY
             or snapshot.get("telemetry_schema_mode", INFLUX_SCHEMA_UUID) != INFLUX_SCHEMA_UUID
+            or snapshot.get("relay_control_available") is not True
         ):
             _LOGGER.warning("Scene command refused without current UUID-backed relay telemetry")
             return False

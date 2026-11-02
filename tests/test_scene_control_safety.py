@@ -72,7 +72,7 @@ class SceneControlSafetyTests(unittest.TestCase):
         coordinator = types.SimpleNamespace(
             config_entry=types.SimpleNamespace(data={}),
             relay_controller=types.SimpleNamespace(set_relay_states_bulk=send_bulk),
-            data={"snapshot_data": {"telemetry_schema_mode": "channel_read_only", "presentDemands": [relay]}},
+            data={"snapshot_data": {"telemetry_schema_mode": "channel_read_only", "relay_control_available": True, "presentDemands": [relay]}},
         )
         manager = scene_module.SavantSceneManager(hass, coordinator, types.SimpleNamespace())
         scene = {"name": "Test scene"}
@@ -91,6 +91,10 @@ class SceneControlSafetyTests(unittest.TestCase):
         coordinator.data["snapshot_status"] = {"ok": False, "used_cached_snapshot": True}
         self.assertFalse(asyncio.run(manager._execute_scene_current(scene, members)))
         coordinator.data["snapshot_status"] = {"ok": True}
+        coordinator.data["snapshot_data"]["relay_control_available"] = False
+        self.assertFalse(asyncio.run(manager._execute_scene_current(scene, members)))
+        self.assertEqual(calls, [])
+        coordinator.data["snapshot_data"]["relay_control_available"] = True
         self.assertTrue(asyncio.run(manager._execute_scene_current(scene, members)))
         self.assertEqual(calls, [{"SEM.1": 100}])
 

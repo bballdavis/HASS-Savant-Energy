@@ -90,17 +90,18 @@ class InfluxClientBackfillTests(unittest.IsolatedAsyncioTestCase):
         influx_client = _load_influx_client_module()
         partial = influx_client.InfluxFetchResult(
             success=True,
-            data={"presentDemands": [{"uid": "live::1", "power": 1}], "circuit_map_status": {"missing_circuit_keys": ["lost::2"], "inventory_status": "partial", "inventory_authoritative": False}},
+            data={"presentDemands": [{"uid": "live::1", "power": 1}], "relay_control_available": True, "circuit_map_status": {"missing_circuit_keys": ["lost::2"], "inventory_status": "partial", "inventory_authoritative": False}},
             query_window="-2m",
         )
         historical = influx_client.InfluxFetchResult(
             success=True,
-            data={"presentDemands": [{"uid": "live::1", "power": 999}, {"uid": "lost::2", "power": 888}], "circuit_map_status": {"missing_circuit_keys": [], "inventory_status": "complete", "inventory_authoritative": True}},
+            data={"presentDemands": [{"uid": "live::1", "power": 999}, {"uid": "lost::2", "power": 888}], "relay_control_available": False, "circuit_map_status": {"missing_circuit_keys": [], "inventory_status": "complete", "inventory_authoritative": True}},
             query_window="-15m",
         )
         with mock.patch.object(influx_client, "fetch_influx_snapshot", new=mock.AsyncMock(side_effect=[partial, historical])):
             result = await influx_client.fetch_influx_snapshot_with_backfill("url", "token", "org", backfill_windows=("-2m", "-15m"))
         self.assertEqual(result.data["presentDemands"], partial.data["presentDemands"])
+        self.assertTrue(result.data["relay_control_available"])
         self.assertEqual(result.data["circuit_map_status"]["inventory_status"], "partial")
         self.assertEqual(result.data["circuit_map_status"]["identity_inventory_status"], "complete")
         self.assertFalse(result.data["circuit_map_status"]["inventory_authoritative"])
@@ -197,6 +198,7 @@ class InfluxClientBackfillTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.query_window, "-15m")
         self.assertEqual(len(result.data["presentDemands"]), 1)
+        self.assertFalse(result.data["relay_control_available"])
 
     async def test_fetch_influx_snapshot_reports_auth_failure_with_window(self):
         influx_client = _load_influx_client_module()

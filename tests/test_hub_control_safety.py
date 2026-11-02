@@ -174,11 +174,15 @@ class HubControlSafetyTests(unittest.TestCase):
             config_entry=types.SimpleNamespace(data={switch.CONF_MODE: switch.MODE_CURRENT}),
             relay_controller=types.SimpleNamespace(set_relay_state=send),
             data={"snapshot_status": {"ok": True}, "snapshot_data": {
-                "telemetry_schema_mode": "channel_read_only", "presentDemands": [relay]}},
+                "telemetry_schema_mode": "channel_read_only", "relay_control_available": True, "presentDemands": [relay]}},
         )
         self.assertFalse(asyncio.run(entity._send_relay_command("255")))
         send.assert_not_awaited()
         entity.coordinator.data["snapshot_data"]["telemetry_schema_mode"] = "uuid"
+        entity.coordinator.data["snapshot_data"]["relay_control_available"] = False
+        self.assertFalse(asyncio.run(entity._send_relay_command("255")))
+        send.assert_not_awaited()
+        entity.coordinator.data["snapshot_data"]["relay_control_available"] = True
         self.assertTrue(asyncio.run(entity._send_relay_command("255")))
         send.assert_awaited_once_with("SEM.1", 100)
 

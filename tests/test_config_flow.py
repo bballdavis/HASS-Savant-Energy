@@ -189,6 +189,7 @@ class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(flow._pending_options["future_option"], 7)
         self.assertTrue(flow._pending_options[module.CONF_DMX_TESTING_MODE])
         self.assertNotIn("reprovision_ssh_key", flow._pending_options)
+
     async def test_channel_only_setup_accepts_system_data_without_creating_circuit_identities(self):
         module = _load_config_flow_module()
         entry = types.SimpleNamespace(entry_id="entry", data={})

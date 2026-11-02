@@ -195,6 +195,8 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             return None
         if snapshot.get("telemetry_schema_mode", INFLUX_SCHEMA_UUID) != INFLUX_SCHEMA_UUID:
             return None
+        if snapshot.get("relay_control_available") is not True:
+            return None
         for device in snapshot.get("presentDemands") or []:
             if (
                 device.get("uid") == self._device.get("uid")
@@ -232,8 +234,7 @@ class EnergyDeviceSwitch(CoordinatorEntity, SwitchEntity):
             _LOGGER.error("Relay controller is not initialized for current mode")
             return False
         
-        # Get the legacy relay UID from device data, or use the InfluxDB UID if not set
-        # The device dict should have 'relay_uid' field populated by influx_client
+        # Use only the SEM relay UID verified by the current live snapshot.
         relay_uid = live_relay["relay_uid"]
         
         if not relay_uid:

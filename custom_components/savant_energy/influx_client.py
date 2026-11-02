@@ -1646,6 +1646,10 @@ async def fetch_influx_snapshot(
             "presentDemands": present_demands,
             "system_data": system_data,
             "telemetry_schema_mode": effective_schema_mode,
+            # Wider queries may recover readings/identity, never live control authority.
+            "relay_control_available": (
+                effective_schema_mode == "uuid" and range_start == _BACKFILL_WINDOWS[0]
+            ),
             "pbc_device_id": pbc_device_id,  # PBC SignalR target device ID
             "circuit_map_status": {
                 "reconfigure_required": (

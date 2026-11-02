@@ -185,6 +185,7 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
         assert snapshot.data is not None
         self.assertEqual(snapshot.data["telemetry_schema_mode"], "channel_read_only")
         self.assertEqual(snapshot.data["presentDemands"], [])
+        self.assertFalse(snapshot.data["relay_control_available"])
         self.assertEqual(snapshot.data["system_data"]["Energy.Total.Consumption.Power"], 321.5)
         self.assertNotIn("Energy.Circuit.Unknown Load.Power", snapshot.data["system_data"])
         status = snapshot.data["circuit_map_status"]
@@ -269,6 +270,7 @@ class InfluxCircuitMappingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(snapshot.data["presentDemands"]), 1)
         self.assertNotIn("measurement_source", snapshot.data["presentDemands"][0])
         self.assertEqual(snapshot.data["presentDemands"][0]["power"], 123.4)
+        self.assertTrue(snapshot.data["relay_control_available"])
 
     async def test_uuid_mode_downgrades_hub_only_snapshot_to_read_only_fallback(self):
         module = _load_influx_client_module()
