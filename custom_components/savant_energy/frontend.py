@@ -12,7 +12,7 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 _DATA_KEY = f"{DOMAIN}_frontend"
-_RESOURCE_BASE = f"/local/{DOMAIN}"
+_RESOURCE_BASE = f"/{DOMAIN}"
 _EXTERNAL_CARD_PATHS = {
     "/hacsfiles/Savant-Card/Savant-Card.js",
     "/local/community/Savant-Card/Savant-Card.js",

@@ -26,7 +26,7 @@ The screenshots below show the actual card running in Home Assistant. Readings v
 
 **Expected result:** the card discovers related entities and displays available readings. Missing registry relationships may require [manual mappings](https://github.com/bballdavis/Savant-Card/blob/main/docs/CONFIGURATION.md). For a missing card, see [frontend troubleshooting](../troubleshooting/scenes-card.md).
 
-The integration loads `/local/savant_energy/Savant-Card.js` with a version query for browser caching. Do not add another copy to Dashboard resources. A Home Assistant **panel view** gives the board the available width; sections and masonry layouts also work.
+The integration loads `/savant_energy/Savant-Card.js` with a version query for browser caching. Do not add another copy to Dashboard resources. A Home Assistant **panel view** gives the board the available width; sections and masonry layouts also work.
 
 ## Upgrade from an existing card
 

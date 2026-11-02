@@ -5,7 +5,6 @@ All utility functions are now documented for clarity and open source maintainabi
 
 import logging
 import asyncio
-import subprocess
 import json
 from datetime import datetime, timedelta
 import aiohttp
@@ -762,24 +761,6 @@ async def async_get_dmx_status(ip_address: str, channel: int, ola_port: int = DE
         _api_failure_count += 1
     
     return None
-
-
-async def _execute_curl_command(cmd: str) -> tuple[int, str, str]:
-    """
-    Execute the given curl command asynchronously.
-    Args:
-        cmd: Curl command string
-    Returns:
-        Tuple containing (returncode, stdout, stderr)
-    """
-    process = await asyncio.create_subprocess_shell(
-        cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await process.communicate()
-    returncode = process.returncode if process.returncode is not None else -1
-    return returncode, stdout.decode(), stderr.decode()
 
 
 def _normalize_dmx_value(value: Any, default: str = "255") -> str:

@@ -464,6 +464,38 @@ class SshHelperTests(unittest.TestCase):
         self.assertEqual(password.sftp.storage[path], original)
         self.assertEqual(password.sftp.rename_calls, 0)
 
+    def test_all_bootstrap_key_generation_runs_off_event_loop(self):
+        import threading
+        module = _load_ssh_helper_module()
+        for name, expected in (
+            ("async_ssh_bootstrap", ("private", "token", None, None)),
+            ("async_ssh_prepare_bootstrap", ("private", "public", "token", None, None)),
+            ("async_ssh_prepare_bootstrap_candidates", ("private", "public", [], None)),
+        ):
+            with self.subTest(name=name):
+                loop_thread = threading.get_ident()
+                def generate():
+                    self.assertNotEqual(threading.get_ident(), loop_thread)
+                    return "private", "public"
+                hass = SimpleNamespace(async_add_executor_job=asyncio.to_thread)
+                with mock.patch.object(module, "generate_ed25519_keypair", side_effect=generate), mock.patch.object(
+                    module, "_ssh_bootstrap_worker", return_value=module.SSHBootstrapResult(token="token")
+                ), mock.patch.object(module, "_ssh_fetch_influx_bundle_with_key_worker", return_value=("token", None)), mock.patch.object(
+                    module, "_ssh_read_influx_bundle_with_password_worker", return_value=("token", None, None)
+                ), mock.patch.object(module, "_ssh_read_influx_bundle_candidates_with_password_worker", return_value=([], None)):
+                    self.assertEqual(asyncio.run(getattr(module, name)(hass, "host", "user", "pass")), expected)
+
+    def test_all_bootstrap_keygen_failures_keep_error_contract(self):
+        module = _load_ssh_helper_module()
+        for name, expected in (
+            ("async_ssh_bootstrap", (None, None, None, "keygen_failed")),
+            ("async_ssh_prepare_bootstrap", (None, None, None, None, "keygen_failed")),
+            ("async_ssh_prepare_bootstrap_candidates", (None, None, [], "keygen_failed")),
+        ):
+            with self.subTest(name=name), mock.patch.object(module, "generate_ed25519_keypair", side_effect=RuntimeError("keygen")):
+                hass = SimpleNamespace(async_add_executor_job=asyncio.to_thread)
+                self.assertEqual(asyncio.run(getattr(module, name)(hass, "host", "user", "pass")), expected)
+
     def test_async_bootstrap_rejects_unusable_installed_key(self):
         module = _load_ssh_helper_module()
 

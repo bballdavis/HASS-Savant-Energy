@@ -738,7 +738,9 @@ async def async_ssh_bootstrap(
 ) -> tuple[str | None, str | None, InfluxHostMetadata | None, str | None]:
     """Generate a key pair, install the public key, and fetch the influx token."""
     try:
-        private_pem, public_openssh = generate_ed25519_keypair()
+        private_pem, public_openssh = await hass.async_add_executor_job(
+            generate_ed25519_keypair
+        )
     except Exception as exc:
         _LOGGER.error("Failed to generate Ed25519 key pair: %s", exc)
         return None, None, None, "keygen_failed"
@@ -762,7 +764,9 @@ async def async_ssh_prepare_bootstrap(
 ) -> tuple[str | None, str | None, str | None, InfluxHostMetadata | None, str | None]:
     """Generate key material and read the token without mutating the Savant host."""
     try:
-        private_pem, public_openssh = generate_ed25519_keypair()
+        private_pem, public_openssh = await hass.async_add_executor_job(
+            generate_ed25519_keypair
+        )
     except Exception as exc:
         _LOGGER.error("Failed to generate Ed25519 key pair: %s", exc)
         return None, None, None, None, "keygen_failed"
@@ -782,7 +786,9 @@ async def async_ssh_prepare_bootstrap_candidates(
 ) -> tuple[str | None, str | None, list[InfluxTokenCandidate], str | None]:
     """Prepare a key and enumerate, but do not select or persist, SSH tokens."""
     try:
-        private_pem, public_openssh = generate_ed25519_keypair()
+        private_pem, public_openssh = await hass.async_add_executor_job(
+            generate_ed25519_keypair
+        )
     except Exception:
         return None, None, [], "keygen_failed"
     candidates, error_key = await hass.async_add_executor_job(

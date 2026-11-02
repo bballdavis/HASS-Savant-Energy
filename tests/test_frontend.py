@@ -43,10 +43,12 @@ class FrontendTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(sys.modules, stubs):
             await module.async_register_frontend_resource(hass)
         urls = [c.args[1] for c in frontend.add_extra_js_url.call_args_list]
-        self.assertEqual(urls, [f'/local/savant_energy/Savant-Card.js?v={module.CARD_VERSION}',
-                               f'/local/savant_energy/savant-energy-scenes-card.js?v={module.CARD_VERSION}'])
+        self.assertEqual(urls, [f'/savant_energy/Savant-Card.js?v={module.CARD_VERSION}',
+                               f'/savant_energy/savant-energy-scenes-card.js?v={module.CARD_VERSION}'])
         paths = hass.http.async_register_static_paths.call_args.args[0]
+        self.assertEqual(paths[0][0], '/savant_energy')
         self.assertEqual(paths[0][1], str(ROOT / 'www'))
+        self.assertTrue(all(not url.startswith('/local/') for url in urls))
 
     async def test_external_hacs_resource_retains_ownership(self):
         module, frontend, stubs = load_frontend()

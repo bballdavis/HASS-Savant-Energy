@@ -11,7 +11,7 @@ from homeassistant.helpers.entity_registry import async_get as async_get_entity_
 from homeassistant.components.button import ButtonEntity, ButtonDeviceClass  # type: ignore
 from homeassistant.config_entries import ConfigEntry  # type: ignore
 from homeassistant.const import EntityCategory  # type: ignore
-from homeassistant.core import HomeAssistant  # type: ignore
+from homeassistant.core import HomeAssistant, callback  # type: ignore
 from homeassistant.helpers.entity import DeviceInfo  # type: ignore
 from homeassistant.helpers.entity_platform import AddEntitiesCallback  # type: ignore
 from homeassistant.helpers.event import async_track_time_interval  # type: ignore
@@ -90,6 +90,7 @@ async def async_setup_entry(
     hass.data.setdefault(f"{DOMAIN}_scene_button_managers", {})[entry.entry_id] = (
         button_manager
     )
+    entry.async_on_unload(button_manager.async_unload)
     await button_manager.async_setup()
 
     async_add_entities(
@@ -114,11 +115,14 @@ class SavantSceneButtonManager:
         self.async_add_entities = async_add_entities
         self.buttons = {}  # scene_id -> SavantSceneButton
         self._unsub_refresh = None
+        self._unloaded = False
         self._last_scene_ids = set()
 
     async def async_setup(self):
         # On initial setup, ensure all scenes have a button entity
         await self._refresh_buttons()
+        if self._unloaded:
+            return
         self._unsub_refresh = async_track_time_interval(
             self.hass, self._periodic_refresh, timedelta(seconds=10)
         )
@@ -127,7 +131,12 @@ class SavantSceneButtonManager:
         await self._refresh_buttons()
 
     async def _refresh_buttons(self):
+        if self._unloaded:
+            return
         await self.scene_manager.storage.async_load()  # Ensure latest scenes are loaded
+        # A storage read may finish after the config entry has been unloaded.
+        if self._unloaded:
+            return
         current_scene_data = self.scene_manager.storage.scenes
         current_scene_ids = set(current_scene_data.keys())
 
@@ -168,17 +177,19 @@ class SavantSceneButtonManager:
 
         self._last_scene_ids = current_scene_ids
 
-    async def async_unload(self):
+    @callback
+    def async_unload(self):
+        """Stop refreshes; the button platform owns entity removal on unload."""
+        self._unloaded = True
         if self._unsub_refresh:
             self._unsub_refresh()
             self._unsub_refresh = None
-
-        for button in self.buttons.values():
-            await (
-                button.async_remove()
-            )  # Ensure all managed buttons are removed on unload
         self.buttons.clear()
-        _LOGGER.info("All scene buttons have been marked for removal during unload.")
+        self._last_scene_ids.clear()
+        managers = self.hass.data.get(f"{DOMAIN}_scene_button_managers", {})
+        for entry_id, manager in list(managers.items()):
+            if manager is self:
+                managers.pop(entry_id)
 
 
 class SavantAllLoadsButton(ButtonEntity):
