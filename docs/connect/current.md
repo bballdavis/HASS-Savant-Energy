@@ -59,3 +59,11 @@ Open the integration’s devices and follow [Verify the first readings](verify.m
 | Missing or uncertain circuits | Read the mapping warning and [telemetry troubleshooting](../troubleshooting/telemetry.md) |
 
 For the full text of source-defined errors, see [error messages](../reference/generated/errors.md). Capture a [focused log](../troubleshooting/logs.md) if the recovery steps do not resolve the problem.
+
+## Hosts with channel-only telemetry
+
+Current mode prefers circuit records with Savant UUIDs. If those records are unavailable, setup checks recent, recognized system channels instead. A valid channel-only host can provide available consumption, solar, battery, grid, and load-group readings in **read-only** mode.
+
+This fallback preserves existing circuit mappings and can show measurements matched to those loads, but it does not create new per-load identities or allow relay, scene, or All Loads commands. Unknown channel labels are not treated as circuit identities. Missing UUID rows do not trigger circuit-map cleanup or a request to rebuild the map.
+
+Home Assistant shows a read-only telemetry notification after setup. Reconfigure the integration after a verified UUID-backed data source becomes available to restore supported relay controls.

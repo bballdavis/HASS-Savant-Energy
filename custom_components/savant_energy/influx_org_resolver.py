@@ -5,12 +5,17 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import aiohttp
 
-from .const import DEFAULT_INFLUX_BUCKET
+from .const import (
+    DEFAULT_INFLUX_BUCKET,
+    INFLUX_SCHEMA_CHANNEL_READ_ONLY,
+    INFLUX_SCHEMA_UUID,
+)
 
 from .ssh_helper import InfluxHostMetadata
 
@@ -20,10 +25,50 @@ _EXPECTED_FIELDS = ("power", "current", "voltage", "energy")
 _PLAUSIBLE_FIELDS = ("power", "energy")
 _PROBE_WINDOWS = ("-15m", "-24h", "-7d")
 _BUCKET_SCAN_PREFIXES = ("localHub",)
+_CHANNEL_READ_ONLY = INFLUX_SCHEMA_CHANNEL_READ_ONLY
+_KNOWN_SYSTEM_CHANNELS = frozenset(
+    {
+        "Energy.Total.Consumption.Power",
+        "Energy.Total.Feed.Power",
+        "Energy.Total.Net.Power",
+        "Energy.Battery.Power",
+        "Energy.Battery.StateOfCharge",
+        "Energy.Battery.SecondsRemaining",
+        "Energy.Battery.OperatingMode",
+        "Energy.Circuit.Solar.Power",
+        "Energy.Solar.isProducingEnergy",
+        "Energy.Grid.IsAvailable",
+        "Energy.Group.HVAC.Power",
+        "Energy.Group.Lighting.Power",
+        "Energy.Group.Appliances.Power",
+        "Energy.Group.Room.Power",
+        "Energy.Group.Outlet.Power",
+        "Energy.Group.Garage.Power",
+        "Energy.Group.Refrigerator.Power",
+        "Energy.Group.Microwave.Power",
+        "Energy.Group.Network.Power",
+    }
+)
+_CHANNEL_MAX_AGE_SECONDS = 20 * 60
 
 
-def _probe_query(range_start: str, bucket: str = DEFAULT_INFLUX_BUCKET) -> str:
+def _probe_query(
+    range_start: str,
+    bucket: str = DEFAULT_INFLUX_BUCKET,
+    *,
+    schema_mode: str = INFLUX_SCHEMA_UUID,
+) -> str:
     import json
+    if schema_mode == _CHANNEL_READ_ONLY:
+        known_channels = ", ".join(json.dumps(channel) for channel in sorted(_KNOWN_SYSTEM_CHANNELS))
+        return f"""\
+from(bucket: {json.dumps(bucket or DEFAULT_INFLUX_BUCKET)})
+  |> range(start: {range_start})
+  |> filter(fn: (r) => r.type == "0000")
+  |> filter(fn: (r) => contains(value: r.channel, set: [{known_channels}]))
+  |> filter(fn: (r) => r._field == "power" or r._field == "energy")
+  |> last()
+"""
     return f"""\
 from(bucket: {json.dumps(bucket or DEFAULT_INFLUX_BUCKET)})
   |> range(start: {range_start})
@@ -51,6 +96,8 @@ class InfluxOrgCandidate:
     query_window: str | None = None
     bucket_names: tuple[str, ...] = ()
     selected_bucket: str | None = None
+    schema_mode: str = INFLUX_SCHEMA_UUID
+    system_channel_count: int = 0
 
     @property
     def field_count(self) -> int:
@@ -68,6 +115,8 @@ class InfluxOrgDiscoveryResult:
     error_message: str | None = None
     auth_failure: bool = False
     source: str | None = None
+    schema_mode: str = INFLUX_SCHEMA_UUID
+    system_channel_count: int = 0
 
 
 def _parse_influx_csv(text: str) -> list[dict[str, str]]:
@@ -95,11 +144,20 @@ def _safe_float(value: str | None) -> float:
         return 0.0
 
 
+def _finite_float(value: str | None) -> float | None:
+    try:
+        parsed = float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed is not None and math.isfinite(parsed) else None
+
+
 def _parse_time(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
     except ValueError:
         return None
 
@@ -126,6 +184,7 @@ def _build_candidate(
     query_window: str | None = None,
     bucket_names: tuple[str, ...] = (),
     selected_bucket: str | None = None,
+    schema_mode: str = INFLUX_SCHEMA_UUID,
 ) -> InfluxOrgCandidate:
     uuids = {row.get("savantUUID", "").strip() for row in rows if row.get("savantUUID", "").strip()}
     fields = sorted({row.get("_field", "").strip() for row in rows if row.get("_field", "").strip()})
@@ -186,6 +245,82 @@ def _build_candidate(
         query_window=query_window,
         bucket_names=bucket_names,
         selected_bucket=selected_bucket or (bucket_names[0] if bucket_names else DEFAULT_INFLUX_BUCKET),
+        schema_mode=schema_mode,
+    )
+
+
+def _build_channel_candidate(
+    org_id: str,
+    org_name: str,
+    rows: list[dict[str, str]],
+    *,
+    source: str,
+    query_window: str,
+    bucket_names: tuple[str, ...],
+) -> InfluxOrgCandidate | None:
+    """Build a read-only candidate from known type-0000 system channels."""
+    valid_rows: list[dict[str, str]] = []
+    for row in rows:
+        channel = str(row.get("channel") or "").strip()
+        field = str(row.get("_field") or "").strip().lower()
+        timestamp = _parse_time(row.get("_time"))
+        value = _finite_float(row.get("_value"))
+        if (
+            channel in _KNOWN_SYSTEM_CHANNELS
+            and field in {"power", "energy"}
+            and timestamp is not None
+            and value is not None
+            and -60 <= (datetime.now(timezone.utc) - timestamp).total_seconds() <= _CHANNEL_MAX_AGE_SECONDS
+        ):
+            valid_rows.append(row)
+
+    primary_rows = [
+        row
+        for row in valid_rows
+        if row.get("channel", "").strip() == "Energy.Total.Consumption.Power"
+        and row.get("_field", "").strip().lower() == "power"
+    ]
+    other_channels = {
+        row.get("channel", "").strip()
+        for row in valid_rows
+        if row.get("channel", "").strip() != "Energy.Total.Consumption.Power"
+    }
+    if not primary_rows or not other_channels or not any(abs(_finite_float(row.get("_value")) or 0.0) > 0 for row in primary_rows):
+        return None
+
+    fields = tuple(sorted({row.get("_field", "").strip() for row in valid_rows if row.get("_field", "").strip()}))
+    last_seen_dt = max((_parse_time(row.get("_time")) for row in valid_rows), default=None)
+    last_seen = last_seen_dt.isoformat() if last_seen_dt else None
+    total_power_w = sum(abs(_safe_float(row.get("_value"))) for row in valid_rows if row.get("_field", "").strip().lower() == "power")
+    score = 180 + min(len(other_channels), 10) * 5 + (20 if "energy" in fields else 0)
+    summary = (
+        f"{org_name} [{source}] - channel-only system data - "
+        f"{len(other_channels) + 1} channels, {len(fields)} fields, {_format_age(last_seen)}"
+    )
+    _LOGGER.debug(
+        "Influx channel fallback candidate %s (%s): source=%s window=%s channels=%d fields=%s",
+        org_name,
+        org_id,
+        source,
+        query_window,
+        len(other_channels) + 1,
+        ",".join(fields) or "-",
+    )
+    return InfluxOrgCandidate(
+        org_id=org_id,
+        org_name=org_name,
+        circuit_count=0,
+        field_names=fields,
+        total_power_w=round(total_power_w, 1),
+        last_seen=last_seen,
+        score=score,
+        summary=summary,
+        source=source,
+        query_window=query_window,
+        bucket_names=bucket_names,
+        selected_bucket=bucket_names[0] if bucket_names else DEFAULT_INFLUX_BUCKET,
+        schema_mode=_CHANNEL_READ_ONLY,
+        system_channel_count=len(other_channels) + 1,
     )
 
 
@@ -197,10 +332,26 @@ def _is_plausible(candidate: InfluxOrgCandidate) -> bool:
     return candidate.last_seen is not None
 
 
+def _is_channel_plausible(candidate: InfluxOrgCandidate) -> bool:
+    return (
+        candidate.schema_mode == _CHANNEL_READ_ONLY
+        and candidate.system_channel_count >= 2
+        and candidate.last_seen is not None
+        and "power" in candidate.field_names
+    )
+
+
+def _is_candidate_plausible(candidate: InfluxOrgCandidate) -> bool:
+    return _is_plausible(candidate) or _is_channel_plausible(candidate)
+
+
 def _pick_clear_winner(candidates: list[InfluxOrgCandidate]) -> str | None:
+    usable_uuid = [candidate for candidate in candidates if _is_plausible(candidate)]
+    if usable_uuid:
+        candidates = usable_uuid
     best_by_org: dict[str, InfluxOrgCandidate] = {}
     for candidate in candidates:
-        if not _is_plausible(candidate):
+        if not (_is_plausible(candidate) or _is_channel_plausible(candidate)):
             continue
         current = best_by_org.get(candidate.org_id)
         if current is None or candidate.score > current.score:
@@ -215,6 +366,8 @@ def _pick_clear_winner(candidates: list[InfluxOrgCandidate]) -> str | None:
         return top.org_id if top.score >= 180 else None
 
     runner_up = ranked[1]
+    if top.schema_mode == _CHANNEL_READ_ONLY and runner_up.schema_mode == _CHANNEL_READ_ONLY:
+        return top.org_id if top.score >= runner_up.score + 60 else None
     if top.score >= runner_up.score + 60 and top.circuit_count >= max(runner_up.circuit_count + 4, int(runner_up.circuit_count * 1.5)):
         return top.org_id
     return None
@@ -230,6 +383,7 @@ async def _probe_org(
     *,
     source: str = "org_list",
     bucket_names: tuple[str, ...] = (),
+    schema_mode: str = INFLUX_SCHEMA_UUID,
 ) -> InfluxOrgCandidate | None:
     url = f"{base_url.rstrip('/')}/api/v2/query"
     try:
@@ -241,7 +395,11 @@ async def _probe_org(
                 "Content-Type": "application/vnd.flux",
                 "Accept": "text/csv",
             },
-            data=_probe_query(range_start, bucket_names[0] if bucket_names else DEFAULT_INFLUX_BUCKET),
+            data=_probe_query(
+                range_start,
+                bucket_names[0] if bucket_names else DEFAULT_INFLUX_BUCKET,
+                schema_mode=schema_mode,
+            ),
             timeout=aiohttp.ClientTimeout(total=10),
         ) as response:
             text = await response.text()
@@ -255,6 +413,15 @@ async def _probe_org(
                 )
                 return None
             rows = _parse_influx_csv(text)
+            if schema_mode == _CHANNEL_READ_ONLY:
+                return _build_channel_candidate(
+                    org_id,
+                    org_name,
+                    rows,
+                    source=source,
+                    query_window=range_start,
+                    bucket_names=bucket_names,
+                )
             return _build_candidate(
                 org_id,
                 org_name,
@@ -376,6 +543,29 @@ async def _probe_orgs_for_candidates(
             source,
             len(candidates),
         )
+        if any(_is_plausible(candidate) for candidate in candidates):
+            break
+    if any(_is_plausible(candidate) for candidate in candidates):
+        return candidates
+
+    _LOGGER.debug("No usable UUID rows found from %s; probing known system channels read-only", source)
+    for range_start in _PROBE_WINDOWS:
+        candidates = []
+        for org_id, org_name, bucket_names in orgs:
+            for bucket_name in bucket_names or (DEFAULT_INFLUX_BUCKET,):
+                candidate = await _probe_org(
+                    session,
+                    base_url,
+                    token,
+                    org_id,
+                    org_name,
+                    range_start,
+                    source=source,
+                    bucket_names=(bucket_name,),
+                    schema_mode=_CHANNEL_READ_ONLY,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
         if candidates:
             break
     return candidates
@@ -419,7 +609,7 @@ async def async_discover_influx_org(
                 )
                 if metadata_candidates:
                     metadata_candidate = metadata_candidates[0]
-                    if metadata_candidate.score >= 120:
+                    if _is_candidate_plausible(metadata_candidate) and metadata_candidate.score >= 120:
                         _LOGGER.info(
                             "Influx org discovery selected host metadata org %s (%s)",
                             metadata_candidate.org_id,
@@ -430,6 +620,8 @@ async def async_discover_influx_org(
                             selected_bucket=metadata_candidate.selected_bucket,
                             candidates=metadata_candidates,
                             source="ssh_metadata",
+                            schema_mode=metadata_candidate.schema_mode,
+                            system_channel_count=metadata_candidate.system_channel_count,
                         )
                     _LOGGER.debug(
                         "Host metadata org %s returned no strong data shape; continuing discovery",
@@ -471,7 +663,7 @@ async def async_discover_influx_org(
                 if bucket_candidates:
                     winner = _pick_clear_winner(bucket_candidates)
                     plausible = sorted(
-                        [candidate for candidate in bucket_candidates if _is_plausible(candidate)],
+                        [candidate for candidate in bucket_candidates if _is_candidate_plausible(candidate)],
                         key=lambda item: item.score,
                         reverse=True,
                     )
@@ -489,6 +681,8 @@ async def async_discover_influx_org(
                             selected_bucket=selected_candidate.selected_bucket,
                             candidates=plausible or sorted(bucket_candidates, key=lambda item: item.score, reverse=True),
                             source="bucket_scan",
+                            schema_mode=selected_candidate.schema_mode,
+                            system_channel_count=selected_candidate.system_channel_count,
                         )
                     if plausible:
                         _LOGGER.info(
@@ -498,6 +692,8 @@ async def async_discover_influx_org(
                         return InfluxOrgDiscoveryResult(
                             candidates=plausible[:5],
                             source="bucket_scan",
+                            schema_mode=plausible[0].schema_mode,
+                            system_channel_count=plausible[0].system_channel_count,
                         )
 
             async with session.get(
@@ -580,7 +776,7 @@ async def async_discover_influx_org(
 
     winner = _pick_clear_winner(org_candidates)
     plausible = sorted(
-        [candidate for candidate in org_candidates if _is_plausible(candidate)],
+        [candidate for candidate in org_candidates if _is_candidate_plausible(candidate)],
         key=lambda item: item.score,
         reverse=True,
     )
@@ -600,6 +796,8 @@ async def async_discover_influx_org(
             selected_bucket=selected_candidate.selected_bucket,
             candidates=plausible or sorted(org_candidates, key=lambda item: item.score, reverse=True),
             source="org_list",
+            schema_mode=selected_candidate.schema_mode,
+            system_channel_count=selected_candidate.system_channel_count,
         )
 
     if plausible:
@@ -607,7 +805,12 @@ async def async_discover_influx_org(
             "Influx org discovery found %d plausible candidate(s) but no clear winner",
             len(plausible),
         )
-        return InfluxOrgDiscoveryResult(candidates=plausible[:5], source="org_list")
+        return InfluxOrgDiscoveryResult(
+            candidates=plausible[:5],
+            source="org_list",
+            schema_mode=plausible[0].schema_mode,
+            system_channel_count=plausible[0].system_channel_count,
+        )
 
     scored = sorted(org_candidates, key=lambda item: item.score, reverse=True)
     _LOGGER.debug(

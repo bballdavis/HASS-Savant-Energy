@@ -69,6 +69,16 @@ class ConfigStorageTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(normalized_data[module.CONF_INFLUX_BUCKET], "localHub")
 
+    def test_channel_read_only_mode_moves_from_legacy_options_to_entry_data(self):
+        module = _load_config_storage_module()
+        data, options, changed = module.normalize_entry_storage(
+            {module.CONF_MODE: module.MODE_CURRENT, module.CONF_HOST: "host"},
+            {module.CONF_INFLUX_SCHEMA_MODE: "channel_read_only"},
+        )
+        self.assertTrue(changed)
+        self.assertEqual(data[module.CONF_INFLUX_SCHEMA_MODE], "channel_read_only")
+        self.assertNotIn(module.CONF_INFLUX_SCHEMA_MODE, options)
+
 
 if __name__ == "__main__":
     unittest.main()

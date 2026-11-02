@@ -79,3 +79,72 @@ class SceneButtonLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await task
         add.assert_not_called()
         self.assertEqual(manager.buttons, {})
+
+
+class AllLoadsControlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_current_controls_block_fallback_and_failed_polls_then_recover(self):
+        module = load_buttons()
+        relay = {'uid': 'uuid::1', 'role': 'relay', 'has_relay': True,
+                 'relay_uid': 'SEM.1', 'percentCommanded': 100}
+        bulk = AsyncMock(return_value=True)
+        entry = types.SimpleNamespace(data={})
+        coordinator = types.SimpleNamespace(mode=module.MODE_CURRENT, config_entry=entry,
+            relay_controller=types.SimpleNamespace(set_relay_states_bulk=bulk),
+            data={'snapshot_status': {'ok': True}, 'snapshot_data': {
+                'telemetry_schema_mode': 'channel_read_only', 'relay_control_available': True, 'presentDemands': [relay]}})
+        button = module.SavantAllLoadsButton(types.SimpleNamespace(), coordinator)
+        self.assertFalse(button.available)
+        await button.async_press()
+        bulk.assert_not_awaited()
+        coordinator.data['snapshot_data']['telemetry_schema_mode'] = 'uuid'
+        coordinator.data['snapshot_status']['ok'] = False
+        self.assertFalse(button.available)
+        await button.async_press()
+        bulk.assert_not_awaited()
+        coordinator.data['snapshot_status']['ok'] = True
+        entry.data[module.CONF_INFLUX_SCHEMA_MODE] = module.INFLUX_SCHEMA_CHANNEL_READ_ONLY
+        self.assertFalse(button.available)
+        await button.async_press()
+        bulk.assert_not_awaited()
+        entry.data[module.CONF_INFLUX_SCHEMA_MODE] = module.INFLUX_SCHEMA_UUID
+        coordinator.data['snapshot_data']['presentDemands'].append({
+            **relay, 'relay_uid': 'UNVERIFIED', 'has_relay': False})
+        coordinator.data['snapshot_data']['relay_control_available'] = False
+        self.assertFalse(button.available)
+        await button.async_press()
+        bulk.assert_not_awaited()
+        coordinator.data['snapshot_data']['relay_control_available'] = True
+        self.assertTrue(button.available)
+        await button.async_press()
+        bulk.assert_awaited_once_with({'SEM.1': 100})
+
+    async def test_legacy_all_loads_still_uses_legacy_command_path(self):
+        module = load_buttons()
+        coordinator = types.SimpleNamespace(mode='legacy')
+        button = module.SavantAllLoadsButton(types.SimpleNamespace(), coordinator)
+        with patch.object(button, '_press_legacy', new=AsyncMock()) as legacy:
+            self.assertTrue(button.available)
+            await button.async_press()
+            legacy.assert_awaited_once()
+
+
+class SceneButtonAvailabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scene_button_blocks_historical_data_and_recovers(self):
+        module = load_buttons()
+        coordinator = types.SimpleNamespace(mode=module.MODE_CURRENT,
+            config_entry=types.SimpleNamespace(data={}),
+            data={'snapshot_status': {'ok': True}, 'snapshot_data': {
+                'telemetry_schema_mode': 'uuid', 'relay_control_available': False}})
+        manager = types.SimpleNamespace(coordinator=coordinator,
+            storage=types.SimpleNamespace(scenes={'scene': {}}),
+            async_execute_scene=AsyncMock())
+        button = object.__new__(module.SavantSceneButton)
+        button._scene_manager = manager
+        button._scene_id = 'scene'
+        self.assertFalse(button.available)
+        await button.async_press()
+        manager.async_execute_scene.assert_not_awaited()
+        coordinator.data['snapshot_data']['relay_control_available'] = True
+        self.assertTrue(button.available)
+        await button.async_press()
+        manager.async_execute_scene.assert_awaited_once_with('scene')
